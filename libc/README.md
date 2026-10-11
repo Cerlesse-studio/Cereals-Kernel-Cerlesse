@@ -1,9 +1,12 @@
 # libc（最小用户态运行时）
 
-- 版本：v0.6 建立 / **v0.7 补齐文件 syscall** / **v0.9 第一步补齐用户堆**
-- 状态：✅ 已实现（2026-10-11，随 `make test-user` **59 项**断言实测通过；`user/hello` 作为 RAMFS 上的
-  `/init` 经 ELF Loader 装载并跑在 ring3，堆自测也在其中）
-- 关联：[docs/syscall.md](../docs/syscall.md) 2.11 / 3.1 / 3.5、[user/hello](../user/hello)、
+- 版本：v0.6 建立 / **v0.7 补齐文件 syscall** / **v0.9 第一步补齐用户堆** / **v0.9 第二步补齐 `stdin`** /
+  **v0.9 第三步补齐进程调用与 `argc`/`argv`**
+- 状态：✅ 已实现（2026-10-11，随 `make test-user` **61 项** + `make test-shell` **11 项** + `make test-proc` **8 项 + 4 正则**断言实测通过；
+  `user/hello` 作为 RAMFS 上的 `/init`、`user/shell` 作为 `/bin/sh`、`user/hello-bin` 作为 `/bin/hello`
+  （**由 Shell `fork` + `execve` 起来**），三者都经 ELF Loader 装载并跑在 ring3）
+- 关联：[docs/syscall.md](../docs/syscall.md) 2.11 / 3.1 / 3.5 / 3.6 / 3.7、[user/hello](../user/hello)、
+  [user/shell](../user/shell)、[user/hello-bin](../user/hello-bin)、[docs/process.md](../docs/process.md) 1.4、
   [docs/filesystem.md](../docs/filesystem.md) 2.6
 
 ## 1. 这是什么
@@ -14,7 +17,8 @@
 
 | 组成 | 内容 |
 | ---- | ---- |
-| `syscall` | 系统调用号常量 + 裸入口 `raw(nr, a1..a5)` + `write` / `read` / `open` / `close` / `getpid` / `nanosleep` / `exit` / `brk` / `mmap` / `munmap` |
+| `syscall` | 系统调用号常量 + 裸入口 `raw(nr, a1..a5)` + `write` / `read` / `open` / `close` / `getpid` / `nanosleep` / `exit` / `brk` / `mmap` / `munmap` / `fork` / `execve` / `wait4` |
+| `args` | `argc()` / `arg(i)` / `arg_str(i)` / `Args`：入口寄存器里的 `rdi`/`rsi` 由 `_start` 存进来（v0.9 第三步） |
 | `heap` | `#[global_allocator]`（bump over `mmap`，64 KiB 块）—— 用户程序因此可以用 `Vec`/`String`/`Box`（v0.9 第一步） |
 | `console` | `print!` / `println!`（固定 256 字节缓冲，**一次宏调用 = 一次 `write`**） |
 | `_start` | `global_asm!` 放在 `.text.start`：`_start` → 用户 `main` → `exit(main())` |
@@ -64,7 +68,10 @@ pub extern "C" fn main() -> i32 {
 | `write(fd, buf: &[u8])` | fd 1/2 写串口，fd ≥ 3 写文件 | 写出字节数或负 errno |
 | `close(fd)` | 只接受 fd ≥ 3（0/1/2 是保留位） | 0 或负 errno |
 
-判定错误请用 `libc` 里的 errno 常量（`ENOENT`/`EBADF`/`EFAULT`/`EISDIR`/`EINVAL`/`ENOSPC`/`ENOMEM`）。\
+判定错误请用 `libc` 里的 errno 常量（`ENOENT`/`EBADF`/`EAGAIN`/`EFAULT`/`EISDIR`/`EINVAL`/`ENOSPC`/`ENOMEM`/`ENOSYS`）。\
+**`read(0)` 是行缓冲（cooked）**：内核交付**一整行**（行尾统一为 `\n`），所以 `cat` 之类的程序
+不必自己拼行；没有整行的 3 秒内返回 `-EAGAIN`(-11)（无进程模型时内核不会无限等，
+因此交互程序应该把 `EAGAIN` 当作“暂无输入”而不是错误）。\
 **寄存器约定**：与 Linux syscall ABI 一致 —— 一次往返后只有 `rax`（返回值）、`rcx`、`r11` 变化，
 其余寄存器保持进入前的值（内核入口汇编会保存/恢复 `rdi/rsi/rdx/r10/r8/r9`）。
 
@@ -72,8 +79,9 @@ pub extern "C" fn main() -> i32 {
 
 1. 复制 `user/hello/`（`Cargo.toml` + `build.rs` + `user.ld` + `src/main.rs`）并改包名；
 2. 在 workspace 根 `Cargo.toml` 的 `members` 里加上 `"user/<程序名>"`；
-3. 在 `kernel/build.rs` 里让它参与构建与内嵌（`USER_PROGRAM` / `include_bytes!` 路径），
-   内核侧按需增加一次装载调用（当前内核把内嵌 ELF 写进 RAMFS 的 `/init`）；
+3. 在 `kernel/build.rs` 的 `USER_PROGRAMS` 列表里加上 `(包名, "<文件名>.elf")`，
+   并在 `kernel/src/syscall/user.rs` 用 `include_bytes!` 取它、`fs::init` 写进 RAMFS
+   （现有两个：`user-hello` → `/init`、`user-shell` → `/bin/sh`）；
 4. 单独验证脚手架：`make user` —— 编译 + 链接 + `tools/check_user_elf.py` 检查段布局。
 
 构建参数不是可选的（改错会在链接期或 ring3 立刻炸）：
@@ -104,8 +112,8 @@ pub extern "C" fn main() -> i32 {
 `make user` 会跑 `tools/check_user_elf.py`，逐项检查上述 1/2（以及映像窗口、无重定位），
 不用启动 QEMU 就能在改坏链接脚本时立刻发现。
 
-尚未封装的调用（`mprotect`/`fork`/`execve`/`wait4`）在内核侧仍是 ENOSYS 桩；`argc/argv` 与
-动态链接属后续版本。
+尚未实现的调用：**只剩 `mprotect`**（W^X 转换用），它在内核侧落在公共 ENOSYS 桩上；
+环境变量（`envp`）、用户态抢占与动态链接属后续版本。
 
 ## 5. 用户堆（v0.9 第一步）
 
@@ -137,3 +145,78 @@ v.push(1);
 分配器的**限制**（写在代码注释里，也写在这里）：`libc::heap` 是只前进的 bump 分配器，
 `dealloc` 是空操作 —— 目前靠「一次运行结束由内核 `UserSpace::Drop` 整棵释放」兜底，
 长驻程序的内存占用会单调上升；回收式分配器与 `mprotect` 属后续版本。
+
+## 6. 交互式输入（v0.9 第二步）
+
+`read(0)` 是**行缓冲**：内核的行缓冲（`driver/keyboard.rs`）已经做了行编辑与回显，
+一次 `read(0)` 给你一整行（行尾是 `\n`，`\r` 不会出现）。没有整行时等待，但**最多等 3 秒**
+后返回 `EAGAIN` —— 所以在 `-EAGAIN` 上要能继续循环（而不是当成错误退出）：
+
+```rust
+use libc::{print, println, read, EAGAIN, STDIN};
+
+let mut line = [0u8; 128];
+let mut idles = 0u32;
+loop {
+    print!("root@cerlesse C:>");            // 一次 write（日志里可见 len=17）
+    let n = read(STDIN, &mut line);
+    if n == EAGAIN {
+        // 暂无输入：交互式程序应继续等；这里用连续两次空闲退出来避免卡住整机
+        idles += 1;
+        if idles >= 2 { break; }
+        continue;
+    }
+    if n <= 0 { break; }                   // 其他错误（0 在 stdin 接通后不会出现）
+    idles = 0;
+    let text = core::str::from_utf8(&line[..n as usize]).unwrap_or("").trim();
+    println!("got: {}", text);
+}
+```
+
+参考实现是 [user/shell](../user/shell)（提示符、参数切分、内建命令、外部命令走的 `fork`+`execve`+`wait4`）。
+外部程序现在真的能跑起来 —— 见第 7 节。
+
+## 7. 进程调用与命令行参数（v0.9 第三步）
+
+三个包装的后端是真正的进程对象（独立地址空间 + 独立内核栈 + 停在 `syscall` 里的完整
+寄存器帧），内核侧实现见 [docs/process.md](../docs/process.md) 1.4：
+
+| 调用 | 返回 | 说明 |
+| ---- | ---- | ---- |
+| `fork() -> isize` | 父进程：子进程 PID；子进程：`0`；失败：负 errno（进程表满 `EAGAIN`） | 地址空间与**当前寄存器帧**一起复制，子进程从同一条用户指令继续 |
+| `execve(path, argv: &[&str]) -> isize` | **成功不返回**；失败：`-ENOENT` / `-E2BIG` / `-EFAULT` / `-EINVAL` | 换映像 + 换地址空间，`argv` 写进新进程的用户栈 |
+| `wait4(pid: i64) -> isize` | 子进程退出码（可为负）；非直接子进程：`ECHILD` | 运行并**回收**子进程（地址空间整棵归还） |
+
+标准写法原样可用（`user/shell` 的 `cmd_external` 就是这么写的）：
+
+```rust
+use libc::{execve, exit, fork, wait4};
+
+let pid = fork();
+if pid == 0 {
+    let _ = execve("/bin/hello", &["hello", "world"]); // 成功不返回
+    exit(127);                                          // 失败：exec 的常规退出码
+}
+let code = wait4(pid);
+println!("exit code={}", code);
+```
+
+**参数在入口寄存器里**（不是 Linux 的「压在用户栈顶」）：`_start` 的 `rdi = argc`、
+`rsi = argv`，由 `cer_start` 存进 `libc::args`。用户程序侧：
+
+```rust
+use libc::{arg_str, argc, println};
+
+println!("argc={}", argc());
+for i in 0..argc() {
+    println!("argv[{}]={}", i, arg_str(i).unwrap_or("<non-utf8>"));
+}
+```
+
+字符串由内核写在**新进程的用户栈**上（`syscall::process::build_user_frame`），
+生命周期与进程相同，所以 `arg(i)` 给的是 `&'static [u8]`；上限 `ARG_MAX` = 8 项、
+单项 256 字节。
+
+**与 Linux 的调度差异**（刻意，且对调用方透明）：单 CPU、用户态无抢占，`fork` 之后
+子进程**不会立刻运行**，它要等父进程 `wait4` 时才被恢复 —— 也就是「父进程在等的时候，
+子进程在跑」。因此 `fork`/`execve`/`wait4` 的标准写法不需要为这个内核改写。

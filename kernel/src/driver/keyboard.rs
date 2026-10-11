@@ -3,7 +3,19 @@
 //! 目标是建立最小可验证的键盘输入路径（DEVELOPMENT.md v0.4 验收项）：
 //! - 键盘控制器（8042 兼容）初始化：排空输出缓冲、打开 IRQ1 使能位、启用键盘；
 //! - IRQ1 回调读取扫描码 → 解码 set 1 扫描码 → 串口回显；
-//! - 回显格式固定为 `KB <字符>`，便于集成测试断言。
+//! - **行缓冲（v0.9）**：可打印字符进缓冲、`Enter` 把整行标记为「可取」，
+//!   `stdin`（fd=0）由 [`take_line`] 取走 —— 这是交互式 Shell 的输入侧（
+//!   `kernel/src/syscall/file.rs::read_stdin`）。
+//!
+//! 回显协议在 v0.9 改过一次（有意为之，测试同批更新）：
+//!
+//! | 版本 | 行为 |
+//! | ---- | ---- |
+//! | v0.4–v0.8 | 每个字符回显成一行 `KB <字符>`（便于断言，但终端语义下不可读） |
+//! | v0.9 起 | 字符**原样**回显（终端式），`Enter` 回显换行并打印 `kbd: line ready len=N` |
+//!
+//! `KBIRQ ENTRY` / `KBIRQ EXIT` 保持不变：它们是 v0.4 的 IRQ 进入/退出证据，
+//! `make test-keyboard` 仍然断言它们。
 //!
 //! 端口约定（x86 PS/2 兼容控制器）：
 //! - 数据端口：0x60
@@ -173,11 +185,110 @@ pub unsafe fn poll_scan() -> Option<u8> {
 static mut EXTENDED_PREFIX: bool = false;
 static mut SHIFT_HELD: bool = false;
 
+/// 行缓冲容量（含行尾 `\n`）：一行命令远小于 128 字节。
+pub const LINE_CAP: usize = 128;
+
+/// 行缓冲 + 行编辑状态。
+///
+/// 单核，因此用模块级 `static mut` 而不是锁；写入者是 IRQ1（[`push_char`]），
+/// 读者是 `stdin`（[`take_line`]）。**两者的互斥靠「`ready` 标志」而不是关中断**：
+/// 取行期间 `ready` 仍为 `true`，此时 IRQ 的写入被丢弃（不覆盖正在被取走的内容），
+/// 取行结束后 `len` 归零、`ready` 清位，新的一行从缓冲头部开始。
+struct LineBuffer {
+    buf: [u8; LINE_CAP],
+    /// 有效字节数（含行尾 `\n`）。
+    len: usize,
+    /// 一整行已就绪、等待 [`take_line`] 取走。
+    ready: bool,
+    /// 本行因超长被截断（诊断用，随行一并上报）。
+    truncated: bool,
+}
+
+static mut LINE: LineBuffer = LineBuffer {
+    buf: [0; LINE_CAP],
+    len: 0,
+    ready: false,
+    truncated: false,
+};
+
 /// 释放某个处理状态（重启/自测用，仅开发期调用）。
 pub unsafe fn reset_decode_state() {
     unsafe {
         EXTENDED_PREFIX = false;
         SHIFT_HELD = false;
+    }
+}
+
+/// 取走一整行（**整行交付**：内容 + 行尾 `\n`），返回字节数。
+///
+/// 没有就绪的行时返回 `None`（调用方决定继续等还是返回 `-EAGAIN`）。
+/// `dst` 比整行短时只交付前 `dst.len()` 字节，剩余部分丢弃 —— 文档化的取舍：
+/// 一次系统调用的缓冲由用户程序给出，内核不为它分配内存。
+///
+/// # Safety
+/// 单核；与 IRQ1 的写者用 `ready` 标志互斥（见 [`LineBuffer`]）。
+pub unsafe fn take_line(dst: &mut [u8]) -> Option<usize> {
+    unsafe {
+        if !LINE.ready {
+            return None;
+        }
+        let n = LINE.len.min(dst.len());
+        dst[..n].copy_from_slice(&LINE.buf[..n]);
+        LINE.len = 0;
+        LINE.ready = false;
+        LINE.truncated = false;
+        Some(n)
+    }
+}
+
+/// 把一个已解码字符送进行缓冲，并做终端式回显。
+///
+/// 语义（POSIX 行规程的极简版）：
+/// - 可打印字符：进缓冲并原样回显；
+/// - `Backspace`（0x08）：退一个字符，回显 `\b \b`；
+/// - `\r`（Enter）：补 `\n` 结束本行、回显换行、打印 `kbd: line ready len=N`；
+/// - 缓冲满：丢弃后续字符并置 `truncated`（行尾标记里上报，不静默截断）。
+///
+/// # Safety
+/// 单核；调用方负责串口重入保护与关中断（IRQ1 上下文天然满足）。
+unsafe fn push_char(ch: u8) {
+    unsafe {
+        if LINE.ready {
+            // 上一行还没被 stdin 取走：丢弃本次输入，绝不覆盖待取内容。
+            return;
+        }
+        match ch {
+            b'\r' | b'\n' => {
+                LINE.buf[LINE.len] = b'\n';
+                LINE.len += 1;
+                LINE.ready = true;
+                crate::driver::serial::print("\r\n");
+                crate::driver::serial::print("kbd: line ready len=");
+                crate::driver::serial::print_dec(LINE.len as u64);
+                if LINE.truncated {
+                    crate::driver::serial::println(" truncated=1");
+                } else {
+                    crate::driver::serial::println("");
+                }
+            }
+            0x08 => {
+                if LINE.len > 0 {
+                    LINE.len -= 1;
+                    crate::driver::serial::print("\x08 \x08");
+                }
+            }
+            c if c >= 0x20 => {
+                // 留一字节给行尾 `\n`：保证「就绪的行一定以换行结束」。
+                if LINE.len + 1 < LINE_CAP {
+                    LINE.buf[LINE.len] = c;
+                    LINE.len += 1;
+                    crate::driver::serial::putc(c);
+                } else {
+                    LINE.truncated = true;
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -246,18 +357,7 @@ pub unsafe fn decode_set_1_scan(code: u8) -> Option<u8> {
     }
 }
 
-/// 串口回显一个已解码字符，格式：`KB <字符>`。
-///
-/// # Safety
-///
-/// 需要串口已初始化；调用方负责串口重入保护。
-pub unsafe fn echo_char(c: u8) {
-    crate::driver::serial::print("KB ");
-    crate::driver::serial::putc(c);
-    crate::driver::serial::print("\r\n");
-}
-
-/// IRQ1 回调：读取扫描码、解码并回显。
+/// IRQ1 回调：读取扫描码、解码、进行缓冲并回显。
 ///
 /// 关键顺序：先把扫描码读走（清 OBF），再打印。
 /// 若串口正被占用（`serial_debug_enter` 失败），仍已完成读取，
@@ -277,7 +377,7 @@ pub unsafe extern "C" fn keyboard_irq1_handler(_vector: u8) {
     crate::driver::serial::print("KBIRQ ENTRY\r\n");
     if let Some(code) = code {
         if let Some(ch) = unsafe { decode_set_1_scan(code) } {
-            unsafe { echo_char(ch) };
+            unsafe { push_char(ch) };
         }
     }
     crate::driver::serial::print("KBIRQ EXIT\r\n");

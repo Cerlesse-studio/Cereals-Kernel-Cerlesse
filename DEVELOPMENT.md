@@ -5,7 +5,7 @@
 - 状态：v0.1–v0.5 全部完成（v0.4：中断/Timer/键盘/上下文切换 + H-04/H-05 Go 工具，`make go-test` / `make test-orch` 通过；v0.5：线程模型 + Round Robin 时间片调度 + IPC pipe 骨架，`make test-scheduler` / `make test-ipc` 通过）；
   v0.6 核心已落地并通过 `make test-user` 验收（syscall/sysret 入口 + ring3 + 用户地址空间隔离），
   并且**用户态脚手架已可用**（`libc/` 最小运行时 + `user/hello` 真实 Rust 用户程序 + `kernel/build.rs` 构建期摊平内嵌，`make user` 可单独验证）；
-  **v0.7 已落地并通过 `make test-fs`（19 项）+ `make test-user`（32 项）验收**：
+  **v0.7 已落地并通过 `make test-fs`（20 项）+ `make test-user`（32 项）验收**：
   VFS（trait + 挂载表最长前缀路由）、RAMFS、fd 表、`read`/`write`/`open`/`close`，
   以及 **ELF Loader**（用户程序不再是摊平映像，而是 RAMFS 上的 `/init` 经 `elf.rs` 按段权限装载，
   `RW` 段对 ring3 可写）；`make user` 追加 `tools/check_user_elf.py` 独立校验段布局；
@@ -15,8 +15,14 @@
   **FAT12/16/32 只读后端挂到 VFS**（`/disk` = 启动盘、`/mnt/fat` = 测试盘，syscall 层零改动）与 H-03 `mkfs`
   （`tools/mkfs/mkfs.py`，mtools 独立复核）；启动盘已改为 virtio-blk（`disable-modern=on`）；
   **v0.9 已开局**（2026-10-11，运行时前置条件第一步：**用户堆**）—— `brk`/`mmap`/`munmap`
-  （W^X、全零页、`invlpg`、Linux 式 `brk` 语义）+ `libc` 的 `#[global_allocator]`（`Vec` 可用），
-  `make test-user` 由 32 项增至 **59 项**；Shell/用户程序/网络仍为占位
+  （W^X、全零页、`invlpg`、Linux 式 `brk` 语义）+ `libc` 的 `#[global_allocator]`（`Vec` 可用）；
+  同日**第二步：交互式 Shell 与 `stdin`** —— 键盘行缓冲（行编辑 + 终端式回显）→
+  `read(0)` 整行交付 → `user/shell`（提示符 `root@cerlesse C:>`、内建 `help`/`echo`/`cat`/`pid`/`exit`），
+  内嵌为 RAMFS 上的 `/bin/sh`，新增 `make test-shell`（11 项）；
+  同日**第三步：进程对象 + `fork`/`execve`/`wait4`** —— 每进程地址空间 + 每进程 64 KiB 内核栈
+  （栈底哨兵）+ 停在 syscall 里的完整用户帧；Shell 的外部命令真的跑起来了
+  （`/bin/hello`，新增 `make test-proc`，8 项 + 4 条正则）；
+  `make test-user` 由 32 项增至 **61 项**；`argc/argv` 一并可用；动态链接/网络仍为占位
 - 关联文档：[docs/architecture.md](docs/architecture.md) · [docs/roadmap.md](docs/roadmap.md) · [docs/project-structure.md](docs/project-structure.md) · [docs/drivers.md](docs/drivers.md) · [docs/syscall.md](docs/syscall.md) · [docs/filesystem.md](docs/filesystem.md) · [docs/process.md](docs/process.md)
 
 ---
@@ -111,7 +117,8 @@ lto = false
 - `boot`：UEFI 引导 crate，目标 `x86_64-unknown-uefi`；与内核边界调用必须 `extern "sysv64"`（ADR-006）。
 - `libc`：最小用户态运行时（syscall 封装 + `_start` + `print!/println!`，v0.6 起加入 workspace）。
 - `user/*`：`no_std` 用户态程序，产出静态 ELF（v0.6 起加入 workspace）；
-  当前 `user/hello` 为可运行的真实程序，`init/shell/ls/cat/echo/ps` 仍是 v0.9 占位。
+  当前 `user/hello`（→ RAMFS `/init`）与 `user/shell`（→ RAMFS `/bin/sh`）为可运行的真实程序，
+  `init/ls/cat/echo/ps` 仍是 v0.9 占位（`cat` 先以 Shell 内建命令形式落地）。
 - `tools/`（Python）与 `tools-go/`（Go）**不进 Cargo workspace**，各自独立管理。
 - 交叉编译在 Linux 与 Windows 主机上均通过 `rustup target add` 相同目标完成（见 docs/boot.md）。
 
@@ -185,6 +192,8 @@ v0.3 发现并修复的缺陷（随本阶段一并落地）：
 - [x] IRQ 统一入口 `irq_common` 保存/恢复全部通用寄存器（见 B-09）
 - [x] `kernel/src/driver/keyboard.rs`：PS/2 键盘控制器初始化（排空输出缓冲、打开 IRQ1 使能位）
 - [x] PS/2 键盘中断输入：IRQ1 扫描码接收 → set 1 解码（字母/数字/Shift/扩展前缀）→ 串口回显 `KB <字符>`
+      （v0.9 起改为**行缓冲 + 终端式原样回显**：`Enter` 交付整行并打印 `kbd: line ready len=N`，
+      旧格式废弃，`make test-keyboard` 断言同步——见 docs/drivers.md 1.6）
 - [x] 上下文切换原语（为 v0.5 铺路）：`arch::x86_64::context` 的 `switch_to` / `init_context` + 内核自测 `context: switch PASS`
 - [x] 并行共享磁盘镜像：QEMU 改用 `snapshot=on`（临时写时复制），多场景并发不抢镜像写锁且不污染原镜像
 - [x] H-04 测试编排器（Go）：`tools-go/cmd/testorch` + `internal/orchestrator`（场景配置校验、并发信号量、场景超时、串口日志二次复核）
@@ -272,10 +281,10 @@ v0.5 踩坑记录（已修复，建议保留）：
     - [x] `read` / `open` / `close`（与 VFS 对接）
     - [x] 用户静态数据可写（`RW` 段按段权限映射，实测 `hello: static counter=1`）
 - [ ] 仍未做（属于 v0.8+，不应被读成已完成）：
-    - [ ] `fork` / `exec` / `wait`
-    - [ ] 进程/线程对象（`exit` 是「结束当前用户态执行」，不是「销毁进程」）
+    - [x] ~~`fork` / `exec` / `wait`~~ → **v0.9 第三步已做**（2026-10-11，见下方 v0.9 小节与 docs/syscall.md 3.7）
+    - [x] ~~进程/线程对象~~ → **v0.9 第三步已做**（真正的 PCB：每进程地址空间 + 每进程内核栈 + `Ready/Running/Zombie`）
     - [ ] 高半区迁移（隔离当前靠页表 `USER` 位而非地址空间划分）
-    - [ ] 用户堆/`brk`/`mmap`、`argc/argv` 传递（用户程序只有映像窗口 + 4 页栈）
+    - [x] ~~用户堆/`brk`/`mmap`~~ → v0.9 第一步已做；~~`argc/argv` 传递~~ → **v0.9 第三步已做**
 
 v0.6 踩坑记录（已修复，建议保留）：
 
@@ -303,10 +312,11 @@ v0.6 踩坑记录（已修复，建议保留）：
       `make test-user` 32 项 PASS（`source=elf` + 段数/页数/可写页 + `open/read/close/write` 全链路 +
       用户写入被内核读回 + `static counter=1`（`RW` 段可写）+ `EFAULT` + 退出码/隔离回归）
 - [x] `make user` 追加 `tools/check_user_elf.py`：不启 QEMU 即可校验基址/段页对齐/`W^X`/映像窗口/无重定位
-- [ ] Shell 里 `ls`/`cat`/`cd` 操作 RAMFS → **v0.9**（需要 shell 与 `argc/argv`；v0.7 已在内核侧与
-      `/init` 里验证了同样的路径/文件语义）
+- [x] Shell 里 `cat` 已可用（v0.9 第二步，内建命令走同一套文件 syscall）；`ls`/`cd` 等
+      **外部程序**在 v0.9 第三步打通（`fork`/`execve`/`wait4`）—— 见下方 v0.9 小节
 - [x] 磁盘文件系统后端（FAT）+ Python mkfs（H-03）→ **v0.8 已落地**（见 v0.8 小节的最后两条）
-- [ ] 用户堆 / `brk` / `mmap`、`argc/argv`、`fork`/`execve`/`wait4`、动态链接 → v0.8+（见 docs/syscall.md 3.4）
+- [x] 用户堆 / `brk` / `mmap`（v0.9 第一步）、`argc/argv` 与 `fork`/`execve`/`wait4`（v0.9 第三步）；
+      **剩余**：动态链接、`mprotect`（见 docs/syscall.md 3.4）
 
 ### v0.8 — Driver + PCI + Disk（已实现并通过验收，2026-10-11）
 - [x] Driver Manager 与驱动注册框架（`kernel/src/driver/driver.rs`）：`Driver` trait（`name`/`matches`/`attach`）、
@@ -366,13 +376,33 @@ v0.6 踩坑记录（已修复，建议保留）：
     - [x] 参考用户程序加入堆自测（零页、模式读回、堆缓冲 `write`、6 个负例、`Vec`/`format!`）
     - [x] 验收：`make test-user` 由 32 项增至 **59 项**（含 `user: heap frame reclamation PASS`）；
           `orchestrate.json` 的 `user` 场景同步；`mprotect` 列入「号已定义但未实现」
-- [ ] 运行时前置条件第二步：`argc/argv` 传递（`_start` 目前不接收参数）
-- [ ] 运行时前置条件第三步：进程对象 + `fork`/`execve`/`wait4`（现仍落在 ENOSYS 桩上）
+- [x] **运行时前置条件第二步：`stdin` + 交互式 Shell**（2026-10-11 落地）
+    - [x] 键盘行缓冲（`driver/keyboard.rs`）：128 字节单行缓冲、行编辑（退格/回显）、`Enter` 交付整行 + `kbd: line ready len=N`
+    - [x] `read(0)` 行缓冲语义（`syscall/file.rs::read_stdin`）：整行交付（行尾 `\n`）、3 秒无整行 → `-EAGAIN`(-11)（无进程模型时的权宜之计）
+    - [x] `user/shell`（→ `/bin/sh`）：提示符 `root@cerlesse C:>`（用户名@主机名 盘符>）、参数切分、内建 `help`/`echo`/`cat`/`pid`/`exit`
+    - [x] 外部命令路径：真的调 `fork()` → 当时内核回 `syscall: ENOSYS nr=57 name=fork`（依赖关系的实测证据；
+          **v0.9 第三步已实现**，该 ENOSYS 留痕自然消失，`make test-shell` 的断言同时改为外部程序路径）
+    - [x] `kernel/build.rs` 由「单个用户程序」改为「按列表构建+校验+内嵌」（`/init` + `/bin/sh` 同路数）
+    - [x] 验收：新增 `make test-shell`（**11 项**，QEMU monitor 注入真实按键）+ 编排 `shell` 场景（**11 场景**，后续第三步又加为 12）；
+          `make test-user` 由 59 项增至 **61 项**；`make test-fs` 根目录条目数 3 → 4（新增 `/bin`）
+- [x] **运行时前置条件第三步：进程对象 + `fork`/`execve`/`wait4`**（2026-10-11 落地）
+    - [x] 进程对象（`process/process.rs`）：真正的 PCB（地址空间 / 用户帧 / 每进程 64 KiB 内核栈
+          + 栈底哨兵 / `return_to` / `Ready|Running|Zombie`）；旧入口假设「一次只跑一个用户程序」的问题
+          在 docs/syscall.md 3.6 / process.md 1.4 记下了根因
+    - [x] `syscall/process.rs`：`fork`（复制地址空间 + 克隆当前用户帧）、`execve`（换映像 + 重建 argv 用户栈，
+          先切 CR3 再 Drop 旧地址空间）、`wait4`（延迟调度 + 回收）
+    - [x] `trampoline` 改为按进程切换：CR3 / `TSS.RSP0` / syscall 栈顶 / 当前进程下标；`suspend`/`resume` 语义
+    - [x] `argc/argv` 传递（`libc/src/args.rs`，入口寄存器 `rdi`/`rsi`）
+    - [x] 外部程序 `user/hello-bin` → RAMFS `/bin/hello`；Shell 的 `cmd_external` 改走 `fork`+`execve`+`wait4`
+          （`ls` → `/bin/ls` 不存在 → `execve` 返 `-ENOENT` → 子进程 `exit(127)`）
+    - [x] 验收：新增 `make test-proc`（**8 项 + 4 条正则**；`--expect-re` 用反向引用断言
+          fork/execve/wait4 三处 PID 相同、并断言 `frames free before=N after=N` 无页帧泄漏）；
+          编排新增 `proc` 场景（11 → **12 场景**）；`make test-shell` 12 → 11 项
 - [ ] 动态链接（`PT_INTERP`/`ld.so`）与 `mprotect`（W^X 转换）；文件映射（`mmap` 加 offset）
-- [ ] `init` + `sh`（ls/cat/cp/mv/rm/mkdir/ps/kill/echo）
+- [ ] 其余用户程序（ls/cp/mv/rm/mkdir/ps/kill）与 Shell 增强（`cd`、管道、重定向）
 - [ ] 简化网络：virtio-net → Ethernet → ARP → IPv4 → UDP（TCP 尽力）
 - [ ] Socket syscall 最小集
-- [ ] 验收：Shell 交互可用；ping/HTTP 简例可跑
+- [x] 验收：Shell 能启动外部程序（`make test-proc`，2026-10-11）；ping/HTTP 简例仍待网络落地
 
 ### v1.0 — 完整可启动类 Linux 小型 OS
 - [ ] 用户/组/权限（`-rwxr-xr-x`、UID/GID）
@@ -395,6 +425,7 @@ v0.6 踩坑记录（已修复，建议保留）：
 | 驱动/块设备测试 | PCI 枚举 → 驱动挂接 → 扇区读写/分块一致性/负例（`make test-driver`） | Python | v0.8 |
 | 磁盘文件系统测试 | 双盘启动 → FAT16 启动盘读内核映像 / FAT32 测试盘读·LFN·跨簇公式·偏移读·负例（`make test-fat`） | Python | v0.8 |
 | 包容器测试（主机侧，不启 QEMU） | `.ckc` 容器：确定性、头部逐字段、payload 篡改、ustar 结构规则、打包期规则（超长路径/越界 target/setuid/hooks）+ 系统 `tar` 独立复核（`make test-pkg`） | Python | H-06 P0a |
+| 键盘/交互输入测试 | QEMU monitor `sendkey` 注入真实按键 → 断言 IRQ1 标记、行缓冲整行交付（`make test-keyboard`）；交互式 Shell 全流程（`sh: prompt` → `help` → `cat /etc/motd` → `exit`，`make test-shell`）；**进程调用全流程**（`hello world` → fork/execve/argv → 退出码回收，`ls` → `-ENOENT` → `exit(127)`，`make test-proc`；`--expect-re` 支持正则 + 反向引用） | Python | v0.4（v0.9 起含 Shell / 进程） |
 
 约定：
 
@@ -463,6 +494,8 @@ qemu-system-x86_64 -machine q35 -m 512M -serial stdio -display none \
 | 2026-10-11 | **v0.8 前半落地（驱动框架 + PCI + 块设备）**：新增 `driver/driver.rs`（`Driver` trait + 注册表 + `probe_all` + `ProbeStats`）、`driver/pci.rs`（配置机制 #1 + BAR 探测/窗口大小）、`driver/block.rs`（`BlockDevice` + 注册表 + 验收自测）、`driver/virtio_blk.rs`（legacy virtio 0.9.5：virtqueue/描述符链/轮询/bounce buffer）、`arch/x86_64/port.rs`（端口 I/O 32 位入口）、`frame::allocate_contiguous`（DMA/virtqueue 前置）；启动盘改为 **virtio-blk（`disable-modern=on`）**，`main.rs` 在 `Kernel started!` 后接入「枚举 → 注册 → 探测/挂接 → 块设备自测」；新增 `make test-driver`（22 项）与编排场景 `driver`（**9 场景**，127.2s 全 PASS），全量回归 PASS（含非 snapshot 启动后镜像 md5 不变，验证写测试真的还原了扇区）；修 B-16（BAR 大小 32→64 位宽错误 → I/O BAR 尺寸报错）、B-17（`lba + sectors` 环绕 → 越界请求漏拦）；同步 docs/drivers.md（v0.8 实现记录 + 设计取舍 + 限制） |
 | 2026-10-11 | **v0.8 收官（磁盘文件系统 + `mkfs`）**：`fs/fat.rs`（FAT12/16/32 只读：BPB 按簇数定类型、固定根目录区/簇链目录、8.3 + NT 标志 + LFN 校验和、偏移读、`EROFS`/`EUCLEAN`）挂到 VFS（`fs::mount_disks` → `/disk` 启动盘、`/mnt/fat` 测试盘，验证最长前缀路由）；`FileSystem` trait 改为 `&mut self` + `read_all -> Vec<u8>`；新增 `vfs::is_mount_point` 并修「单盘启动误判 `/mnt/fat` 已挂 → 启动被 halt」；`tools/mkfs/mkfs.py`（H-03）自己生成 FAT12/16/32 镜像并由 mtools 独立复核，`tests/fatroot/` 提供测试盘内容与复核说明；`tests/test_boot.py` 新增 `--disk2`；新增 `make fat-image` / `make test-fat`（**21 项**，双盘启动）与编排场景 `fat`（**10 场景**，150.7s 全 PASS）；全量回归 PASS（`test-driver` 22 项 / `test-fs` 19 项 / `test-user` 32 项 / `make go-test`）；同步 filesystem.md（第 3 节由计划改写为实现记录）、drivers.md、roadmap/README/project-structure/tools README |
 | 2026-10-11 | **H-06 P0a 落地：`.ckc` 包容器（CKC）** —— 内核包后缀定为 **`.ckc`**（Cerlesse Kernel Container），64 字节头 + 确定性 ustar payload（身份 = payload 的 SHA-256）；新增 `tools/pkgmgr/ckc.py`（纯标准库 `pack`/`verify`/`info`，含 `PKG.toml` 子集解析、scope 白名单、setuid/hooks/超长路径等打包期规则）与验收 `tests/test_ckc.py`（新增 `make test-pkg`，**37 项**，含系统 `tar` 独立复核）；docs/package-manager.md 3.2 由「`.cpk` 裸 tar 设想」改写为容器规格，11.1 拆成 P0a（已落地）/P0b（事务/catalog/receipt）；同步 docs/README.md 索引、tools/README.md、project-structure.md、README.md |
+| 2026-10-11 | **v0.9 第三步：进程对象 + `fork`/`execve`/`wait4`** —— `process/process.rs` 换成真正的 PCB（地址空间 / 用户帧 / 每进程 64 KiB 内核栈 + 栈底哨兵 / `return_to` / `Ready\|Running\|Zombie`）；新增 `kernel/src/syscall/process.rs`（fork 复制地址空间与当前帧、execve 换映像并重建 argv 用户栈、wait4 延迟调度 + 回收）；`trampoline` 改为按进程切 CR3/`TSS.RSP0`/syscall 栈顶/当前进程下标； `libc` 新增 `args`（入口寄存器 ABI）并去掉 `fork`/`execve`/`wait4` 的 ENOSYS 说法；新增外部程序 `user/hello-bin` → RAMFS `/bin/hello`，Shell 的 `cmd_external` 改走 `fork`+`execve`+`wait4`；`tests/test_keyboard.py` 新增 `--expect-re`（正则 + 反向引用）；新增 `make test-proc`（8 项 + 4 正则）并加入 `test-all`，编排场景 11 → **12**（新增 `proc`）；`make test-shell` 12 → 11 项；记录两条踩坑（debug 构建下 16 KiB 内核栈静默溢出踩坏 `.bss` 帧分配器；子进程退出时必须先恢复父进程 CR3 再 Drop 地址空间）；同步 syscall/process/libc-README/project-structure/roadmap/README |
+| 2026-10-11 | **v0.9 第二步：交互式 Shell 与 `stdin`** —— 键盘行缓冲（128 字节 + 行编辑，回显由 `KB <字符>` 改为终端式原样回显，`kbd: line ready len=N`）、`read(0)` 行缓冲语义（3 秒 `-EAGAIN`）、新增 `user/shell`（提示符 `root@cerlesse C:>`、内建 `help`/`echo`/`cat`/`pid`/`exit`、外部命令真调 `fork()`）、`kernel/build.rs` 改为多用户程序构建（`/init` + `/bin/sh`）、`syscall/mod.rs` 对已命名未实现的号打印 `syscall: ENOSYS nr=… name=…`；新增 `make test-shell`（12 项）与编排 `shell` 场景（11 场景）；`make test-user` 59 → **61 项**，`test-fs` 根目录 3 → 4；同步 syscall/drivers/process/project-structure/roadmap/README |
 | 2026-10-11 | **v0.9 第一步：用户堆**（运行时前置条件）—— 新增 `kernel/src/syscall/memory.rs`（`mmap`/`munmap`/`brk`：W^X、`MAP_*`/`PROT_*` 白名单、5 参数无 offset 的取舍、逐条错误码）、`address_space.rs` 新增 brk 窗口（256 KiB）与匿名 mmap 窗口（256 KiB，first-fit，清页表项时 `invlpg`）、`libc/heap.rs`（`#[global_allocator]`，bump over mmap）与 `brk/mmap/munmap` 封装、`user/hello` 堆自测、`user.rs` 页帧泄漏检查；`make test-user` 断言 32 → **59 项**，`orchestrate.json` 的 `user` 场景同步；全量回归 PASS（`test-fs` 19 / `test-driver` 22 / `test-fat` 21 / `make go-test` / `make test-orch` 10 场景） |
 | 2026-10-11 | **H-06 包管理器提案 v1 完成（设计阶段，不进内核主线）**：docs/package-manager.md 从「设想」补成可实施规格 —— 术语字段级定义、七个制品格式（`PKG.toml`/确定性 `.cpk`/`catalog.toml(+sig)`/`cpkg.toml`/receipt/journal/内容寻址 store）、内容哈希 + 三级校验（签名 → 绑定 → 落盘后逐文件）、安全模型（显式信任根、scope 域边界与路径白名单、**纯文件安装/无安装脚本**、setuid 拒绝、威胁—对策表）、事务阶段与原子性边界（文件级 + 可恢复）、效率预算（幂等零写入、文件级去重、`gc`）、CLI 与稳定退出码、MVP 三期（P0 主机侧 `tools/pkgmgr/` → P1 与镜像构建/基线对接 → P2 增量补丁等）、可脚本断言的验收条目（`make test-pkg`）；同步 docs/README.md 索引状态（设计中 → 提案 v1）与 H-06 行 |
 

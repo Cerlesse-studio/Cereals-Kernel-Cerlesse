@@ -35,7 +35,8 @@
 - `make test-exception`：`#DE` 诊断
 - `make test-memory`：堆 / 帧 / 页表 自测 + `context: switch PASS`
 - `make test-pagefault`：`#PF` 诊断 + CR2
-- `make test-keyboard`：QEMU monitor 注入真实按键 → `KBIRQ ENTRY` / `KB a` / `KBIRQ EXIT` + `IRQ0_heartbeat tick=`
+- `make test-keyboard`：QEMU monitor 注入真实按键 → `KBIRQ ENTRY` / `kbd: line ready len=3` /
+  `KBIRQ EXIT` + `IRQ0_heartbeat tick=`（v0.9 起行缓冲取代 `KB <字符>` 回显，见 `driver/keyboard.rs` 模块文档）
 - `cargo check --workspace`：无错误、无告警
 
 ## 3. 已知限制

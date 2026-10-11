@@ -27,7 +27,19 @@
 //!   （需要 `mprotect` / 固定地址放置，两者都还没实现）；
 //! - `brk` 沿用 Linux 语义：**不返回错误**，失败时返回原值（用 `ret < addr` 判断）。
 //!
-//! 尚未实现的号（`mprotect`/`fork`/`execve`/`wait4`）在内核侧仍落在公共 ENOSYS 桩上。
+//! v0.9 第三步加入了进程管理（内核侧 `kernel/src/syscall/process.rs`）：
+//!
+//! - `fork()`：父进程返回子进程 PID、子进程返回 0；子进程从**同一条用户指令**
+//!   继续执行（内核克隆了 `fork` 那一刻的完整寄存器帧）；
+//! - `execve(path, argv)`：换映像，成功后**不返回**；`argv` 用「指针 + 长度」对数组传
+//!   （内核逐段校验后写进新进程的用户栈，见 `libc::args`）；
+//! - `wait4(pid)`：运行并回收直接子进程，返回退出码。
+//!
+//! 仍未实现的号只剩 `mprotect`（W^X 转换用），它在内核侧落在公共 ENOSYS 桩上。
+//!
+//! 与 Linux 的调度差异：本内核单 CPU、用户态无抢占，子进程不会与父进程并发运行，
+//! 它要等父进程 `wait4` 才被恢复 —— 标准写法 `if pid == 0 { execve } else { wait4 }`
+//! 因此原样可用（详见 `docs/process.md`）。
 
 /// 系统调用号（与内核表一致；不要用魔法数调用 `raw`）。
 pub const SYS_READ: u64 = 0;
@@ -67,6 +79,11 @@ pub const O_CREAT: i32 = 0o100;
 pub const ENOENT: isize = -2;
 /// `-EBADF`：fd 无效 / 未打开 / 打开模式与操作不符。
 pub const EBADF: isize = -9;
+/// `-EAGAIN`：本次没有数据可用（非阻塞语义，不是错误）。
+///
+/// v0.9 只有 `read(0)` 会返回它：1.5 秒内键盘没有交付一整行时
+/// （内核在无输入时不会无限等待，理由见 `kernel/src/syscall/file.rs::read_stdin`）。
+pub const EAGAIN: isize = -11;
 /// `-ENOMEM`：内核内存不足。
 pub const ENOMEM: isize = -12;
 /// `-EFAULT`：用户传了不属于自己的地址区间。
@@ -77,8 +94,10 @@ pub const EISDIR: isize = -21;
 pub const EINVAL: isize = -22;
 /// `-ENOSPC`：空间不足（fd 用尽 / 文件超过 RAMFS 上限）。
 pub const ENOSPC: isize = -28;
-/// `-ENOSYS`：号合法但内核尚未实现。
+/// `-ENOSYS`：号合法但内核尚未实现（v0.9 起只剩 `mprotect`）。
 pub const ENOSYS: isize = -38;
+/// `-ECHILD`：`wait4` 找不到该 PID 的直接子进程。
+pub const ECHILD: isize = -10;
 
 /// `mmap` 保护位：可读。
 pub const PROT_READ: i32 = 0x1;
@@ -206,15 +225,67 @@ pub fn nanosleep(ticks: u64) -> isize {
     unsafe { raw(SYS_SLEEP, ticks, 0, 0, 0, 0) }
 }
 
-/// `exit(code)`：结束当前用户态执行并把退出码交回内核。
+/// `execve` 的 `argv` 项数上限（与内核 `syscall::process::ARG_MAX` 一致）。
+pub const ARG_MAX: usize = 8;
+
+/// `fork()`：复制当前进程。
 ///
-/// v0.7 的语义仍是「结束这次用户程序运行」（内核不销毁进程对象），
-/// 调用后控制权回到 `kernel/src/syscall/user.rs::selftest` 的调用者。
+/// - **父进程**：返回子进程 PID（> 0）；
+/// - **子进程**：返回 0，并从**同一条用户指令**继续执行（内核恢复了
+///   `fork` 那一刻的完整寄存器现场，只把 `rax` 改成 0）；
+/// - 失败：返回负 errno（进程表满 → [`EAGAIN`]，地址空间复制失败 → [`ENOMEM`]）。
+///
+/// 本内核单 CPU、用户态无抢占：子进程**不会与父进程并发运行**，它要等父进程
+/// `wait4` 才被恢复。对这段调用代码来说两者没有区别 —— 标准的
+/// `if pid == 0 { execve(..) } else { wait4(pid) }` 原样可用。
+pub fn fork() -> isize {
+    unsafe { raw(SYS_FORK, 0, 0, 0, 0, 0) }
+}
+
+/// `execve(path, argv)`：用 `path` 的映像替换当前进程。
+///
+/// **成功后不返回**（内核换 CR3 + 恢复新入口的帧）；失败返回负 errno，调用方
+/// 通常立刻 [`exit`]（Shell 的 `cmd_external` 就是这么写的）。
+///
+/// `argv` 用「指针 + 长度」对数组传递（与 `open`/`write` 的路径同一种风格）：
+/// 内核逐段校验后把字符串与指针数组写进新进程的用户栈。用户态没有堆也能用 ——
+/// 这里的临时数组在栈上。
+pub fn execve(path: &str, argv: &[&str]) -> isize {
+    let n = argv.len().min(ARG_MAX);
+    let mut pairs = [0u64; ARG_MAX * 2];
+    for (i, arg) in argv.iter().take(n).enumerate() {
+        pairs[i * 2] = arg.as_ptr() as u64;
+        pairs[i * 2 + 1] = arg.len() as u64;
+    }
+    unsafe {
+        raw(
+            SYS_EXEC,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            pairs.as_ptr() as u64,
+            n as u64,
+            0,
+        )
+    }
+}
+
+/// `wait4(pid)`：运行并回收直接子进程，返回它的退出码（负数 = errno）。
+///
+/// 找不到该 PID 的直接子进程返回 [`ECHILD`]；重复 `wait4` 同一个 PID 返回
+/// 同一个退出码（内核已把它回收成僵尸后立刻释放，第二次会得到 [`ECHILD`]）。
+pub fn wait4(pid: i64) -> isize {
+    unsafe { raw(SYS_WAIT, pid as u64, 0, 0, 0, 0) }
+}
+
+/// `exit(code)`：结束当前进程并把退出码交回内核。
+///
+/// 顶层程序（`/init`、`/bin/sh`）结束后控制权回到内核运行驱动；
+/// 子进程结束后回到父进程的 [`wait4`]。
 pub fn exit(code: i32) -> ! {
     unsafe {
         raw(SYS_EXIT, code as u64, 0, 0, 0, 0);
     }
-    // 内核的 exit 路径不会回到用户态（它走 `trampoline::leave`）；
+    // 内核的 exit 路径不会回到用户态（它恢复父进程/驱动方的内核现场）；
     // 真回到这里说明 ABI 被破坏了，用 `ud2` 立刻显形而不是继续跑。
     unsafe { core::arch::asm!("ud2", options(noreturn)) }
 }

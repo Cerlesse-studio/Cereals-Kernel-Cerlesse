@@ -5,9 +5,15 @@
 //!
 //! | fd | 含义 |
 //! | ---- | ---- |
-//! | 0 | stdin —— **尚未接通**（键盘行缓冲是 v0.9 的事）：`read` 返回 0（EOF），不让用户程序卡住 |
+//! | 0 | stdin —— **键盘行缓冲（v0.9）**：交付整行（行尾统一为 `\n`），见 [`read_stdin`] |
 //! | 1 / 2 | stdout / stderr —— 写串口（v0.6 行为不变） |
 //! | ≥ 3 | RAMFS 文件（由 [`crate::fs::file`] 的 fd 表管理） |
+//!
+//! stdin 的语义选择（v0.9）：**行缓冲（cooked）**而不是原始字节流 ——
+//! 键盘驱动已经做了行编辑（退格、回显），去程交付「一整行 + `\n`」；
+//! 用户程序因此不需要自己拼行。没有整行时会等待，但**不会无限等**：
+//! 超过 [`STDIN_IDLE_TICKS`] 返回 `-EAGAIN`，否则「无人输入」会让整机
+//! 卡在这里（v0.9 还没有可抢占的调度器，见 `docs/syscall.md` 第 3 节）。
 //!
 //! 两条贯穿所有 handler 的规则：
 //!
@@ -19,10 +25,11 @@
 
 use core::slice;
 
-use crate::driver::serial;
+use crate::driver::{keyboard, serial};
 use crate::fs::file as fdtable;
 use crate::fs::vfs;
 use crate::syscall::address_space::UserSpace;
+use crate::time::clock;
 
 /// 单次 `read`/`write` 允许的最大字节数。
 const IO_MAX: u64 = 4096;
@@ -119,6 +126,51 @@ fn log_errno(op: &str, fd: i32, err: i64) {
     serial::println("");
 }
 
+/// stdin（fd=0）等待一个整行的最大 tick 数（PIT 100Hz → 3 秒）。
+///
+/// 为什么不是阻塞到底：v0.9 仍然是「一次运行一个用户程序、内核在 syscall 里等」
+/// 的模型。若 stdin 无限等待，任何没有键盘输入的启动都会永久停在 Shell 的 `read` 上，
+/// `user: selftest PASS` 不再出现。返回值 `-EAGAIN` 把「现在没有输入」交给
+/// 用户程序决定（Shell 收到两次就自行退出）。进程模型落地后这里会换成真正的阻塞等待。
+const STDIN_IDLE_TICKS: u64 = 300;
+/// `-EAGAIN`：本次没有整行可用（非阻塞语义的一部分，不是错误）。
+const EAGAIN: i64 = -11;
+
+/// stdin（fd=0）：从键盘行缓冲取一整行。
+///
+/// 与 `sys_sleep` 相同的等待手法：`syscall` 入口用 IA32_FMASK 清了 IF，
+/// 等待期间显式 `sti; hlt` 打开中断（IRQ1 才能把字符填进行缓冲）；
+/// 取到行后 `cli` 恢复「handler 关中断」的约定再返回。
+///
+/// 取行本身不需要关中断：`ready` 标志已保证 IRQ1 的写者不会动正在被取走的缓冲
+/// （见 `driver::keyboard::LineBuffer`）。
+unsafe fn read_stdin(space: *const UserSpace, buf: u64, count: u64) -> i64 {
+    let dst = match unsafe { user_bytes_mut(space, buf, count, "read") } {
+        Ok(dst) => dst,
+        Err(errno) => return errno,
+    };
+
+    let deadline = unsafe { clock::tick_count() } + STDIN_IDLE_TICKS;
+    loop {
+        if let Some(n) = unsafe { keyboard::take_line(dst) } {
+            unsafe {
+                core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+            }
+            log_read(0, count, n);
+            return n as i64;
+        }
+        if unsafe { clock::tick_count() } >= deadline {
+            serial::print("user: read fd=0 idle (no line within ");
+            serial::print_dec(STDIN_IDLE_TICKS);
+            serial::println(" ticks)");
+            return EAGAIN;
+        }
+        unsafe {
+            core::arch::asm!("sti", "hlt", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
 /// 系统调用 `read(fd, buf, count)`。
 pub unsafe fn sys_read(args: &[u64; 5], space: *const UserSpace) -> i64 {
     let fd = args[0] as i32;
@@ -132,9 +184,7 @@ pub unsafe fn sys_read(args: &[u64; 5], space: *const UserSpace) -> i64 {
         return 0;
     }
     if fd == 0 {
-        // stdin 未接通：返回 0（EOF）而不是错误，让 `cat` 之类的循环自然结束
-        serial::println("user: read fd=0 got=0 (stdin not connected)");
-        return 0;
+        return unsafe { read_stdin(space, buf, count) };
     }
     if fd < 3 {
         // fd 1/2 是只写串口设备（读它们返回 EBADF，而不是「读到空」）

@@ -1,0 +1,12 @@
+[package]
+name = "user-shell"
+version = "0.1.0"
+edition = "2021"
+description = "v0.9 交互式 Shell：键盘行输入 → 解析 → 内建命令（外部命令依赖进程模型）"
+
+[dependencies]
+libc = { path = "../../libc" }
+
+[[bin]]
+name = "user-shell"
+path = "src/main.rs"

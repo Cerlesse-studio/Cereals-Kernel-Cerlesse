@@ -614,8 +614,8 @@ user           : ~ /home/<user>
 
 ### 12.2 与既有验收的关系
 
-- 本提案不改变任何现有验收：`make test-all`（内核侧 11 个串口断言目标）、`make go-test`、
-  `make test-orch`（10 场景）都必须保持现状；
+- 本提案不改变任何现有验收：`make test-all`（内核侧 12 个串口断言目标）、`make go-test`、
+  `make test-orch`（11 场景）都必须保持现状；
 - P0 的 `make test-pkg` 是**主机侧**测试（`tests/test_ckc.py`，不启 QEMU），不进 `tests/orchestrate.json`（那里是 QEMU 场景）；
 - 不改 `tools/image-builder` / `tools/mkfs` 的现有行为（P1 才动，且以回归通过为前提）。
 

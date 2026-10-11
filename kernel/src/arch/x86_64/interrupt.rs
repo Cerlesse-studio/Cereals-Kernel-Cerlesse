@@ -357,8 +357,12 @@ fn print_reg(name: &str, val: u64) {
 /// 注：IRQ0（向量 0x20）不再经过此函数，而是由向量 stub 直接调用 irq_dispatch。
 ///
 /// v0.6：来自 ring3 的异常**不再 panic**。用户程序的越权访问是预期行为，
-/// 处理方式是打印诊断后终止该用户态执行（`trampoline::leave`）并回到内核调用者，
-/// 内核自身保持存活 —— 这正是「用户地址空间隔离」的验收形态。
+/// 处理方式是打印诊断后终止该用户态执行并回到内核调用者，内核自身保持存活 ——
+/// 这正是「用户地址空间隔离」的验收形态。
+///
+/// v0.9 第三步：终止不再靠全局的「一次性运行」状态，而是把**当前进程**标记成
+/// 异常退出的僵尸进程，然后回到暂停在它 `return_to` 上的内核调用者
+/// （顶层程序回驱动，子进程回 `wait4`）—— 见 `syscall::process::terminate_from_fault`。
 #[no_mangle]
 pub extern "C" fn exception_dispatch(frame: *mut ExceptionFrame) -> ! {
     // SAFETY: frame 由 isr_common 按 ExceptionFrame 布局构造
@@ -391,8 +395,8 @@ pub extern "C" fn exception_dispatch(frame: *mut ExceptionFrame) -> ! {
             serial::println("");
         }
         serial::println("user: isolation PASS (ring3 kernel access blocked; program terminated)");
-        // 丢弃用户上下文，回到 `trampoline::enter` 的内核调用者。
-        unsafe { crate::syscall::trampoline::leave() }
+        // 终止当前进程，回到「谁在等我」的内核调用者（不返回）。
+        unsafe { crate::syscall::process::terminate_from_fault() }
     }
 
     let name = NAMES.get(f.vector as usize).copied().unwrap_or("unknown");

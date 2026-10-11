@@ -26,6 +26,8 @@ pub mod syscall_table;
 pub mod trampoline;
 pub mod user;
 
+use crate::driver::serial;
+
 pub use crate::syscall::address_space::UserSpace;
 
 /// 未实现系统调用的统一返回码（`-ENOSYS`）。
@@ -44,6 +46,16 @@ pub unsafe extern "C" fn syscall_dispatch(
     space: *const UserSpace,
 ) -> u64 {
     let args_ref: &[u64; 5] = unsafe { &*(args as *const [u64; 5]) };
+    // 已命名但未实现的号：留下「谁在依赖它」的记录。
+    // 这是一条**依赖关系证据**，不是诊断噪声：`mprotect`（v0.9 起唯一剩下的号）
+    // 被调用时串口上会出现 `syscall: ENOSYS nr=10 name=mprotect`，
+    // 而不是只靠一句「还没实现」的说明（见 docs/syscall.md 3.4）。
+    if let Some(name) = syscall_table::unimplemented_name(nid) {
+        serial::print("syscall: ENOSYS nr=");
+        serial::print_dec(nid);
+        serial::print(" name=");
+        serial::println(name);
+    }
     match syscall_table::parse(nid) {
         Some(handler) => {
             let ret = unsafe { handler(args_ref, space) };
@@ -71,8 +83,8 @@ pub fn init() {
     // 尚未完全脱离时被中断打断
     cpu::set_fmask(0x200 | 0x400 | 0x100);
 
-    // 4. 两条专用内核栈
-    trampoline::init_stacks();
+    // 4. 进程表（每进程一条 64 KiB 内核栈：syscall 与 ring3 中断/异常共用同一栈顶）
+    crate::process::process::init();
 
     crate::driver::serial::println("syscall: syscall/sysret entry armed (EFER.SCE, STAR/LSTAR/FMASK)");
 }

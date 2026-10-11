@@ -260,11 +260,6 @@ impl UserSpace {
         self.root
     }
 
-    /// 用户栈顶虚拟地址。
-    pub fn stack_top(&self) -> u64 {
-        USER_STACK_TOP
-    }
-
     /// 已映射的映像页数。
     pub fn image_pages(&self) -> usize {
         self.image_pages
@@ -332,6 +327,94 @@ impl UserSpace {
             }
         }
         Ok(USER_VIRT_BASE)
+    }
+
+    /// `fork` 的地址空间复制：新建一棵**同布局**的页表，并把已映射的用户页逐页复制。
+    ///
+    /// 复制的是**内容**而不是页表项：父子进程此后各有自己的页帧（写时复制属后续版本
+    /// 的优化，当前语义是「立即复制」，正确性上更强）。任何一步失败时返回 `Err`，
+    /// 此时新地址空间作为一个局部量被 `Drop`，已分配的帧全部归还（`fork` 失败不留泄漏）。
+    ///
+    /// 复制的对象与「用户态能观察到什么」一一对应：
+    /// - 映像页（代码/`RW` 段 + 每页的权限位，`W^X` 因此保持）；
+    /// - 用户栈（子进程恢复执行时用的还是同一段栈内容）；
+    /// - brk 堆窗口里已映射的页 + 当前 break；
+    /// - 匿名 mmap 窗口里已映射的页 + 每页权限位。
+    pub fn clone_for_fork(&self) -> Result<Self, i64> {
+        let mut child = Self::new()?;
+
+        // 1. 映像页：`map_image_page` 会分配 + 清零 + 写 PT，然后按段权限写入权限位
+        for i in 0..self.image_pages {
+            let Some(src) = self.image[i] else {
+                continue;
+            };
+            let dst = child.map_image_page(i, self.image_flags[i])?;
+            unsafe { copy_page(src.start_address(), dst) };
+        }
+
+        // 2. 用户栈（`new()` 已经映射好，且父子页帧一一对应）
+        for i in 0..USER_STACK_PAGES {
+            unsafe { copy_page(self.stack[i].start_address(), child.stack[i].start_address()) };
+        }
+
+        // 3. brk 堆：只复制**已映射**的页，并沿用当前 break
+        let pt = child.pt;
+        for i in 0..USER_HEAP_PAGES {
+            let Some(src) = self.heap[i] else {
+                continue;
+            };
+            let virt = USER_HEAP_VIRT + i as u64 * PAGE_SIZE;
+            map_new_page(pt, &mut child.heap[i], virt, USER_RW_FLAGS)?;
+            let dst = child.heap[i].expect("map_new_page 已填槽位").start_address();
+            unsafe { copy_page(src.start_address(), dst) };
+        }
+        child.brk = self.brk;
+
+        // 4. 匿名 mmap 窗口：同样只复制已映射的页 + 每页权限
+        for i in 0..USER_MMAP_PAGES {
+            let Some(src) = self.mmap[i] else {
+                continue;
+            };
+            let virt = USER_MMAP_VIRT + i as u64 * PAGE_SIZE;
+            let flags = self.mmap_flags[i];
+            map_new_page(pt, &mut child.mmap[i], virt, flags)?;
+            child.mmap_flags[i] = flags;
+            let dst = child.mmap[i].expect("map_new_page 已填槽位").start_address();
+            unsafe { copy_page(src.start_address(), dst) };
+        }
+
+        Ok(child)
+    }
+
+    /// 把 `data` 写进用户栈的虚拟地址 `virt`（必须整段落在这 4 个栈页内）。
+    ///
+    /// 用途：内核在**切换 CR3 之前**构建 `execve` 的 `argv`（字符串 + 指针数组）。
+    /// 因为此时内核还跑在内核 CR3 下，所以这里按栈页帧的**物理地址**写入
+    /// （内核恒等映射物理内存），而不需要先切页表。
+    ///
+    /// # Panics
+    /// `virt..virt+data.len()` 越出栈窗口会 panic：调用方（syscall 层）在调用前
+    /// 已按自己的上限（[`crate::syscall::process::ARG_MAX_BYTES`]）算过布局。
+    pub fn stack_write(&self, virt: u64, data: &[u8]) {
+        let mut done = 0usize;
+        while done < data.len() {
+            let v = virt + done as u64;
+            let offset = v - USER_STACK_VIRT;
+            let index = (offset / PAGE_SIZE) as usize;
+            let in_page = (offset % PAGE_SIZE) as usize;
+            assert!(index < USER_STACK_PAGES, "stack_write 越出用户栈窗口");
+            let frame = self.stack[index];
+            let room = PAGE_SIZE as usize - in_page;
+            let n = room.min(data.len() - done);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr().add(done),
+                    (frame.start_address() + in_page as u64) as *mut u8,
+                    n,
+                )
+            };
+            done += n;
+        }
     }
 
     /// 当前 break（页对齐）。`brk(0)` 的返回值。
@@ -582,6 +665,16 @@ impl Drop for UserSpace {
         paging::free_table(self.pdpt);
         paging::free_table(self.root);
     }
+}
+
+/// 复制一个页帧的内容（源与目标都由调用方保证是完整映射的 4 KiB 页）。
+///
+/// # Safety
+/// `src`/`dst` 必须是有效且互不重叠的物理页地址；内核 CR3 下两者都可读写。
+unsafe fn copy_page(src: u64, dst: u64) {
+    unsafe {
+        core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, PAGE_SIZE as usize)
+    };
 }
 
 /// 堆页与匿名 mmap 页的默认权限：可读可写、**不可执行**（NX）。

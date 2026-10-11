@@ -144,7 +144,11 @@ IMAGE UNCHANGED (write test restored the scratch sector)
 - [x] PIT/Timer 子系统（`kernel/src/time/`：通道 0 重装载值、tick 计数）
 - [x] IRQ 分发入口与 16 槽 IRQ 注册表（`kernel/src/interrupt/irq.rs`）
 - [x] IRQ0（PIT）回调：100Hz，每 100 tick 打印一次 `IRQ0_heartbeat tick=<n>`
-- [x] PS/2 键盘中断输入（`kernel/src/driver/keyboard.rs`）：8042 初始化、IRQ1、set 1 解码、回显 `KB <字符>`
+- [x] PS/2 键盘中断输入（`kernel/src/driver/keyboard.rs`）：8042 初始化、IRQ1、set 1 解码
+- [x] **行缓冲与终端式回显（v0.9）**：128 字节行缓冲 + 行编辑（退格、回显），`Enter` 把整行标为可取
+      并打印 `kbd: line ready len=N`；`stdin`（fd=0）由 `take_line` 取走（`syscall/file.rs::read_stdin`）。
+      回显协议由 v0.4 的 `KB <字符>` 改为**原样回显**（理由：终端语义；`make test-keyboard` 断言同步改为
+      `kbd: line ready len=3`，`KBIRQ ENTRY/EXIT` 不变）
 - [x] 上下文切换原语（`kernel/src/arch/x86_64/context.rs`）：`switch_to` / `init_context` + 内核自测
 - [x] `make test-keyboard`：QEMU monitor `sendkey` 注入真实按键并断言回显
 
@@ -152,7 +156,10 @@ IMAGE UNCHANGED (write test restored the scratch sector)
 
 - PIC 映射固定为 master/slave + IRQ0..15 → 向量 32..47；APIC（LAPIC/IOAPIC/redirection）仍为占位。
 - IRQ 汇编入口（`irq_common`）保存/恢复 15 个通用寄存器，**不保存** XMM/FPU 状态（内核不用浮点）。
-- 键盘暂无环形缓冲，主循环无法「读取」按键（v0.9 控制台时再补）；驱动在中断上下文直接打印。
+- 键盘行缓冲是**单行**（一行的容量 128、含行尾 `\n`）：还没有输入队列，上一行没被 `read` 取走时
+  新按键被丢弃（`driver/keyboard.rs::LineBuffer` 文档说明了这个互斥约定）。多行队列/终端抽象等 Shell 之后的控制台阶段。
+- 回显在**中断上下文直接打印**（cooked 模式）：同一串口通道上还有 `KBIRQ ENTRY/EXIT` 标记，
+  可读性靠「一次击键一段标记」的约定，终端抽象尚未引入。
 
 ## 2. 开发路线
 
@@ -214,5 +221,6 @@ IMAGE UNCHANGED (write test restored the scratch sector)
 | 2026-10-08 | v0.4 完成：IRQ stub 修正（B-08）、IRQ 入口保存寄存器（B-09）、PIT 100Hz、PS/2 键盘回显、上下文切换原语；新增 `make test-keyboard` |
 | 2026-10-08 | v0.4 最后一项 H-04/H-05 落地：Go 编排器 + 串口分析器；`make go-test` / `make test-orch` 通过 |
 | 2026-10-08 | 统一文档顶部元信息与修订记录（阶段 / 最后更新 / 状态） |
+| 2026-10-11 | **v0.9 输入侧**：键盘驱动加行缓冲（行编辑 + 整行交付 + `kbd: line ready len=N`），回显由 `KB <字符>` 改为终端式原样回显；1.6 补记、1.7 限制项由「无环形缓冲」改为「单行缓冲 + cooked 回显」；`make test-keyboard` 断言同步 |
 | 2026-10-11 | **v0.8 收官**：磁盘文件系统 FAT12/16/32（`fs/fat.rs`，只读）挂到 VFS，`fs::mount_disks` 接入启动链（`/disk` + `/mnt/fat`）；H-03 `tools/mkfs/mkfs.py` 落地（mtools 独立复核）；新增 `make test-fat`（21 项，双盘）与编排场景 `fat`（10 场景）；状态行改为「v0.8 已完成」，限制项从「FAT32 未做」改为「FAT 只读、无扇区缓存」 |
 | 2026-10-11 | **v0.8 前半落地**：新增 `driver/pci.rs`（机制 #1 + BAR 探测 + 窗口大小）、`driver/driver.rs`（注册框架 + `probe_all`）、`driver/block.rs`（按扇区读写 + 验收自测）、`driver/virtio_blk.rs`（legacy virtio 0.9.5，同步轮询 + bounce buffer）、`arch/x86_64/port.rs`（端口 I/O）、`frame::allocate_contiguous`；启动盘改为 virtio-blk（Makefile / `tests/test_boot.py` / `tests/test_keyboard.py`，`disable-modern=on`）；新增 `make test-driver`（22 项）与编排场景 `driver`（9 场景）；修 B-16（BAR 大小 32→64 位宽错误）、B-17（LBA 溢出未拦）；状态行由「v0.8 尚未编写」改为「v0.8 前半完成，FAT32 待做」 |

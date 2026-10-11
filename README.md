@@ -15,6 +15,27 @@ payload_len / payload_off / 32 字节 payload_sha256 / 保留位，小端）+ **
 验收：`make test-pkg`（`tests/test_ckc.py`，**37 项**，含用系统 `tar` 读同一段 payload 的
 **独立复核**）；规格见 docs/package-manager.md 3.2。
 
+**🧩 外部程序真的能跑了（2026-10-11，v0.9 第三步：进程对象 + `fork`/`execve`/`wait4`）**：
+Shell 里的 `hello world` 现在会：`fork()`（复制 Shell 的地址空间与当前寄存器帧）→ 子进程
+`execve("/bin/hello", argv)`（换映像、把 `argv` 写进新进程的用户栈）→ 父进程 `wait4(pid)`
+（恢复子进程运行、回收它的地址空间、拿走退出码）。
+关键不是这三个号“有实现”，而是它们背后终于有了**进程对象**：每进程一棵页表 +
+**每进程 64 KiB 内核栈**（栈底有哨兵 `KERNEL STACK OVERFLOW` 告警）+ 停在 `syscall` 里的完整用户帧。
+验收：`make test-proc`（**8 项断言 + 4 条正则**，QEMU monitor 注入 `hello world` / `ls` / `exit`）——
+用**反向引用**把 fork / execve / wait4 三处的 PID 断言为**同一个值**（PID 数值依赖启动顺序，写常数会碎），
+并断言 `user: frames free before=N after=N`：父子进程的地址空间**全部归还**。
+找不到的程序（`ls` → `/bin/ls`）也是完整链路：execve 返回 `-ENOENT`，子进程 `exit(127)`，父进程拿到 127。
+设计、状态机与两条实测踩坑（debug 构建下 16 KiB 内核栈静默溢出踩坏 `.bss` 帧分配器；退出时必须先恢复 CR3 再 Drop 地址空间）见 docs/process.md 1.4 与 docs/syscall.md 3.7。
+
+**🐚 交互式 Shell 已可用（2026-10-11，v0.9 第二步）**：`/bin/sh` 不再是占位。
+键盘行缓冲（`driver/keyboard.rs`：行编辑 + 终端式回显 + `kbd: line ready len=N`）→
+`read(0)`（`syscall/file.rs::read_stdin`：**整行交付**，行尾 `\n`；3 秒无整行返回 `-EAGAIN`）→
+`user/shell`：提示符按默认加载样式 **`root@cerlesse C:>`**（用户名@主机名 盘符>，一次 `write`），
+内建 `help` / `echo` / `cat` / `pid` / `exit`，执行真实文件 syscall（`cat /etc/motd` 走 `open/read/write/close`），
+外部命令走上面的 `fork`+`execve`+`wait4`。
+验收：`make test-shell`（**11 项**，QEMU monitor 注入真实按键：`help` → `cat /etc/motd` → `exit`）；
+`make test-user` 增至 **61 项**（含非交互路径的 Shell 步骤）；规格见 docs/syscall.md 3.6/3.7。
+
 **v0.9 已开局（2026-10-11，运行时前置条件第一步：用户堆）**：用户态终于**有堆**了。
 内核侧 `brk`（256 KiB 窗口，Linux 语义：失败返回原值）/ `mmap`（匿名私有映射，256 KiB 窗口，first-fit，
 新页**保证全零**）/ `munmap`（整段归还；清页表项时 `invlpg`，不留幽灵映射），
@@ -32,7 +53,8 @@ payload_len / payload_off / 32 字节 payload_sha256 / 保留位，小端）+ **
 PIC（8259A）初始化与 IRQ→向量（32..47）映射 → IRQ 分发注册表 → PIT 通道 0 以 **100Hz（10ms/tick）**
 产生 IRQ0 并维护 tick 计数（每 100 tick 打印一次 `IRQ0_heartbeat tick=<n>`）→
 PS/2 键盘：8042 初始化（排空输出缓冲、打开 IRQ1 使能位）→ IRQ1 扫描码读取 →
-set 1 解码（字母/数字/Shift/扩展前缀）→ 串口回显 `KB <字符>` →
+set 1 解码（字母/数字/Shift/扩展前缀）→ 串口回显（v0.9 起为**行缓冲 + 终端式原样回显**，
+`Enter` 交付整行并打印 `kbd: line ready len=N`）→
 内核态上下文切换原语（callee-saved + 栈切换，含内核自测 `context: switch PASS`）。
 
 主机侧（H-04 testorch / H-05 serialmon）：`make go-test`（`go vet` + `go test`）PASS；
@@ -40,7 +62,9 @@ set 1 解码（字母/数字/Shift/扩展前缀）→ 串口回显 `KB <字符>`
 
 自动化验证（内核侧）：`make test` 回归 PASS；`make test-exception`（#DE）PASS；
 `make test-memory`（堆/帧/页表 + 上下文切换自测）PASS；`make test-pagefault`（#PF 诊断 + CR2）PASS；
-`make test-keyboard`（经 QEMU monitor 注入真实按键，断言 `KB a` / `KBIRQ ENTRY` / `KBIRQ EXIT` / 心跳）PASS。
+`make test-keyboard`（经 QEMU monitor 注入真实按键，断言 `KBIRQ ENTRY` / `kbd: line ready len=3` / `KBIRQ EXIT` / 心跳）PASS；
+`make test-shell`（注入 `help`/`cat /etc/motd`/`exit`，断言提示符、`read fd=0`、`sh: cat /etc/motd bytes=23` 与 `user: shell PASS`）PASS；
+`make test-proc`（注入 `hello world`/`ls`/`exit`，断言 fork/execve/wait4 全链路与 PID 一致性、`user: selftest PASS`）PASS。
 
 **v0.5 已完成（2026-10-08）**：内核线程 + Round Robin 时间片调度 + IPC（pipe 骨架）。
 线程控制块与状态机（`process/thread.rs`）→ PID 分配（`process/pid.rs`）→ 定长环形就绪队列（`scheduler/queue.rs`）
@@ -87,7 +111,7 @@ IRQ 的 EOI 时序错误导致 PIC 停摆（B-11）。
 - **RAMFS**（第一个后端）：`Node { name, kind, data: Vec<u8>, children }`，单文件上限 256 KiB；
   `fs::init` 建立初始文件树 `/init`（用户程序 ELF）+ `/etc/motd` + `/tmp`；
   自测 `make test-fs` 断言 stat/内容读回/路由/`ls` 语义/负例 errno（19 项）；
-- **fd 表与文件 syscall**（`fs/file.rs` + `syscall/file.rs`）：0/1/2 保留（stdin 未接通、串口输出），
+- **fd 表与文件 syscall**（`fs/file.rs` + `syscall/file.rs`）：0/1/2 保留（stdin = 键盘行缓冲、串口输出），
   动态 fd ≥ 3 取最小空闲槽位；新增 `read`/`open`/`close`，`write` 支持文件 fd；
   用户缓冲按页校验（`-EFAULT`），单次 I/O 上限 4096 字节；
 - **ELF Loader**（`syscall/elf.rs`）：ELF64/`ET_EXEC`/`EM_X86_64` → 按**段权限**逐页映射
@@ -101,9 +125,9 @@ IRQ 的 EOI 时序错误导致 PIC 停摆（B-11）。
 `open/read/close/write` 全链路 + 内核读回用户写入的文件 + `static counter=1` + `EFAULT` + 退出码/隔离）PASS；
 `make test-fs`（19 项）PASS；`tests/orchestrate.json` 增至 **8 场景**（新增 `fs`）全 PASS。
 
-v0.7 仍**未做**（后续版本补齐）：`argc/argv`、`fork`/`execve`/`wait4` 与进程对象、动态链接、
-内核高半区迁移（用户堆已于 v0.9 第一步补齐）；磁盘 FS（FAT32）与 `mkfs`（H-03）属 v0.8，
-Shell 与 `ls`/`cat` 属 v0.9。
+v0.7 仍**未做**（后续版本补齐）：动态链接、内核高半区迁移（用户堆已于 v0.9 第一步补齐，
+`argc/argv` 与 `fork`/`execve`/`wait4` 与进程对象已于 v0.9 第三步补齐）；
+磁盘 FS（FAT32）与 `mkfs`（H-03）属 v0.8，Shell 与外部程序属 v0.9。
 
 **v0.8 已落地（2026-10-11）**：驱动注册框架 + PCI 枚举 + 块设备（virtio-blk legacy）+ 磁盘文件系统（FAT12/16/32）。
 
@@ -192,13 +216,15 @@ make test-keyboard   # v0.4：经 QEMU monitor 注入按键，断言 IRQ1 回显
 make test-scheduler  # v0.5：断言 ≥3 个内核任务在 PIT 时间片下轮转
 make test-ipc        # v0.5：断言 pipe 创建/写入/读取摘要日志 + 自测 PASS
 make test-fs         # v0.7：断言 VFS 挂载路由 + RAMFS 读/写/ls + 负例 errno
-make test-user       # v0.7/v0.9：ELF 从 RAMFS 装载 + 文件 syscall + 用户堆（brk/mmap/munmap + Vec）+ 隔离（59 项）
+make test-user       # v0.7/v0.9：ELF 从 RAMFS 装载 + 文件 syscall + 用户堆 + 隔离 + Shell（61 项）
+make test-shell      # v0.9：注入按键跑交互式 Shell（help / cat /etc/motd / exit，11 项）
+make test-proc       # v0.9：fork/execve/wait4 全链路（外部程序 /bin/hello + argv + 退出码回收，8 项 + 4 正则）
 make test-driver     # v0.8：断言 PCI 枚举 + 驱动挂接 + virtio-blk 扇区读/写/负例
 make fat-image       # v0.8：用 tools/mkfs/mkfs.py 生成 FAT32 测试盘（内容见 tests/fatroot/）
 make test-fat        # v0.8：双盘启动，断言 FAT16/32 挂到 VFS 后的读/ls/LFN/跨簇/偏移读/EROFS
-make user            # v0.7：单独构建并校验用户态脚手架（libc + user/hello → 段页对齐的 ELF）
+make user            # v0.7/v0.9：单独构建并校验三个用户程序（hello/shell/hello-bin → 段页对齐的 ELF）
 make test-pkg        # H-06 P0a：CKC 包容器（.ckc）与打包/校验规则（主机侧，不启 QEMU）
 make test-all        # 全部集成测试
 make go-test         # v0.4 H-04/H-05：Go 单元测试（串口分析 + 并行编排器）
-make test-orch       # v0.4 H-04：Go 编排器并行跑 10 个集成测试场景（tests/orchestrate.json）
+make test-orch       # v0.4 H-04：Go 编排器并行跑 12 个集成测试场景（tests/orchestrate.json）
 ```

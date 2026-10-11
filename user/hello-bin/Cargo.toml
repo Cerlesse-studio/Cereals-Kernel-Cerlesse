@@ -1,0 +1,12 @@
+[package]
+name = "user-hello-bin"
+version = "0.1.0"
+edition = "2021"
+description = "v0.9 外部程序（/bin/hello）：由 Shell fork+execve 起来，打印 pid 与 argv"
+
+[dependencies]
+libc = { path = "../../libc" }
+
+[[bin]]
+name = "user-hello-bin"
+path = "src/main.rs"

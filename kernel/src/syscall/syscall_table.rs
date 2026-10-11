@@ -31,14 +31,36 @@ pub const SYS_WAIT: u64 = 61;
 /// 系统调用号上限（不含），用于边界检查。
 pub const SYS_MAX: u64 = 256;
 
-/// 已定义但尚未实现的系统调用号（逐个补齐）。
+/// 已定义但尚未实现的系统调用号（逐个补齐）：`(号, 名字)`。
 ///
 /// 显式列出而不是「不写」：查表时它们落在 ENOSYS 桩上，
 /// 与「号越界」是两种不同的失败原因，调试时不会被混为一谈。
 /// v0.7 已把 `read/open/close` 从这张表里摘掉；用户堆（`mmap/munmap/brk`）
-/// 见下方 [`SYS_TABLE`]。`mprotect` 是下一个相关的号 —— `PROT_NONE` 的映射、
-/// 以及「先写后换成只执行」的 W^X 转换都需要它。
-const UNIMPLEMENTED: [u64; 4] = [SYS_MPROTECT, SYS_FORK, SYS_EXEC, SYS_WAIT];
+/// 见下方 [`SYS_TABLE`]。
+///
+/// `mprotect` 是 W^X 转换需要的号，目前仍未实现。
+///
+/// v0.9 第二步时 `fork/execve/wait4` 也在这张表里（Shell 的外部命令路径会真的
+/// 调用 `fork` 并拿到 -38，串口上留下 `syscall: ENOSYS nr=57 name=fork` 这条
+/// **依赖关系证据**）；v0.9 第三步实现进程对象后三者已移到 [`SYS_TABLE`]，
+/// `/bin/hello` 就是被它们跑起来的外部程序。
+const UNIMPLEMENTED: [(u64, &str); 1] = [(SYS_MPROTECT, "mprotect")];
+
+/// 查「已命名但未实现」的号对应的名字（[`UNIMPLEMENTED`] 的查询接口）。
+///
+/// 用途：`syscall_dispatch` 在把调用交给 ENOSYS 桩之前打印
+/// `syscall: ENOSYS nr=57 name=fork` —— 让「谁在依赖未实现的调用」
+/// 在串口上**可断言**，而不是只写在文档里。
+pub fn unimplemented_name(nid: u64) -> Option<&'static str> {
+    let mut i = 0;
+    while i < UNIMPLEMENTED.len() {
+        if UNIMPLEMENTED[i].0 == nid {
+            return Some(UNIMPLEMENTED[i].1);
+        }
+        i += 1;
+    }
+    None
+}
 
 /// 系统调用处理函数类型。`args[0..5]` = `rdi, rsi, rdx, r10, r8`。
 pub type SyscallHandler = unsafe fn(args: &[u64; 5], space: *const UserSpace) -> i64;
@@ -70,5 +92,9 @@ pub const SYS_TABLE: [SyscallHandler; SYS_MAX as usize] = {
     table[SYS_GETPID as usize] = crate::syscall::process::sys_getpid;
     table[SYS_SLEEP as usize] = crate::syscall::process::sys_sleep;
     table[SYS_EXIT as usize] = crate::syscall::process::sys_exit;
+    // v0.9 第三步：进程对象落地后 fork/execve/wait4 不再是 ENOSYS 桩
+    table[SYS_FORK as usize] = crate::syscall::process::sys_fork;
+    table[SYS_EXEC as usize] = crate::syscall::process::sys_exec;
+    table[SYS_WAIT as usize] = crate::syscall::process::sys_wait;
     table
 };

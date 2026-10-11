@@ -3,7 +3,7 @@
 - 阶段：第六阶段（v0.7）+ 第八阶段（v0.8 磁盘后端）
 - 最后更新：2026-10-11
 - 状态：✅ v0.7 核心已实现并验收（VFS + RAMFS + 挂载点路由 + fd 表 → `open`/`read`/`write`/`close`，
-  `make test-fs` 19 项串口断言 PASS）；**v0.8 磁盘后端（FAT12/16/32，只读）已挂到同一套 VFS** 并验收
+  `make test-fs` 20 项串口断言 PASS）；**v0.8 磁盘后端（FAT12/16/32，只读）已挂到同一套 VFS** 并验收
   （`make test-fat` 21 项），H-03 `mkfs`（`tools/mkfs/mkfs.py`）同步落地
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
@@ -141,9 +141,10 @@ fd 编号（与 Linux 一致的形状，见 syscall.md 2.7）：
 - [x] 挂载与初始文件树：`fs: mount point=/ fs=ramfs` / `fs: create /init` / `fs: write /etc/motd bytes=23` / `fs: mkdir /tmp`
 - [x] 元数据与内容：`fs: stat /etc/motd kind=file size=23 perms=-rw-r--r--`、`fs: read /etc/motd len=23 data=motd: hello from ramfs`
 - [x] **挂载点路由**：`fs: mount point=/mnt fs=ramfs-scratch` + `fs: route /mnt/note.txt fs=ramfs-scratch` + `fs: readback /mnt/note.txt len=7 data=v0.7-ok`
-- [x] 目录列举（`ls` 语义）：`fs: ls / entries=3` + 每项 `name/kind/size/perms`
+- [x] 目录列举（`ls` 语义）：`fs: ls / entries=4` + 每项 `name/kind/size/perms`
+      （v0.9 前为 3；新增 `/bin` 后变 4，这是个精确断言：根条目变化必须同步改 `fs::selftest` 与测试期望）
 - [x] 负例 errno：`fs: negative cases PASS (ENOENT/ENOTDIR/EISDIR/EEXIST/EINVAL)`
-- [x] 文件 syscall 全链路（随 `make test-user`，v0.7 时 32 项、v0.9 起 59 项断言）：`user: open path=/etc/motd flags=0x0 fd=3`
+- [x] 文件 syscall 全链路（随 `make test-user`，v0.7 时 32 项、v0.9 起 **61 项**断言）：`user: open path=/etc/motd flags=0x0 fd=3`
       → `user: read fd=3 want=64 got=23` → 内容经 `write` 打到串口 → `user: read fd=3 want=64 got=0`（EOF）
       → `user: close fd=3` → `user: open path=/tmp/hello.txt flags=0x41 fd=3` → `user: write fd=3 len=24`
       → 内核读回 `fs: readback /tmp/hello.txt len=24` + `fs: user data: written by user program`
@@ -260,5 +261,6 @@ fs: disk selftest PASS
 | 2026-10-07 | 补记路线细化：明确 VFS 先行/RAMFS 后端/文件描述符表与 syscall 对接顺序、补充 ELF Loader 对接关系、补充 FAT32/mkfs 后续位置 |
 | 2026-10-08 | 本次 docs 迭代统一文档顶部元信息（阶段 / 最后更新 / 状态）与修订记录，保持与 DEVELOPMENT.md 与索引文档描述一致 |
 | 2026-10-11 | 备注：v0.8 的块设备层已落地（`block.rs` + `virtio_blk.rs`，`make test-driver`）；当时 FAT 后端与 `mkfs` 仍未开始 |
+| 2026-10-11 | **v0.9 第二步影响**：RAMFS 初始文件树新增 `/bin`（`/bin/sh` = 交互式 Shell），根目录条目数 3 → 4（`fs::selftest` 与 `make test-fs` 期望同步）；`stdin`（fd 0）改接键盘行缓冲，fd 表描述更新 |
 | 2026-10-11 | **v0.8 磁盘后端落地（收官）**：新增 `fs/fat.rs`（FAT12/16/32 只读：BPB 解析与类型判定、固定根目录区/簇链目录、8.3 + NT 标志 + LFN、偏移读、`EROFS`/`EUCLEAN`）与 `fs::mount_disks`（`/disk` + `/mnt/fat`，验证最长前缀路由）；`FileSystem` trait 收 `&mut self` 且 `read_all` 返回 `Vec<u8>`（磁盘内容不在内存里）；修「单盘启动误判 `/mnt/fat` 已挂」（改用 `vfs::is_mount_point`）；新增 `vfs::is_mount_point`；`make test-fat`（21 项，双盘启动，编排第 10 个场景）；`tools/mkfs/mkfs.py` + `tests/fatroot/`；第 3 节由「后续计划」改写为实现记录 |
 | 2026-10-11 | **v0.7 核心落地**：从占位改为实现记录 —— 模块划分与 `FileSystem` trait、挂载表最长前缀路由（含路由证据日志）、路径语义收窄项、RAMFS 数据模型与单文件上限、初始文件树与启动日志、fd 表与 syscall 对接（fd 0/1/2 与 ≥3 的语义、最小空闲槽位、偏移量推进）、`make test-fs` 19 项验收；明确 Shell `cd/ls/cat` 属 v0.9、磁盘后端与 `mkfs` 属 v0.8 |

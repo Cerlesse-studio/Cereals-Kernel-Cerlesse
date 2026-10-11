@@ -4,7 +4,15 @@ resolver = "2"
 # 它们只对目标 x86_64-unknown-none 构建（链接脚本固定在 0x0000_0080_0000_0000，
 # 见 user/hello/user.ld），因此 `default-members` 保持 v0.1–v0.5 的三个包，
 # `cargo build`（不带 --target）不会连带构建它们。
-members = ["shared", "boot", "kernel", "libc", "user/hello"]
+members = [
+    "shared",
+    "boot",
+    "kernel",
+    "libc",
+    "user/hello",
+    "user/shell",
+    "user/hello-bin",
+]
 default-members = ["shared", "boot", "kernel"]
 
 [profile.dev]
