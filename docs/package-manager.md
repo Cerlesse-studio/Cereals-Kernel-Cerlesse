@@ -6,7 +6,8 @@
   **包容器 `.ckc`（CKC = Cerlesse Kernel Container）与打包/校验规则已实现**：
   `tools/pkgmgr/ckc.py` + `make test-pkg`（37 项，含 `tar` 独立复核）；
   事务/receipt/catalog（P0b）与内核侧接入（P1）仍待做，见第 11 节
-- 关联：[DEVELOPMENT.md](../DEVELOPMENT.md)（H-06 需求行）· [docs/README.md](./README.md)（索引）·
+- 关联：**[ckm.md](./ckm.md)（CKM 设计提案：本文的 P0b 事务/回执/签名 = CKM 阶段 3，用户态 `cpm` 合并进 `ckm pkg`；内核侧消费点由 CKM 的 `ckm_component_state` + 状态树提供）** ·
+  [DEVELOPMENT.md](../DEVELOPMENT.md)（H-06 需求行）· [docs/README.md](./README.md)（索引）·
   [docs/filesystem.md](./filesystem.md)（VFS/RAMFS/FAT 现状）· [docs/syscall.md](./syscall.md)（用户程序约束）·
   [docs/lang-selection.md](./lang-selection.md)（语言分工）· [docs/project-structure.md](./project-structure.md)（`tools/` 归属）
 
@@ -570,6 +571,11 @@ user           : ~ /home/<user>
 - 事务日志 + 回滚 + 失败注入（用 `--fail-after <phase>` 这个测试专用开关注入失败，而不是靠真断电）；
 - 退出码按 9.2；`--json` 输出；
 - 验收目标：`make test-pkg` 扩到覆盖 12.1 里剩下的条目（catalog 签名/未知公钥/激活与回退/幂等/去重/原子失败/可恢复/并发/预算）。
+
+> **与 CKM 的关系（2026-10-11）**：P0b 的交付物（事务、回执、catalog/签名、`recover`）就是
+> [CKM](ckm.md) 的 **CKM-3 阶段**，实现位置从 `tools/pkgmgr/` 延伸到 CKM Service（`userland/ckmd`）；
+> P1 原先说的「内核侧只保留未来的消费点」现在有具体契约：CKM 的组件状态接口（`ckm_component_state`，
+> 号 259）与 `/ckm/**` 状态树。**包格式（P0a）与本节的事务语义不变**，本文仍是包格式与事务的唯一规格。
 
 ### 11.2 P1 —— 与内核交付路径对接
 

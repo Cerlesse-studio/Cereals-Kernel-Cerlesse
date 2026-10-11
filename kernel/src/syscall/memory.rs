@@ -7,6 +7,7 @@
 //! | syscall | 号 | 行为 |
 //! | ---- | ---- | ---- |
 //! | `mmap` | 9 | 匿名映射：`MAP_PRIVATE|MAP_ANONYMOUS`，first-fit 落在 mmap 窗口（256 KiB），返回页对齐地址 |
+//! | `mprotect` | 10 | 改写**已映射**页的保护属性（v1.0 第一步）：页对齐、单个窗口、全段已映射；`PROT_NONE` 关页帧而不归还 |
 //! | `munmap` | 11 | 整段归还：要求页对齐、全段已映射，缺一即 `EINVAL` |
 //! | `brk` | 12 | 增长/收缩堆顶（窗口 256 KiB）；`addr == 0` 只查询。**Linux 语义：不返回错误**，失败返回原值 |
 //!
@@ -16,28 +17,31 @@
 //!    本内核的 syscall ABI 传 5 个参数（`rdi, rsi, rdx, r10, r8`）；匿名映射不需要
 //!    偏移，所以第 6 个参数现在恒为 0。要支持文件映射时必须先扩 ABI（`r9` 或
 //!    `mmap2` 风格），那是后续版本的事 —— 现在**明确拒绝**而不是假装支持。
-//! 2. **W^X 是硬约束**：`PROT_WRITE|PROT_EXEC` 直接 `EINVAL`。自分配内存不存在
-//!    「既可写又可执行」这一档（需要 JIT 的运行时只能先写、再换只执行映射，
-//!    而 `mprotect` 同样属于后续版本）。
-//! 3. **`PROT_NONE` 与 `MAP_FIXED` 现在都是 `EINVAL`**：没有 `mprotect` 时
-//!    `PROT_NONE` 的映射无法被重新启用；`MAP_FIXED` 会要求内核按调用方给的
-//!    固定地址放置映射（可能覆盖映像/栈）——没有实现之前不能「尽力而为」。
+//! 2. **W^X 是硬约束**：`PROT_WRITE|PROT_EXEC` 在 `mmap` 与 `mprotect` 上都是
+//!    `EINVAL`。自分配内存不存在「既可写又可执行」这一档；需要 JIT 的运行时走
+//!    「先 `mmap(RW)`、写完 `mprotect(RX)`」这条路（v1.0 之前 `mprotect` 落在
+//!    ENOSYS 桩上，那条路走不通）。
+//! 3. **`PROT_NONE` 现在合法**（v1.0 第一步起）：`mmap(PROT_NONE)` 得到一个
+//!    已分配但 ring3 不可访问的映射，`mprotect` 再启用它 —— 在此之前没有
+//!    `mprotect`，`PROT_NONE` 的段再也回不来，所以当时直接拒。`MAP_FIXED` 仍然
+//!    是 `EINVAL`（内核按调用方给的固定地址放置映射可能覆盖映像/栈）。
+//!
+//! `mprotect` 的失败面比 `mmap` 大（对齐、窗口、已映射、跨窗口），因此错误路径
+//! 把**每一类原因**写在串口上（`user: mprotect rejected (<reason>)` 与
+//! `user: mprotect errno=<n> ...` 两条），验收脚本断言它们，而不是只看返回值。
 //!
 //! 每个失败的路径都在串口留一行 `user: <op> rejected (...)` 或 `user: <op> errno=<n>`：
 //! 与文件类 syscall 一样，「内核真的校验过」这件事必须是可断言的串口事实。
 
 use crate::driver::serial;
 use crate::fs::vfs::EINVAL;
-use crate::syscall::address_space::{UserSpace, USER_HEAP_MAX, USER_HEAP_VIRT, USER_MMAP_MAX};
+use crate::syscall::address_space::{
+    UserSpace, PROT_EXEC, PROT_MASK, PROT_WRITE, USER_HEAP_MAX, USER_HEAP_VIRT, USER_MMAP_MAX,
+};
 use crate::memory::page::PAGE_SIZE;
 
 /// `-EFAULT`：用户传了不属于自己的地址区间（本模块只在「没有当前用户地址空间」时用）。
 const EFAULT: i64 = -14;
-
-/// `PROT_*`：`mmap` 的保护位（与 Linux 一致）。
-const PROT_READ: u64 = 0x1;
-const PROT_WRITE: u64 = 0x2;
-const PROT_EXEC: u64 = 0x4;
 
 /// `MAP_*`：只支持私有匿名映射；`MAP_FIXED`/`MAP_SHARED` 等一律 `EINVAL`。
 const MAP_PRIVATE: u64 = 0x2;
@@ -135,14 +139,11 @@ pub unsafe fn sys_mmap(args: &[u64; 5], space: *const UserSpace) -> i64 {
         return reject("len=0");
     }
     // 未知保护位（例如 PROT_GROWSDOWN）→ 拒绝，而不是忽略
-    if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+    if prot & !PROT_MASK != 0 {
         return reject("unknown PROT bits");
     }
     if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
         return reject("PROT_WRITE|PROT_EXEC is not allowed (W^X)");
-    }
-    if prot & (PROT_READ | PROT_WRITE) == 0 {
-        return reject("PROT_NONE needs mprotect (not implemented)");
     }
     if flags & MAP_ANONYMOUS == 0 {
         return reject("file-backed mmap is not supported (need MAP_ANONYMOUS)");
@@ -160,11 +161,9 @@ pub unsafe fn sys_mmap(args: &[u64; 5], space: *const UserSpace) -> i64 {
             serial::println("user: mmap rejected (no current user address space)");
             return EFAULT;
         }
-    };
-
-    let writable = prot & PROT_WRITE != 0;
-    let executable = prot & PROT_EXEC != 0;
-    match space.mmap_anon(len, writable, executable) {
+    };    // `prot` 的合法性（未知位、W^X）已在上面的校验里拦下，这里直接交给地址空间层翻译成
+    // 页表标志（`PROT_NONE` 会得到一个「已分配但 ring3 不可访问」的映射）。
+    match space.mmap_anon(len, prot) {
         Ok(addr) => {
             serial::print("user: mmap len=");
             serial::print_dec(len);
@@ -222,6 +221,83 @@ pub unsafe fn sys_munmap(args: &[u64; 5], space: *const UserSpace) -> i64 {
             serial::print(" (must be page-aligned, inside the mmap window, fully mapped; max=");
             serial::print_dec(USER_MMAP_MAX);
             serial::println(")");
+            errno
+        }
+    }
+}
+
+/// 系统调用 `mprotect(addr, len, prot)`（v1.0 第一步：运行时改保护属性）。
+///
+/// ABI 层校验（都在这里，地址空间层只管翻译与落页表）：
+///
+/// - `addr` 必须页对齐、`len > 0`（与 `munmap` 一致，Linux 的 `len=0` 也按 `EINVAL` 处理）；
+/// - `prot` 里的未知位（如 `PROT_GROWSDOWN`）一律 `EINVAL`，不静默忽略；
+/// - `PROT_WRITE|PROT_EXEC` 仍然 `EINVAL`：`mprotect` 不能绕过 W^X。它提供的正是
+///   「先 `mmap(RW)` 写、再 `mprotect(RX)` 执行」这条路，而不是可写可执行的段。
+///
+/// 返回 `0`；地址空间层拒绝时返回 `-EINVAL` 并把原因写在串口上。
+pub unsafe fn sys_mprotect(args: &[u64; 5], space: *const UserSpace) -> i64 {
+    let addr = args[0];
+    let len = args[1];
+    let prot = args[2];
+
+    let reject = |reason: &str| -> i64 {
+        serial::print("user: mprotect rejected (");
+        serial::print(reason);
+        serial::print(") addr=");
+        serial::print_hex(addr);
+        serial::print(" len=");
+        serial::print_dec(len);
+        serial::print(" prot=");
+        serial::print_hex(prot);
+        serial::println("");
+        EINVAL
+    };
+
+    if addr % PAGE_SIZE != 0 {
+        return reject("addr is not page-aligned");
+    }
+    if len == 0 {
+        return reject("len=0");
+    }
+    if prot & !PROT_MASK != 0 {
+        return reject("unknown PROT bits");
+    }
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        return reject("PROT_WRITE|PROT_EXEC is not allowed (W^X)");
+    }
+
+    let space = match unsafe { space_mut(space) } {
+        Some(space) => space,
+        None => {
+            serial::println("user: mprotect rejected (no current user address space)");
+            return EFAULT;
+        }
+    };
+
+    match space.mprotect(addr, len, prot) {
+        Ok(pages) => {
+            serial::print("user: mprotect addr=");
+            serial::print_hex(addr);
+            serial::print(" len=");
+            serial::print_dec(len);
+            serial::print(" prot=");
+            serial::print_hex(prot);
+            serial::print(" -> pages=");
+            serial::print_dec(pages as u64);
+            serial::println("");
+            0
+        }
+        Err(errno) => {
+            serial::print("user: mprotect errno=");
+            serial::print_dec(errno.unsigned_abs());
+            serial::print(" addr=");
+            serial::print_hex(addr);
+            serial::print(" len=");
+            serial::print_dec(len);
+            serial::print(" prot=");
+            serial::print_hex(prot);
+            serial::println(" (page-aligned, one window, fully mapped; the user stack is fixed RWNX)");
             errno
         }
     }

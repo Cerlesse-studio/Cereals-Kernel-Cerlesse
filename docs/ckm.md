@@ -1,0 +1,517 @@
+# Cerlesse Kernel Manager（CKM）设计提案
+
+- 阶段：跨阶段 / 内核级权限与扩展管理（CKM；执行上排在 v1.0 之后，桌面路线之前）
+- 最后更新：2026-10-11
+- 状态：📋 **提案 v1（规划）** —— 三项规格已定稿：**权限模型（第 3 节）**、
+  **内核接口（第 4 节）**、**扩展生命周期（第 5–6 节）**；实现按第 9 节的
+  CKM-1 … CKM-7 分期推进，当前**尚未写任何 CKM 代码**（`kernel/src/ckm/` 不存在）
+- 关联：[../DEVELOPMENT.md](../DEVELOPMENT.md)（H-07 需求行）· [docs/README.md](./README.md)（索引）·
+  [docs/package-manager.md](./package-manager.md)（`.ckc` 包格式与事务，CKM 的包格式层）·
+  [docs/architecture.md](./architecture.md)（第 5 节非目标）· [docs/pure-kernel.md](./pure-kernel.md)（内核/用户态边界）·
+  [docs/filesystem.md](./filesystem.md)（VFS/RAMFS/FAT 现状）· [docs/syscall.md](./syscall.md)（syscall ABI 与用户程序约束）·
+  [docs/project-structure.md](./project-structure.md)（目录归属）
+
+> 本文档顶部保留阶段 / 最后更新 / 状态字段，与项目文档维护约定对齐。
+> 约定：**文档即规格** —— 带「必须」的条款是参考实现要照着做并被验收的条款，
+> 其余是理由与开放问题。不写「大概」「可能」这类无法验收的表述。
+
+## 0. 一句话、分层与边界
+
+CKM 不是「内核里的包管理器」，而是 **内核提供强制权限控制 + 特权用户态服务执行操作 + 可插拔扩展系统提供功能** 的三层结构：
+
+```text
+CKM Manager（管理界面）          用户态、无特权：查看状态、发起操作、看审计
+   ckm（CLI，第一版唯一界面）     ↕ 经内核校验的接口
+CKM Service（特权管理服务）      用户态、持权限：包安装、启停、事务、签名校验、修复回滚
+   ckmd                          ↕ 受内核策略保护的受控接口
+CKM Core（内核管理核心）          内核内：身份/能力校验、受控系统接口、组件状态、安全策略、审计
+   kernel/src/ckm/              只实现**必须由内核保证的机制**
+Cerlesse Kernel                  进程、内存、syscall、VFS、驱动、调度、隔离
+```
+
+三条边界（写下来避免误读）：
+
+1. **内核不认识「包」**：CKM Core 不解析 `.ckc`、不解压、不下载、不比较版本、不做依赖求解、不做界面。
+   它只回答两类问题：*这个主体有没有这个能力*（第 3 节）、*这个组件处于什么状态*（第 5 节）。
+2. **权限判断在内核、不在管理器**：管理器自己算出来的结论只是 UX；任何受保护动作都要经过
+   `ckm::policy::check`，管理器被替换/篡改也不能越权（第 3.4 节的判定点表）。
+3. **第一版不做动态内核代码加载**（第 11 节）：内核模块类扩展只登记状态、不装载。
+
+借鉴的是 KernelSU 的**分层与「系统无损」思想**（内核侧强制、元模块式可插拔覆盖、模块状态机、
+安全模式恢复），不照搬 Android 的 `su`/SELinux/root 隐藏机制（见第 11 节）。
+
+> 引用到的 KernelSU 事实（本文提到时以官方文档为准）：元模块接管常规模块的安装与挂载、
+> 官方参考实现 `meta-overlayfs` 用内核 OverlayFS 做系统无损修改、**同一时刻只能装一个元模块**
+> （<https://kernelsu.org/guide/metamodule.html>）；模块目录标记 `disable`/`remove`/`skip_mount`、
+> `module.prop` 的 `id`/`versionCode`、模块 ZIP **不能**在 Recovery 里刷
+> （<https://kernelsu.org/guide/module.html>）；卷键安全模式禁用全部模块
+> （<https://kernelsu.org/guide/rescue-from-bootloop.html>）；Root Profile 由内核强制
+> （<https://kernelsu.org/guide/app-profile.html>）。**Cerlesse 的差异**：不采用 Android 的
+> `su`/SELinux 语义，覆盖层第一版内置（6.2），恢复使用独立镜像而不是 Recovery。
+
+## 1. 目标、验收面与非目标
+
+| 目标 | 落成什么条款 | 在哪一节 |
+| ---- | ---- | ---- |
+| **内核级权限控制** | 凭证 + 能力位 + 判定点表；拒绝 = `-EPERM` + 审计事件 + 串口证据 | 3 |
+| **受控系统接口** | `kernel/src/ckm/` 的模块划分与 syscall 号（Cerlesse 扩展段）+ 定长记录布局 | 4 |
+| **扩展管理** | 四类扩展、元数据字段、状态机与合法转换表、确定性加载顺序 | 5 |
+| **系统无损修改** | 覆盖层（baseline + overlay + priority），停用即撤销；基线文件永不被覆盖 | 6 |
+| **故障修复与回滚** | 事务阶段、回执、失败注入、`recover`；安全模式与恢复镜像 | 7 / 8 |
+| **可验收** | 第 10 节把 8 条故障场景落成串口断言 / 主机侧断言 / QEMU 场景名 | 10 |
+
+**非目标**（第一版明确不做，理由见第 11 节）：动态内核模块装载、GUI、多管理员/ACL/RBAC、
+扩展携带安装脚本或 hook、内核态包管理器、Android 兼容层。
+
+## 2. 现状审计（每条都有据）
+
+| 项 | 现状 | 证据 | CKM 需要它吗 |
+| ---- | ---- | ---- | ---- |
+| 凭证 / 权限 / 能力 | **全是 2 行占位**：`kernel/src/security/{credential,permission,capability}.rs` 只有 `//!` 与 `// TODO(v1.0)` | 文件本身；`docs/project-structure.md` 标 `security/` = v1.0 | ✅ 阶段 1 的下层（v1.0 先做 uid/gid + 文件 mode） |
+| 文件权限 | VFS 已有 `perms` 展示（`fs: stat … perms=-rw-r--r--`），但**没有 UID/GID 判定**、没有 `EACCES`/`EPERM` 路径 | `docs/filesystem.md`；`make test-fs` 断言里只有展示 | ✅ 判定点 1 |
+| 可写持久化 | RAMFS 在内存里、**FAT12/16/32 后端只读**（写 = `EROFS`） | `docs/filesystem.md` 3.x、`fs/fat.rs` 模块文档 | ✅ 阶段 2 的前置（扩展状态/回执/store 都要落盘） |
+| 扩展包格式 | `.ckc` 容器 + 确定性打包 + payload 哈希 + 打包期规则**已落地**（P0a，`make test-pkg` 37 项） | `docs/package-manager.md` 3.2 / 11.1 | ✅ 直接复用，**不重做**（见 2.2） |
+| `.ckc` 的事务/回执/目录 | **未做**（P0b：`cpm.py`、catalog 签名、事务日志、`rollback`/`recover`） | `docs/package-manager.md` 11.1 | ✅ = CKM 阶段 3 的交付物 |
+| syscall 扩展号段 | `0..=255` = Linux 语义，`>= 256` = Cerlesse 扩展；当前只用了 `getprocs = 256`，`SYS_MAX = 257` | `docs/syscall.md` 3.8、`syscall_table.rs` | ✅ CKM 从 257 起编号（4.3） |
+| 内核/用户态边界 | 已有 `tools/check-boundary.py`（内核不得嵌套 cargo/内嵌用户态字节/依赖用户态包）与独立 workspace `userland/` | `docs/pure-kernel.md` 第 8 节、`make check-boundary` | ✅ CKM Core 留在内核，`ckmd`/`ckm` 必须进 `userland/` |
+| 审计 / 事件 | 无（只有串口日志） | `kernel/src/` 无 audit 模块 | ✅ 阶段 1 新增 |
+| 引导菜单 / 恢复镜像 | boot crate 只做「装载内核并移交」；无菜单、无恢复条目、无启动失败计数 | `docs/boot.md`、`boot/` | ✅ 阶段 6（依赖阶段 2 的持久化） |
+
+### 2.1 三件已经具备的前提
+
+1. **机制/功能分层已有制度**（`docs/pure-kernel.md`）：内核只提供机制，因此「CKM Core 在内核、CKM Service 在用户态」不是新规矩，是既有规矩的延伸；
+2. **`.ckc` 已经是「内容即身份」**：payload 的 SHA-256 就是修订号，CKM 的签名/回执/回滚都建立在它之上，不需要第二套标识；
+3. **验收是可以只看串口的**：内核侧任何新机制都能用「一行串口证据 + 一个 `make` 目标」验收，
+   这决定了 CKM 的接口必须**可观测**（4.5 的串口行格式是硬要求）。
+
+### 2.2 与 H-06（包管理器提案）的关系 —— 明确不建两套
+
+| 层 | 归属 | 说明 |
+| ---- | ---- | ---- |
+| 包容器与打包规则 | **H-06 P0a（已落地）** | `.ckc` 格式、确定性、打包期规则；CKM 直接复用，**不新增第二套格式** |
+| 事务 / 回执 / catalog / 签名 | **CKM 阶段 3（= H-06 P0b）** | 规格继续以 `docs/package-manager.md` 第 7/8/11 节为准，本文只补「与内核状态机的接口」（第 7 节） |
+| 用户态包管理器 `cpm` | **CKM Service 的一个子命令集** | 第一版 CLI 统一叫 `ckm`，`ckm pkg add/remove/rollback/verify` 对应 `cpm` 的动词；不再并列维护两个工具 |
+| 内核侧「消费点」 | **CKM 阶段 1/4 的接口** | 原 package-manager 提案里「内核侧只保留未来的消费点」在本文变成具体契约（4.3 的 `ckm_component_state` + 第 5 节状态机） |
+
+## 3. 权限模型（定稿）
+
+### 3.1 主体与凭证
+
+每个进程持有一份凭证（v1.0 在 `kernel/src/security/credential.rs` 落地，CKM 在其上加能力位）：
+
+```rust
+struct Cred {
+    uid: u32,        // 用户
+    gid: u32,        // 主组
+    caps: u32,       // 能力位（3.2）
+}
+```
+
+固定的主体划分（**单管理员模型**，第一版刻意很小）：
+
+| uid | 主体 | 初始能力 | 说明 |
+| ---- | ---- | ---- | ---- |
+| 0 | 内核上下文 / 引导 | 全部 | 内核自己发起的操作不受判定（内核不是「外部主体」） |
+| 0 | `/init`（第一个用户进程） | `CAP_FS_SYSTEM_WRITE` | 建立系统视图；**不给 `CAP_CKM_ADMIN`**（最小权限） |
+| 1000 | 管理员（`admin`） | `CAP_CKM_ADMIN \| CAP_FS_SYSTEM_WRITE \| CAP_AUDIT_READ` | 阶段 1 是**内核常量** `CKM_ADMIN_UID = 1000`；阶段 4 起由签名配置决定 |
+| 1001 | 管理服务（`ckmd`） | `CAP_CKM_SERVICE \| CAP_FS_SYSTEM_WRITE \| CAP_AUDIT_READ` | 「服务」而不是「管理员」：能执行事务，但不能改策略（3.4 判定点 4） |
+| ≥ 2000 | 普通用户 / 普通扩展 | 无 | 默认拒绝 |
+
+**凭证只有一条改变路径（必须）**：`execve` 一个**由 CKM 状态表登记为组件程序**（5.3 的 `kind=userland|system-component`）的路径时，
+内核把该组件声明的 uid/gid 装进新凭证；其余情况凭证**完全沿袭父进程**。
+
+因此第一版**没有** `setuid`/`setgid` 系统调用、**没有** `su`、**没有** 给普通进程提权的路径 ——
+「谁能做什么」由内核的组件表 + 常量决定，而不是由用户态自己声明。
+
+### 3.2 能力位（第一版只有 4 位）
+
+| 能力 | 位 | 语义 | 谁持有 |
+| ---- | ---- | ---- | ---- |
+| `CAP_CKM_ADMIN` | `0x1` | 改 CKM 策略/授予撤销/决定进入或退出安全模式 | uid 1000 |
+| `CAP_CKM_SERVICE` | `0x2` | 执行扩展事务：启停组件、写扩展状态、注册覆盖层 | uid 1001（`ckmd`） |
+| `CAP_FS_SYSTEM_WRITE` | `0x4` | 写受保护前缀（`/etc`、`/bin`、`/lib`、`/init`、基线区） | uid 0 的 `/init`、1000、1001 |
+| `CAP_AUDIT_READ` | `0x8` | 读审计环形缓冲（`ckm_audit_read`） | 1000、1001 |
+
+规则（必须）：
+
+- 能力位是**位图**，判定只看「需要的位置是否都在持有位里」（`need & !caps == 0`）；
+- 能力**不可继承性提升**：`fork`/`execve` 不增加能力，只有 3.1 的组件表路径能换 uid/gid，
+  且新凭证的能力 = 该组件登记的能力（**不并集父进程**）；
+- 没有能力位表示的细粒度（ACL、SELinux 式标签）—— 见第 12 节开放问题 1。
+
+### 3.3 文件保护与 mode 判定（与 v1.0 的分工）
+
+- **文件 mode**（`-rwxr-xr-x` 的读/写/执行位 + uid/gid 属主）由 `security/permission.rs`（v1.0）判定，
+  失败返回 `EACCES(-13)`；这是 POSIX 意义上的检查，CKM 不重复实现；
+- **受保护前缀**额外要求能力（判定点 1）：即使 mode 允许，写 `/bin/**`、`/lib/**`、`/etc/**`、`/init`
+  仍需 `CAP_FS_SYSTEM_WRITE`，失败返回 `EPERM(-1)`（**刻意与 `EACCES` 分开**：一个是「不属于你」，
+  一个是「你没有这个能力」，两者在审计与测试里必须可区分）；
+- 受保护前缀的列表是**内核常量**（`ckm::policy::PROTECTED_PREFIXES`），第一版不允许运行时增删（阶段 4 起可由管理员改，且改动本身进审计）。
+
+### 3.4 判定点表（阶段 1 的全部强制点）
+
+| # | 操作 | 需要的条件 | 失败 | 落点（现有代码） |
+| ---- | ---- | ---- | ---- | ---- |
+| 1 | 写受保护前缀（`open(O_WRONLY\|O_CREAT)` / `write` 到已打开文件） | `CAP_FS_SYSTEM_WRITE` | `EPERM(-1)` | `syscall/file.rs` |
+| 2 | 读扩展状态树（`/ckm/**`，第 5.4 节） | 无（只读） | — | `fs/` 路由 + `syscall/dir.rs` |
+| 3 | 写扩展状态树 | `CAP_CKM_SERVICE`（内核自身写不受限） | `EPERM(-1)` | `fs/` 路由 |
+| 4 | 改 CKM 策略 / 触发安全模式 / 授予能力（阶段 4） | `CAP_CKM_ADMIN` | `EPERM(-1)` | `syscall/ckm.rs`（新增） |
+| 5 | 读审计缓冲 | `CAP_AUDIT_READ` | `EPERM(-1)` | `syscall/ckm.rs` |
+| 6 | 查自己的凭证/能力与某个 op 的判定结果 | 无（只能查自己） | — | `syscall/ckm.rs` |
+| 7 | `execve` 到受保护前缀的程序 | 程序文件可读（mode）+ 目标路径在 CKM 组件表里才有 uid 变化 | `EACCES(-13)` / 无提权 | `syscall/process.rs` |
+
+**每次 deny 必须同时产生三样东西**（缺一即验收不过）：
+
+1. 返回值 `-EPERM`（或该行指定的 errno）；
+2. 一条审计事件（4.4 的定长记录）；
+3. 一行串口证据（4.5 的格式）。
+
+## 4. 内核接口（定稿）
+
+### 4.1 模块划分（`kernel/src/ckm/`，新增，阶段 1）
+
+| 文件 | 职责 | 明确不做 |
+| ---- | ---- | ---- |
+| `mod.rs` | 常量（`CKM_ABI_VERSION`、`CKM_ADMIN_UID`、受保护前缀）、`init()`（幂等，建立空状态表与审计环） | 不解析任何包/清单 |
+| `cred.rs` | 凭证与能力位定义、`current()`、`cap_ok(need)`、组件表驱动的 uid/gid 切换 | 不做文件 mode 判定（那是 `security/permission.rs`） |
+| `policy.rs` | 判定点表（3.4）的实现：`check(op, cred, arg) -> Result<(), Errno>`，拒绝理由枚举 | 不读磁盘、不做事务 |
+| `state.rs` | 组件/扩展状态表（5.4）+ 合法转换校验 + 确定性枚举顺序 | 不持久化（阶段 3 由服务写回执；内核重启后由服务重新注入） |
+| `audit.rs` | 固定容量环形缓冲（**必须** ≥ 64 条）+ 串口行输出 + `ckm_audit_read` 的数据源 | 不做持久化审计（阶段 6 之后再谈） |
+| `api.rs` | 给 `syscall/` 用的唯一入口（把上面四个模块包成几个 `pub` 函数） | 不暴露内部类型给别的内核模块 |
+
+依赖关系（必须）：`syscall/* → ckm::api → {policy, cred, state, audit}`；
+`fs/` 只依赖 `ckm::policy` 与前缀常量；**`ckm/` 不反向依赖 `syscall/`**（与 `security/` 一样是叶子被依赖者）。
+现有 `security/` 继续承担凭证的 UID/GID 与文件 mode 判定（v1.0），两者分工写在 4.1 与 3.3。
+
+### 4.2 CKM ABI 版本
+
+- 内核导出常量 `CKM_ABI_VERSION: u32 = 1`（第一版）；
+- 扩展清单必须声明 `abi.kernel`（整数）；**判定规则第一阶段取相等**（`ext.abi_kernel == CKM_ABI_VERSION`），
+  不等即拒绝安装并留证据 `ckm: verify id=<id> result=deny reason=abi`（不等号语义留给后续版本，见开放问题 5）；
+- 内核自己的 syscall ABI 版本已有 `SYS_MAX` 表达；CKM 的 ABI 版本与它独立（前者是调用号边界，后者是管理接口/记录布局的边界）。
+
+### 4.3 CKM 系统调用（Cerlesse 扩展段，接在 `getprocs = 256` 之后）
+
+| 号 | 名字 | 签名（5 参数 ABI） | 权限 | 行为 |
+| ---- | ---- | ---- | ---- | ---- |
+| 257 | `ckm_policy_query` | `(op, arg, out_ptr, out_len, 0)` | 无（**只能查当前进程**） | 返回该 op 在本进程凭证下的判定（`0` = 允许，`-EPERM` = 拒绝）+ 定长记录（4.4） |
+| 258 | `ckm_audit_read` | `(buf_ptr, buf_len, since_seq, out_count_ptr, 0)` | `CAP_AUDIT_READ` | 把审计环里 `seq > since_seq` 的记录拷进用户缓冲，返回**条数** |
+| 259 | `ckm_component_state` | `(buf_ptr, buf_len, out_count_ptr, 0, 0)` | 无（只读） | 按 5.4 的**确定性顺序**导出组件状态记录 |
+| 260 | `ckm_policy_set` | **阶段 4 才定义** | `CAP_CKM_ADMIN` | 第一版**不实现**（阶段 1 的授予面为零） |
+
+- `SYS_MAX` 由 `257` 改为 **`260`**（即 `0..=259` 可用），`syscall_table.rs` 的号段说明同步；
+- 260 在阶段 1–3 落在公共 ENOSYS 桩上（保持「号已定义但未实现」可区分，机制已在 v1.0 保留）；
+- 号一旦发布不再回收利用（与 Linux 的号段纪律一致）。
+
+### 4.4 定长记录（内核侧唯一权威定义）
+
+**审计事件（48 字节）** —— `ckm_audit_read` 的单元，也是「拒绝必须可核查」的载体：
+
+| 偏移 | 大小 | 字段 | 说明 |
+| ---- | ---- | ---- | ---- |
+| 0 | 8 | `seq` | 单调递增（从 1 起），环形缓冲满后回绕并置 `wrapped` 标志 |
+| 8 | 8 | `pid` | 发起进程 |
+| 16 | 4 | `uid` | 凭证 uid |
+| 20 | 4 | `gid` | 凭证 gid |
+| 24 | 2 | `op` | 事件类型（4.6 枚举） |
+| 26 | 1 | `result` | `0` = allow，`1` = deny |
+| 27 | 1 | `reserved` | 0 |
+| 28 | 4 | `need` | deny 时需要的 capability 位，否则 0 |
+| 32 | 8 | `detail` | op 相关（被拒路径哈希 / 组件槽位 / 页数 / errno） |
+| 40 | 8 | `reserved` | 0 |
+
+**组件状态（64 字节）** —— `ckm_component_state` 的单元：
+
+| 偏移 | 大小 | 字段 | 说明 |
+| ---- | ---- | ---- | ---- |
+| 0 | 16 | `id` | 扩展标识（`[A-Za-z0-9._-]{1,15}`，NUL 填充） |
+| 16 | 2 | `kind` | `1` userland / `2` system-component / `3` system-override / `4` kernel-module（阶段 7 前恒不出现） |
+| 18 | 1 | `state` | `0` absent / `1` staged / `2` installed / `3` active / `4` disabled / `5` failed / `6` removed-pending |
+| 19 | 1 | `reserved` | 0 |
+| 20 | 4 | `version_code` | 整数版本（比较规则同 H-06） |
+| 24 | 4 | `abi_kernel` | 声明兼容的 CKM ABI 版本 |
+| 28 | 4 | `priority` | 覆盖层优先级（大者优先；非覆盖层恒 0） |
+| 32 | 24 | `rev` | 内容修订（payload SHA-256 的前 24 字节，与 `.ckc` 同一身份） |
+| 56 | 8 | `reserved` | 0 |
+
+两份布局的偏移与大小**必须**在 `docs/api.md` 与 `libc` 里镜像一次（与 `DIRENT_SIZE`/`PROCINFO_SIZE` 同样的做法：
+内核是唯一权威定义，用户态用 `ckm_audit_*`/`ckm_component_*` 解析器，不自己算偏移）。
+
+### 4.5 串口证据格式（必须）
+
+```text
+ckm: init ABI_VERSION=1 admin_uid=1000 protected=4 audit_cap=64
+ckm: policy op=fs_write pid=3 uid=2000 result=deny need=0x4 detail=0x2
+ckm: policy op=policy_query pid=1 uid=1000 result=allow need=0x0 detail=0x0
+ckm: component id=hello kind=1 state=3 rev=1f3c... priority=0
+ckm: audit seq=1 op=fs_write result=deny pid=3 uid=2000
+ckm: selftest PASS (checks=N)
+```
+
+- 判定行**必须**在每次 `check` 后打印（allow 与 deny 都打），因此「内核真的判断过」是可断言的串口事实；
+- `op` 用**短名**而不是数字（数字在 4.6，改动时不会让日志变成天书）：`fs_write`、`state_write`、
+  `policy_set`、`audit_read`、`policy_query`、`exec_component`、`overlay_register`、`overlay_conflict`；
+- 组件状态行只在**状态转换**时打印（不是每次查询），因此 `make test-ckm` 可以断言「谁在什么时候动了什么」。
+
+### 4.6 事件/操作枚举（内核常量，用户态镜像）
+
+```text
+1 fs_write         2 state_write      3 policy_set       4 audit_read
+5 policy_query     6 exec_component   7 overlay_register 8 overlay_conflict
+9 safe_mode_enter  10 txn_commit      11 txn_rollback
+```
+
+## 5. 扩展模型（定稿）
+
+### 5.1 四类扩展与第一版范围
+
+| 类型 | `kind` | 示例 | 管理方式 | 第一版 |
+| ---- | ---- | ---- | ---- | ---- |
+| 用户态扩展 | 1 | Shell、命令、应用、`libc` | 安装/卸载/修复/回滚（文件事务） | ✅ 阶段 3–4 |
+| 系统组件扩展 | 2 | 服务、系统工具、配置组件 | 版本与依赖管理、权限审核、健康检查 | ✅ 阶段 3–4 |
+| 系统修改模块 | 3 | 替换系统文件、增加资源、覆盖配置 | 内核覆盖层（第 6 节）的启停 | ✅ 阶段 5 |
+| 内核模块 | 4 | 可加载驱动、内核功能 | 严格签名 + ABI + 受控装载 | ❌ 阶段 7，第一版只登记状态 |
+
+判断标准（必须）：一个扩展属于哪一类，由**它的清单里的 `kind`** 决定，不由文件后缀或安装路径推断；
+`kind = 4` 在阶段 7 之前**一律拒绝安装**，错误码 `EINVAL` + 证据 `ckm: verify id=<id> result=deny reason=kind`。
+
+### 5.2 元数据（复用 `.ckc` 与 `PKG.toml` 子集）
+
+扩展清单就是 H-06 的 `PKG.toml`，CKM 只**新增一个段**（不新增格式）：
+
+```toml
+[package]
+name    = "hello-extra"
+version = "1.2.0"
+category = "userland"        # 沿用 H-06：system/driver/userland/service/image-baseline
+
+[extension]                  # CKM 新增，字段名固定
+id          = "hello-extra"  # 必须：与目录名/回执键一致，[A-Za-z0-9._-]{1,15}
+kind        = 1              # 必须：1..=4（5.1）
+version_code = 10200         # 必须：整数，唯一用于版本比较
+priority    = 0              # kind=3 必须 ≥1；其余必须为 0
+uid         = 2000           # 可选：组件程序的运行 uid（缺省 = 2000）
+[extension.abi]
+kernel      = 1              # 必须：CKM ABI 版本（4.2）
+
+[requires]
+kernel      = ">=1.0"        # 沿用 H-06：只记录、只校验
+```
+
+必须拒绝（沿用 H-06 的安全模型，不放松）：安装脚本/hook、setuid/setgid/sticky 位、scope 路径越界、
+超长路径、重复 target、未声明 `abi.kernel`、`kind=4`（阶段 7 前）。
+
+### 5.3 生命周期状态机（内核侧状态 = 5.4 记录的 `state`）
+
+```text
+        install(校验通过)            activate(依赖满足+无冲突)
+absent ───────────────▶ staged ──▶ installed ─────────────▶ active
+   ▲                     │              │                    │  │
+   │                 校验失败         启动失败             disable│  │enable
+   │                     ▼              ▼                    ▼  │
+   │                   failed ◀─────────┘                 disabled
+   │                     │                                    │
+   └──── removed-pending ◀────────────────────────────────────┘
+        （下次启动清理；用户数据不受影响）
+```
+
+合法转换表（必须，其他转换一律 `EINVAL` 并留证据）：
+
+| 从 | 到 | 谁有权 | 守卫条件 |
+| ---- | ---- | ---- | ---- |
+| absent | staged | `ckmd`（`CAP_CKM_SERVICE`） | 签名/哈希/ABI/kind/路径白名单全部通过 |
+| staged | installed | `ckmd` | 事务提交成功（回执已落盘） |
+| staged | failed | 内核 | 任一校验失败，原因进审计 `detail` |
+| installed | active | `ckmd` | 依赖满足、覆盖层无冲突（第 6.3 节） |
+| active | disabled | `ckmd` 或 `CAP_CKM_ADMIN` | 停用即撤销覆盖（6.4） |
+| disabled | active | `ckmd` | 重新激活必须重新做冲突检查 |
+| active / disabled | failed | 内核 | 健康检查/启动失败计数超阈值（阶段 6） |
+| any | removed-pending | `ckmd` | 标记删除；下次启动清理文件，**保留用户改动过的配置**（沿用 H-06 receipt 语义） |
+| removed-pending | absent | 内核（启动清理阶段） | 文件删除完成 + 回执更新 |
+
+### 5.4 内核里的状态表（阶段 1 的形态）
+
+- 固定容量：**32 个槽位**（与 `driver` 注册表、进程表同样的「固定容量 + 明确拒绝」风格；满了返回 `ENOSPC`）；
+- 枚举顺序（`ckm_component_state` 必须按它输出）：先 `kind` 升序，再 `priority` 降序，最后 `id` 字节序升序
+  —— **确定性**是可断言的前提（与 `fs: ls` 条目顺序、`getprocs` 槽位顺序同一约定）；
+- 状态树暴露在 VFS 上：`/ckm/state`（只读文件，定长记录拼接）与 `/ckm/audit`（只读，4.4 记录），
+  写它们需要 `CAP_CKM_SERVICE`；`ckmd` 通过 `ckm_component_state` 读，而不是解析串口文本；
+- **内核不持久化**状态表：重启后由 `ckmd` 从回执/状态目录重建并重新登记（阶段 3 起）。这样内核不需要认识
+  「包」，也不需要持久化格式（第 12 节开放问题 2）。
+
+### 5.5 启动加载顺序（阶段 5 起，必须确定性）
+
+```text
+内核 ckm::init()（空表）
+  → /init 建立基线视图
+  → ckmd 读状态目录 → 按 5.4 顺序逐个 ckm_component_state 登记（阶段 4 起改为内核读状态树）
+  → 按登记顺序激活：kind 1/2（文件层）→ kind 3（覆盖层，按 priority 降序）
+  → 覆盖层全部注册完成后才放行用户登录（阶段 5 的开关写在 ckmd，内核只提供 overlay_register）
+  → 任一扩展激活失败：计数 +1；连续 3 次启动失败 → 安全模式（第 8 节）
+```
+
+## 6. 系统无损修改：覆盖层（定稿）
+
+### 6.1 模型
+
+```text
+基线区（只读，可信）          覆盖层（可插拔，按 priority）
+ /system/**   ← 原始视图  ←  /ckm/overlay/<id>/**  （替代文件）
+                             /ckm/overlay/<id>.mask （显式隐藏基线文件）
+```
+
+- **基线永不被写**：扩展不得直接修改 `/system/**`（判定点 1 之外，另有一条硬规则：
+  基线与覆盖都是「只读挂载 + 内核覆盖表」，写基线一律 `EROFS`，写覆盖目录需要 `CAP_CKM_SERVICE`）；
+- **覆盖层是注册表项**（不是「真的挂了文件系统」）：`ckm::api::overlay_register(id, kind, priority, prefix)`，
+  内核在 VFS 查表时先查覆盖表（前缀最长匹配 → 优先级最高 → 同优先级冲突即拒绝），再落到基线；
+- 覆盖层只对 `kind=3` 的扩展开放；`kind=1/2` 走普通文件事务（装到 `/app/<id>/**` 与 `/bin` 白名单）。
+
+### 6.2 为什么第一版由内核内置实现、而不是「元模块」
+
+KernelSU 把「挂载/覆盖」做成可插拔的**元模块**（官方文档：元模块接管常规模块的安装与挂载，
+`meta-overlayfs` 是参考实现，同一时刻只能装一个）。Cerlesse 第一版**内置**覆盖层，理由是可验收性：
+
+1. 内置才能保证「停用扩展即撤销覆盖」是**内核**性质（一条 `overlay_unregister` 就能断言），
+   若覆盖由用户态服务实现，则「服务崩了覆盖还在不在」变成不可控；
+2. `kind=3` 的冲突检测需要内核已知全部覆盖（否则要靠服务自律）；
+3. **元模块化是明确的后续项**：阶段 5 之后可以把「覆盖表的内容来源」做成可插拔
+   （内核只保留 `overlay_register/unregister/查表`，注入者可以是 `ckmd`、也可以是另一个扩展服务），
+   这与 KernelSU 的分层目的（内核稳定、实现可替换）一致，但**第一版不做**（第 11 节）。
+
+### 6.3 冲突检测（必须）
+
+同一基线路径被两个 `kind=3` 扩展覆盖时：
+
+1. `priority` 不同 → 高者生效，低者保留但**不参与查表**，并记 `ckm: policy op=overlay_register ... result=allow detail=<被遮蔽者>`；
+2. `priority` 相同 → **拒绝后注册者**（`ckm: policy op=overlay_conflict ... result=deny`），
+   注册失败 → 该扩展进 `failed`，不进入 `active`；
+3. 禁止「隐式覆盖」：没有显式 `[extension].priority` 的 `kind=3` 扩展一律拒绝安装（5.2 已写成必须字段）。
+
+### 6.4 停用即撤销（必须可断言）
+
+`active → disabled` 时，内核必须做到三件事，且三件都进审计：
+
+1. 从覆盖表移除该扩展的全部条目（前缀 + mask）；
+2. 对受影响的路径**刷新已打开的文件视图**：重新打开得到基线内容（第一版不要求对已打开的 fd 立即生效，
+   但必须要求「新 `open` 一定拿到基线」——这条写进验收，避免「看起来撤销了、其实还有旧映射」）；
+3. 打印 `ckm: component id=<id> state=4 rev=<rev>`。
+
+## 7. 事务、回执与回滚（阶段 3 = H-06 P0b）
+
+规格继续以 `docs/package-manager.md` 第 7/8/11 节为准，本文只写**与 CKM 状态机的接口**（必须）：
+
+| 事务阶段（H-06） | CKM 侧的状态 | 谁写 |
+| ---- | ---- | ---- |
+| `prepare`（校验签名/哈希/ABI/kind/路径） | `staged` | `ckmd` 调 `ckm_component_state` 只会**读**；状态由服务镜像进内核（阶段 4） |
+| `backup`（前像入 store） | 不变 | `ckmd` |
+| `activate`（落文件） | `installed → active` | `ckmd`；内核在 `overlay_register` 时做冲突检查 |
+| `commit`（回执落盘） | 保持 | `ckmd` |
+| 任何阶段失败 | `failed` | 内核记录原因（4.6 的 `txn_rollback`） |
+| `recover`（启动时发现未提交事务） | 回滚到事务前状态并记审计 | `ckmd` + 内核审计 |
+
+必须保持不变的三条既有结论（避免被 CKM 悄悄推翻）：
+
+1. 修订 = 内容哈希，没有第二套版本标识；
+2. **纯文件安装、不执行安装脚本**（因此「扩展损坏」不会在安装期执行任意代码）；
+3. `rollback` 必须能**离线**完成（基线/缓存足够），这条在第 10 节变成验收条目 7。
+
+## 8. 救援与安全模式（阶段 6）
+
+### 8.1 触发方式（必须都支持，且可脚本断言）
+
+| 触发 | 机制 | 断言 |
+| ---- | ---- | ---- |
+| 连续 3 次启动未到「CKM 服务就绪」 | 引导器在持久化区写失败计数（第 2 节：需要阶段 2 的可写区） | `ckm: safe mode enter (boot_failures=3)` |
+| 引导菜单显式选择 | boot crate 增加菜单项 `Cerlesse (recovery)`，把 `--recovery` 放进 UEFI `LoadOptions` / 内核命令行 | 恢复镜像启动后串口出现 `ckm: recovery mode (services=off)` |
+| 管理员在管理界面请求 | `ckm enter-safe-mode`（需要 `CAP_CKM_ADMIN`） | `ckm: safe mode enter (requested_by=1000)` |
+
+### 8.2 安全模式里必须成立的四件事
+
+1. **不加载任何 `kind=3` 覆盖**（覆盖表为空）→ 系统回到基线视图；
+2. **不启动 `ckmd`**（因此 CKM 服务自己损坏时也能进来）；
+3. 只提供**最小工具集**：恢复用的 shell、`ckm recover`、审计查看、文件校验；全部**不在**扩展可覆盖的前缀里；
+4. 进入时把**全部扩展**置为 `disabled`（不是 `failed`），并在审计里记一条 `safe_mode_enter`；
+   退出安全模式必须由管理员显式逐项重新激活（不做「自动全开」）。
+
+### 8.3 恢复镜像（独立、可信）
+
+- 恢复环境是**独立启动项 + 独立镜像**，不复用正常启动链的 `/init` 与 `ckmd`（第 10 节验收条目 5 的前提）；
+- 它必须能做四件事：查看审计、校验 `store` 里每个 blob 的哈希、重装/回滚指定的扩展、修复 `ckmd` 本体；
+- 构建方式（引导菜单 vs. 独立 ESP 条目）见第 12 节开放问题 6。
+
+## 9. 分期计划（每期一个可验收出口）
+
+| 期 | 交付物 | 依赖 | 验收出口 |
+| ---- | ---- | ---- | ---- |
+| **CKM-1 内核接口** | `kernel/src/ckm/`（`cred`/`policy`/`state`/`audit`/`api`）+ 3.4 判定点 1/3/5/6 + `ckm_policy_query`/`ckm_audit_read`/`ckm_component_state` + 串口证据 | **v1.0 的 `security/`（uid/gid + mode）先落地** | `make test-ckm`（新增）：未授权写受保护前缀被拒 + 审计可读 + 组件状态枚举确定性 |
+| **CKM-2 可写持久化** | 原子写 + 掉电一致的状态区（FAT 写支持或小型日志式区，见开放问题 1）+ VFS 覆盖层的**机制**（`overlay_register/unregister` + 最长前缀/优先级/冲突） | CKM-1 | `make test-ckm`：写-重启-读回一致；覆盖注册/撤销改变 `open` 结果 |
+| **CKM-3 事务引擎** | H-06 P0b（`cpm.py` → `ckmd` 的库）+ 签名/catalog + 回执 + `recover` + 失败注入 | CKM-2 | `make test-pkg` 扩到 H-06 12.1 的剩余条目（含离线回滚、原子失败、可恢复） |
+| **CKM-4 特权服务与 CLI** | `userland/ckmd`（持 `CAP_CKM_SERVICE`）+ `userland/ckm`（CLI）+ 内核状态树 `/ckm/**` 写路径 | CKM-3 | QEMU 场景 `ckm`：装/启/停/卸/回滚全链路 + 拒绝证据（判定点 1/3/4/5） |
+| **CKM-5 系统修改模块** | `kind=3` 覆盖层全量（优先级、冲突、开机顺序、基线保护） | CKM-4 | QEMU 场景 `ckm-overlay`：停用后 `open` 回基线（6.4 的三条） |
+| **CKM-6 恢复环境** | 恢复镜像 + 引导菜单/命令行 + 启动失败计数 + 安全模式四件事 | CKM-5 | `make test-recovery`：连续 3 次失败进安全模式；从恢复环境重装 `ckmd` |
+| **CKM-7 可加载内核模块** | 签名 + ABI + 依赖 + 卸载安全检查（**本文档不展开**） | CKM-6 | 需要单独提案（`docs/ckm-kmod.md`），先于实现评审 |
+
+顺序上的两条硬约束（必须）：
+
+1. **CKM-1 之前先做 v1.0 的 `security/`**（uid/gid + mode + `EACCES`）：否则能力判定没有主体可挂靠；
+2. **CKM-3 之前必须有 CKM-2**：没有可写持久化就没有回执与可恢复事务，事务引擎只能是玩具。
+
+## 10. 第一版验收标准（把 8 条故障场景落成断言）
+
+`make test-ckm`（新增 QEMU 场景 + 主机侧断言）必须覆盖下表；每条的「断言」都是可脚本化的，
+不依赖人工观察。
+
+| # | 测试 | 合格标准 | 断言方式（必须实现其中至少一条） |
+| ---- | ---- | ---- | ---- |
+| 1 | 未授权进程请求管理权限 | 被内核拒绝 | 串口 `ckm: policy op=state_write pid=N uid=2000 result=deny need=0x2` + 用户程序拿到 `-1`（`make test-ckm`） |
+| 2 | 扩展包签名或哈希错误 | 在修改系统前拒绝 | `ckm: verify id=<id> result=deny reason=digest`（或 `reason=sig`）+ **零文件写入**（主机侧 store 快照对比） |
+| 3 | 安装过程中发生错误 | 事务回滚，无半成品状态 | `--fail-after activate` ⇒ 退出码 3 + scope 逐文件回到事务前 + 无半成品 receipt（H-06 12.1） |
+| 4 | 系统文件被扩展覆盖 | 停用后恢复原始视图 | 停用后新 `open` 得到基线内容 + `ckm: component id=<id> state=4` + 覆盖表空（`make test-ckm`） |
+| 5 | 扩展管理器程序损坏 | 独立恢复环境能修复它 | 删/改坏 `ckmd` 后从恢复镜像启动 → `ckm recover --repair-service` 成功 → 正常启动回到就绪（`make test-recovery`） |
+| 6 | 上次更新后无法启动 | 能进入安全模式并回滚 | 注入「扩展激活后 `/init` 失败」⇒ 第 3 次启动 `ckm: safe mode enter (boot_failures=3)` + 全部扩展 `state=4` + 回滚后正常启动 |
+| 7 | 网络不可用 | 能用本地基线或缓存恢复 | `ckm pkg rollback --offline` 成功（无任何网络设备时也可通过；与 H-06 12.1 同一条） |
+| 8 | 用户数据存在 | 修复系统组件不删用户数据 | 安装/回滚/修复后 `/app/<id>` 之外的用户数据（配置、用户文件）逐字节不变 |
+
+补充（必须同批验收，避免「功能对、机制没生效」）：
+
+- 判定点 1 的两类失败**可区分**：mode 不允许 → `-13`（`EACCES`），能力不足 → `-1`（`EPERM`）；
+- 审计环回绕后仍可读（`wrapped` 标志 + 至少保留 64 条中的最新部分）；
+- 组件状态枚举顺序在两次查询间**稳定**（相同输入 → 逐字节相同的输出）；
+- 不允许任何扩展通过 `kind=3` 之外的路径写基线（`EROFS` 证据）。
+
+## 11. 非目标（第一版明确不做）
+
+1. **不照搬 Android root 机制**：没有 `su` 二进制、没有 SELinux、不 patch 内核以隐藏 root、
+   不追求与 Magisk/KernelSU 模块的二进制兼容；借鉴的是**分层与系统无损思想**（第 0 节）。
+2. **不做动态内核代码加载**（`kind=4` 只登记、拒不安装）：内核模块出错会直接破坏内存，
+   不能像用户态那样沙箱；装载需要独立提案（CKM-7）。
+3. **不做 GUI**：第一版只有 `ckm` CLI（CLI 优先是刻意的：可脚本断言，GUI 的验收成本远高于收益）。
+4. **不做多管理员/ACL/RBAC**：单管理员 + 固定能力位（3.1/3.2）。
+5. **不做扩展携带脚本/hook**（沿用 H-06：`hooks = true` 一律拒绝）。
+6. **不把包管理器放进内核**：内核不认识包、不解析清单、不做依赖求解（第 0 节边界 1）。
+7. **不做 OTA/远程仓库协议**：渠道与签名沿用 H-06，第一版只要求「本地基线/缓存可用」（第 10 节 7）。
+
+## 12. 风险与开放问题（需要定夺，未定不进实现）
+
+1. **可写持久化介质**（CKM-2 的前置）：(a) 给 FAT 后端加写支持 + 原子替换（用户可 mount 走），
+   还是 (b) 新增一个极小的日志式区（双槽 A/B + CRC）专供 CKM 状态/回执/store。
+   倾向 (b)：事务需要原子性与掉电一致性，FAT 的写语义（FAT 表 + 目录项 + 簇链三处更新）
+   不天然提供；但 (a) 对用户价值更大。**定夺前不开工 CKM-2。**
+2. **覆盖表的内容来源**：第一版由内核内置（6.2）；元模块化（KernelSU 式可插拔注入）作为 CKM-5 之后的演进，
+   接口先按 6.1 固定，避免以后改 ABI。
+3. **首个管理员身份**：CKM-1 用内核常量 `CKM_ADMIN_UID = 1000`；CKM-4 起改为签名配置。
+   「如何在不引入信任悖论的前提下换管理员」必须靠恢复环境（第 8 节）解决，不能由普通路径自举。
+4. **签名算法**：与 `docs/package-manager.md` 13.1 同一个开放问题（纯标准库没有 Ed25519）。
+   两处必须用同一个决定，不能一个用 Ed25519、一个用别的。
+5. **`abi.kernel` 的兼容规则**：第一阶段取 `==`；何时放宽到区间（`>=`）需要一次 ABI 评审，
+   且必须说明「旧扩展在新内核上语义不变」的依据。
+6. **恢复环境的构建方式**：引导菜单项 + 同一 ESP（改动小）vs. 独立 ESP 条目（隔离强）。
+   取决于 `boot/` 与 `tools/image-builder` 的改动成本，CKM-6 开工前定。
+7. **审计的持久化**：第一版审计只在内存（重启即丢）；是否需要在 CKM-6 落盘（掉电后仍可核查「谁拒了谁」）
+   取决于第 1 条的可写区是否足够便宜。
+
+## 13. 修订记录
+
+| 日期 | 变更 |
+| ---- | ---- |
+| 2026-10-11 | 创建本文档：定稿权限模型（单管理员 + 4 个能力位 + 7 个判定点，凭证只由 CKM 组件表在 `execve` 时改变）、内核接口（`kernel/src/ckm/` 五模块 + `CKM_ABI_VERSION=1` + 扩展号段 257–259 + 两份定长记录 + 串口证据格式）、扩展生命周期（四类扩展、状态机与合法转换表、确定性枚举/加载顺序）；覆盖层与 KernelSU 元模块的对应关系、事务与 H-06 P0b 的接口、安全模式与恢复环境、CKM-1…CKM-7 分期、8 条故障验收落成断言、非目标与 7 个开放问题；同步 docs/README.md 索引、DEVELOPMENT.md（H-07 行 + 5.12 + 修订记录）、roadmap（第十一阶段）、architecture 第 5 节、project-structure（规划目录）、README（文档入口） |

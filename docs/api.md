@@ -40,7 +40,7 @@
 | 2 | `open` | ✅ | 打开/创建文件，返回 fd（≥ 3） |
 | 3 | `close` | ✅ | 关闭动态 fd |
 | 9 | `mmap` | ✅ | 匿名私有映射（无 offset） |
-| 10 | `mprotect` | ⛔ | 号已定义但未实现（落 ENOSYS 桩） |
+| 10 | `mprotect` | ✅ | 改写**已映射**页的保护属性（`PROT_NONE` = ring3 不可访问但帧保留） |
 | 11 | `munmap` | ✅ | 整段归还匿名映射 |
 | 12 | `brk` | ✅ | 调整用户堆顶（Linux 语义） |
 | 35 | `nanosleep` | ✅ | 睡眠 N 个 PIT tick（100Hz） |
@@ -107,11 +107,27 @@ isize mmap(usize len, i32 prot, i32 flags)   // libc: mmap(len: usize, prot: i32
 ```
 
 - **只支持私有匿名映射**：`flags` 必须含 `MAP_PRIVATE|MAP_ANONYMOUS`，`fd` 固定 `-1`，**没有 offset 参数**（ABI 5 参数）。
-- `prot` 允许 `PROT_READ`(0x1) / `PROT_WRITE`(0x2) / `PROT_EXEC`(0x4)；拒绝 `PROT_WRITE|PROT_EXEC`（W^X）与 `PROT_NONE`。
+- `prot` 允许 `PROT_READ`(0x1) / `PROT_WRITE`(0x2) / `PROT_EXEC`(0x4) / `PROT_NONE`(0x0，v1.0 起：映射存在但 ring3 不可访问，可由 `mprotect` 启用)；拒绝 `PROT_WRITE|PROT_EXEC`（W^X）。
 - 返回页对齐地址（> 0）或负 errno；**新页保证全零**；窗口 256 KiB，first-fit。
-- 错误：`EINVAL`（位非法/文件映射/PROT_NONE）、`ENOMEM`（超窗口/无空闲帧）。
+- 错误：`EINVAL`（位非法/文件映射）、`ENOMEM`（超窗口/无空闲帧）。
 
-### 2.6 `munmap`（nr=11）
+### 2.6 `mprotect`（nr=10）
+
+```
+isize mprotect(u64 addr, usize len, i32 prot)   // libc: mprotect(addr: u64, len: usize, prot: i32) -> isize
+```
+
+- 改写**已映射**页的保护属性（页帧不搬家、不清零）；成功返回 0。
+- 要求：`addr` 页对齐、`len > 0`、范围完整落在**同一个窗口**（映像 / brk 堆 / 匿名 mmap / 共享库）
+  且每一页都已映射【不做「部分成功」】。
+- `PROT_NONE`：清页表项的 `USER` 位而保留 `PRESENT`——ring3 访问 #PF，页帧与内容都还在，
+  可以再 `mprotect` 回来；同时内核不再拿它当用户缓冲（`write` 之类的调用返回 `-EFAULT`）。
+- `PROT_WRITE|PROT_EXEC` 仍被拒（W^X）；W^X 下的 JIT 写法是先 `mmap(PROT_READ|PROT_WRITE)` 写，
+  再 `mprotect(PROT_READ|PROT_EXEC)` 执行。
+- 用户栈（固定 4 页 `RW` + `NX`）不在支持范围 —— 同样是 `-EINVAL`。
+- 错误：`EINVAL`（对齐/长度/保护位/跨窗口/有页未映射/目标为栈），见 `docs/syscall.md` 3.10。
+
+### 2.7 `munmap`（nr=11）
 
 ```
 isize munmap(u64 addr, usize len)   // libc: munmap(addr: u64, len: usize) -> isize
@@ -120,7 +136,7 @@ isize munmap(u64 addr, usize len)   // libc: munmap(addr: u64, len: usize) -> is
 - 整段归还（要求页对齐且全段已映射）；清页表项并 `invlpg`，不留幽灵映射。
 - 错误：`EINVAL`。
 
-### 2.7 `brk`（nr=12）
+### 2.8 `brk`（nr=12）
 
 ```
 u64 brk(u64 addr)   // libc: brk(addr: u64) -> u64
@@ -129,7 +145,7 @@ u64 brk(u64 addr)   // libc: brk(addr: u64) -> u64
 - 沿用 **Linux 语义**：`addr = 0` 只查询当前堆顶；否则页对齐增长/收缩（窗口 256 KiB）。
 - **不返回错误**：失败时返回**原值**，调用方用 `ret >= addr` 判断成功。
 
-### 2.8 `nanosleep`（nr=35）
+### 2.9 `nanosleep`（nr=35）
 
 ```
 isize nanosleep(u64 ticks)   // libc: nanosleep(ticks: u64) -> isize
@@ -137,7 +153,7 @@ isize nanosleep(u64 ticks)   // libc: nanosleep(ticks: u64) -> isize
 
 - 睡眠 `ticks` 个 PIT tick（100Hz → 1 tick = 10ms）；等待期间 `sti; hlt`，tick 真实推进。
 
-### 2.9 `getpid`（nr=39）
+### 2.10 `getpid`（nr=39）
 
 ```
 u64 getpid()   // libc: getpid() -> u64
@@ -145,7 +161,7 @@ u64 getpid()   // libc: getpid() -> u64
 
 - 当前进程 PID（内核分配的顺序号）。
 
-### 2.10 `fork`（nr=57）
+### 2.11 `fork`（nr=57）
 
 ```
 isize fork()   // libc: fork() -> isize
@@ -157,7 +173,7 @@ isize fork()   // libc: fork() -> isize
 - **调度差异**：单 CPU、用户态无抢占，子进程**不会与父进程并发运行**，要等父进程 `wait4`
   才被恢复 —— 标准写法 `if pid == 0 { execve(..) } else { wait4(pid) }` 原样可用。
 
-### 2.11 `execve`（nr=59）
+### 2.12 `execve`（nr=59）
 
 ```
 isize execve(const u8 *path, usize path_len, const u64 *argv_pairs, usize argc, u64 _)
@@ -169,7 +185,7 @@ isize execve(const u8 *path, usize path_len, const u64 *argv_pairs, usize argc, 
   内核逐段校验后写进**新进程的用户栈**。上限 `ARG_MAX = 8` 项、单项 `ARG_MAX_LEN = 256` 字节。
 - 错误：`ENOENT`（映像不存在）、`E2BIG`（argv 超限）、`EFAULT`、`EINVAL`（ELF 被拒）。
 
-### 2.12 `exit`（nr=60）
+### 2.13 `exit`（nr=60）
 
 ```
 ! exit(i32 code)   // libc: exit(code: i32) -> !
@@ -178,7 +194,7 @@ isize execve(const u8 *path, usize path_len, const u64 *argv_pairs, usize argc, 
 - 结束当前进程并把退出码交回内核。顶层程序（`/init`、`/bin/sh`）结束后控制权回到内核；
   子进程结束后回到父进程的 `wait4`。**不返回**。
 
-### 2.13 `wait4`（nr=61）
+### 2.14 `wait4`（nr=61）
 
 ```
 isize wait4(i64 pid)   // libc: wait4(pid: i64) -> isize
@@ -205,7 +221,7 @@ isize wait4(i64 pid)   // libc: wait4(pid: i64) -> isize
 | -22 | `EINVAL` | 参数非法 | ✅ |
 | -28 | `ENOSPC` | 空间/句柄不足 | ✅ |
 | -30 | `EROFS` | 只读文件系统 | — |
-| -38 | `ENOSYS` | 号合法但未实现（v0.9 起只剩 `mprotect`） | ✅ |
+| -38 | `ENOSYS` | 号合法但未实现（v1.0 第一步实现 `mprotect` 后无此类调用；保留给后续新增号） | ✅ |
 | -117 | `EUCLEAN` | 磁盘结构损坏（簇链断/越界/目录项非法） | — |
 
 ## 4. 用户态 `libc` API
@@ -224,6 +240,7 @@ isize wait4(i64 pid)   // libc: wait4(pid: i64) -> isize
 | `close` | `fn close(fd: i32) -> isize` | |
 | `brk` | `fn brk(addr: u64) -> u64` | Linux 语义，失败返回原值 |
 | `mmap` | `fn mmap(len: usize, prot: i32, flags: i32) -> isize` | 匿名私有，无 offset |
+| `mprotect` | `fn mprotect(addr: u64, len: usize, prot: i32) -> isize` | 改写已映射页的保护属性（v1.0） |
 | `munmap` | `fn munmap(addr: u64, len: usize) -> isize` | |
 | `getpid` | `fn getpid() -> u64` | |
 | `nanosleep` | `fn nanosleep(ticks: u64) -> isize` | 1 tick = 10ms |
@@ -236,7 +253,7 @@ isize wait4(i64 pid)   // libc: wait4(pid: i64) -> isize
 
 - fd：`STDIN = 0`、`STDOUT = 1`、`STDERR = 2`、`FD_FIRST_DYNAMIC = 3`。
 - `open` 标志：`O_RDONLY = 0`、`O_WRONLY = 1`、`O_RDWR = 2`、`O_CREAT = 0o100`。
-- `mmap` 保护位：`PROT_READ = 0x1`、`PROT_WRITE = 0x2`、`PROT_EXEC = 0x4`。
+- `mmap`/`mprotect` 保护位：`PROT_NONE = 0x0`、`PROT_READ = 0x1`、`PROT_WRITE = 0x2`、`PROT_EXEC = 0x4`。
 - `mmap` 标志：`MAP_PRIVATE = 0x2`、`MAP_ANONYMOUS = 0x20`。
 - errno：`ENOENT/EBADF/ECHILD/EAGAIN/ENOMEM/EFAULT/EISDIR/EINVAL/ENOSPC/ENOSYS`（数值见第 3 节）。
 - 进程：`ARG_MAX = 8`。
@@ -401,7 +418,7 @@ make clean
 | `test-scheduler` | Round Robin 轮转 | — |
 | `test-ipc` | pipe 创建/写/读 | — |
 | `test-fs` | VFS 路由 + RAMFS 读/写/ls + 负例 | 21 |
-| `test-user` | ELF 装载 + 文件 syscall + 用户堆 + 隔离 + Shell + 动态链接 | 61 |
+| `test-user` | ELF 装载 + 文件 syscall + 用户堆 + `mprotect`（`PROT_NONE`/`RX` 转换）+ 隔离 + Shell + 动态链接 | 91 |
 | `test-shell` | 交互式 Shell（注入按键） | 11 |
 | `test-proc` | fork/execve/wait4 全链路 + PID 一致性 | 8 + 4 正则 |
 | `test-programs` | getdents/getprocs + 四个基础用户程序真的被 exec | 17 + 5 正则 |
@@ -418,3 +435,4 @@ make clean
 | 2026-10-11 | 创建本文档：汇总系统调用 ABI（寄存器约定/号表/逐条语义）、errno 表、`libc` API、
 内核内部 trait（`FileSystem`/`Driver`/`BlockDevice`）、主机侧工具 CLI 与 Makefile 目标 |
 | 2026-10-11 | 补记 v0.9 第六步（最小动态链接）：5.5 构建期接口新增 `as`+`ld` 夹具说明；第 7 节新增 `test-dyn`（10 项）与 `dyn-hostcheck`、补上漏记的 `test-programs`/`test-network` 行，`test-fs` 20 → 21 |
+| 2026-10-11 | **v1.0 第一步：`mprotect`** —— 号表第 10 行由 ⛔ 改为 ✅；新增 2.5/2.6 的 `PROT_NONE` 语义与 `mprotect` 逐条说明（2.6 之后的节号顺移一位）；4.1 新增 `mprotect` 封装、4.2 新增 `PROT_NONE`；errno 表 `-38` 行改写；第 7 节 `test-user` 61 → **91** 项 |

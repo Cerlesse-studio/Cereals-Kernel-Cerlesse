@@ -52,13 +52,11 @@ pub const SYS_MAX: u64 = 257;
 /// v0.7 已把 `read/open/close` 从这张表里摘掉；用户堆（`mmap/munmap/brk`）
 /// 见下方 [`SYS_TABLE`]。
 ///
-/// `mprotect` 是 W^X 转换需要的号，目前仍未实现。
-///
-/// v0.9 第二步时 `fork/execve/wait4` 也在这张表里（Shell 的外部命令路径会真的
-/// 调用 `fork` 并拿到 -38，串口上留下 `syscall: ENOSYS nr=57 name=fork` 这条
-/// **依赖关系证据**）；v0.9 第三步实现进程对象后三者已移到 [`SYS_TABLE`]，
-/// `/bin/hello` 就是被它们跑起来的外部程序。
-const UNIMPLEMENTED: [(u64, &str); 1] = [(SYS_MPROTECT, "mprotect")];
+/// **v1.0 第一步实现 `mprotect` 之后这张表空了**（历史上它装着
+/// `read/open/close`、`fork/execve/wait4`，最后一个是 W^X 转换要用的
+/// `mprotect`）。表结构保留：下一个「号先定义、实现后补」的调用继续往这里放，
+/// 串口上的 `syscall: ENOSYS nr=… name=…` 依然能区分「未实现」与「号越界」。
+const UNIMPLEMENTED: [(u64, &str); 0] = [];
 
 /// 查「已命名但未实现」的号对应的名字（[`UNIMPLEMENTED`] 的查询接口）。
 ///
@@ -101,6 +99,8 @@ pub const SYS_TABLE: [SyscallHandler; SYS_MAX as usize] = {
     table[SYS_OPEN as usize] = crate::syscall::file::sys_open;
     table[SYS_CLOSE as usize] = crate::syscall::file::sys_close;
     table[SYS_MMAP as usize] = crate::syscall::memory::sys_mmap;
+    // v1.0 第一步：mprotect 不再是 ENOSYS 桩（W^X 的「先写后换只执行」）
+    table[SYS_MPROTECT as usize] = crate::syscall::memory::sys_mprotect;
     table[SYS_MUNMAP as usize] = crate::syscall::memory::sys_munmap;
     table[SYS_BRK as usize] = crate::syscall::memory::sys_brk;
     table[SYS_GETPID as usize] = crate::syscall::process::sys_getpid;

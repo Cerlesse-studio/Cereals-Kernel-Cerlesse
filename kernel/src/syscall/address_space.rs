@@ -61,6 +61,22 @@
 //! 窗口大小是**刻意写死**的（各 256 KiB）：v0.9 只需要支撑「有堆可用」这件事，
 //! 更大的地址空间留给后续「按需新建 PT」的扩展（那时窗口大小会变成运行期参数）。
 //!
+//! ## `mprotect`（v1.0 第一步：运行时改保护属性）
+//!
+//! `mprotect(addr, len, prot)` 改写**已经映射**的页的权限位（[`UserSpace::mprotect`]）：
+//!
+//! - 范围必须**页对齐**、非空、且完整落在**同一个窗口**里（映像 / brk 堆 / 匿名 mmap /
+//!   共享库）；跨窗口或越界 ⇒ `EINVAL`，不做「部分成功」；
+//! - `W^X` 仍然在 syscall 层校验：`PROT_WRITE|PROT_EXEC` 一律 `EINVAL`；
+//! - 每一页都必须已映射（堆/mmap 里没碰过的页不存在）⇒ 缺一即 `EINVAL`
+//!   （与 `munmap` 的「整段已映射」同一约定，而不是 Linux 的 `ENOMEM`）；
+//! - `PROT_NONE` 的表达方式是**清 `USER` 位而保留 `PRESENT`**：ring3 访问立刻 #PF
+//!   （`error=P|U`），页帧与内容都还在，`mprotect` 回来即可用；内核侧仍然可访问，
+//!   但 [`UserSpace::page_flags`] 把没有 `USER` 的页当作「不是用户缓冲」拒掉
+//!   （所以拿一段 `PROT_NONE` 内存去 `write` 是 `-EFAULT`）；
+//! - 用户栈（固定 4 页 `RW` + `NX`）**不在支持范围**：它的保护属性由内核在 `new()`
+//!   里一次性定死，`mprotect` 碰它返回 `EINVAL`（串口有记录，不静默忽略）。
+//!
 //! 已知限制（写在文档里而不是藏着）：拷贝的是 PML4 项的**快照**。若内核在用户态
 //! 运行期间新增整个 PML4 槽位级的映射（如堆跨到新 PDPT），该映射不会出现在用户
 //! 页表中。用户态路径只做串口输出与 tick 等待，不触发此类增长。
@@ -118,6 +134,17 @@ pub const USER_DYN_PAGES: usize = 32;
 /// 共享库窗口字节上限。
 pub const USER_DYN_MAX: u64 = USER_DYN_PAGES as u64 * PAGE_SIZE;
 
+/// `PROT_*`：用户内存保护位（与 Linux 一致）。
+///
+/// 位值在这里定义**一次**（syscall 层翻译与校验都用它，libc 侧镜像同一组常量）。
+/// 本模块只负责把位翻译成页表标志（[`prot_to_flags`]），ABI 层的合法性校验
+/// （未知位、`W^X`）在 `syscall/memory.rs`。
+pub const PROT_READ: u64 = 0x1;
+pub const PROT_WRITE: u64 = 0x2;
+pub const PROT_EXEC: u64 = 0x4;
+/// 所有合法的 `PROT_*` 位；其余位（例如 Linux 的 `PROT_GROWSDOWN`）一律 `EINVAL`。
+pub const PROT_MASK: u64 = PROT_READ | PROT_WRITE | PROT_EXEC;
+
 /// 本地址空间在 `new()` 期间拥有的帧数量：PML4 + PDPT + PD + PT + 栈页。
 ///
 /// 映像页不在其中：它们在 `map_image_page` 里按 ELF 段按需分配。
@@ -157,6 +184,8 @@ pub struct UserSpace {
     stack: [PhysFrame; USER_STACK_PAGES],
     /// brk 堆窗口页帧（`None` = 未映射；下标 = 页序号）
     heap: [Option<PhysFrame>; USER_HEAP_PAGES],
+    /// 每个堆页的映射标志（`mprotect` 之后堆页未必还是 `RW`；`USER` 位为 0 = ring3 不可访问）
+    heap_flags: [u64; USER_HEAP_PAGES],
     /// 当前 break（页对齐，恒在 `[USER_HEAP_VIRT, USER_HEAP_VIRT + USER_HEAP_MAX]` 内）
     brk: u64,
     /// 匿名 mmap 窗口页帧（first-fit 分配，`None` = 空闲）
@@ -265,6 +294,7 @@ impl UserSpace {
             image_pages: 0,
             stack,
             heap: [None; USER_HEAP_PAGES],
+            heap_flags: [0; USER_HEAP_PAGES],
             brk: USER_HEAP_VIRT,
             mmap: [None; USER_MMAP_PAGES],
             mmap_flags: [0; USER_MMAP_PAGES],
@@ -423,8 +453,15 @@ impl UserSpace {
             let Some(src) = self.image[i] else {
                 continue;
             };
-            let dst = child.map_image_page(i, self.image_flags[i])?;
+            let flags = self.image_flags[i];
+            let dst = child.map_image_page(i, flags)?;
             unsafe { copy_page(src.start_address(), dst) };
+            // `map_image_page` 会把 `PRESENT|USER` 并进调用方给的标志位。父进程若用
+            // `mprotect(PROT_NONE)` 把这一页关掉（`USER` 已清），子进程必须保持同样的
+            // 不可访问状态 —— 否则 fork 会把保护属性悄悄「升权」。
+            if flags & USER == 0 {
+                child.set_page_flags(UserWindow::Image, i, flags)?;
+            }
         }
 
         // 2. 用户栈（`new()` 已经映射好，且父子页帧一一对应）
@@ -439,7 +476,10 @@ impl UserSpace {
                 continue;
             };
             let virt = USER_HEAP_VIRT + i as u64 * PAGE_SIZE;
-            map_new_page(pt, &mut child.heap[i], virt, USER_RW_FLAGS)?;
+            // 标志位沿用父进程的（`mprotect` 可能把某个堆页改成非 `RW`）
+            let flags = self.heap_flags[i];
+            map_new_page(pt, &mut child.heap[i], virt, flags)?;
+            child.heap_flags[i] = flags;
             let dst = child.heap[i].expect("map_new_page 已填槽位").start_address();
             unsafe { copy_page(src.start_address(), dst) };
         }
@@ -534,10 +574,14 @@ impl UserSpace {
             for i in have_pages..want_pages {
                 let virt = USER_HEAP_VIRT + i as u64 * PAGE_SIZE;
                 match map_new_page(self.pt, &mut self.heap[i], virt, USER_RW_FLAGS) {
-                    Ok(()) => mapped += 1,
+                    Ok(()) => {
+                        self.heap_flags[i] = USER_RW_FLAGS;
+                        mapped += 1;
+                    }
                     Err(_) => {
                         for j in have_pages..have_pages + mapped {
                             unmap_page(self.pt, &mut self.heap[j], USER_HEAP_VIRT + j as u64 * PAGE_SIZE);
+                            self.heap_flags[j] = 0;
                         }
                         return self.brk;
                     }
@@ -546,6 +590,7 @@ impl UserSpace {
         } else if want_pages < have_pages {
             for i in want_pages..have_pages {
                 unmap_page(self.pt, &mut self.heap[i], USER_HEAP_VIRT + i as u64 * PAGE_SIZE);
+                self.heap_flags[i] = 0;
             }
         }
         self.brk = want;
@@ -554,9 +599,11 @@ impl UserSpace {
 
     /// 匿名映射（`mmap`）：在 mmap 窗口里 first-fit 找连续 `len` 字节。
     ///
-    /// 只接受 `MAP_PRIVATE|MAP_ANONYMOUS`（调用方在 syscall 层校验 flags/prot）。
-    /// 新页**必须清零**：匿名映射不得把上一任使用者的内容送给新调用方。
-    pub fn mmap_anon(&mut self, len: u64, writable: bool, executable: bool) -> Result<u64, i64> {
+    /// 只接受 `MAP_PRIVATE|MAP_ANONYMOUS`（调用方在 syscall 层校验 flags，并已把
+    /// `prot` 的合法性、`W^X` 检查做完）。新页**必须清零**：匿名映射不得把上一任
+    /// 使用者的内容送给新调用方。`PROT_NONE`（`prot == 0`）是合法的：映射存在、
+    /// 帧已分配，但对 ring3 不可访问（清 `USER`），可由 `mprotect` 再启用。
+    pub fn mmap_anon(&mut self, len: u64, prot: u64) -> Result<u64, i64> {
         if len == 0 {
             return Err(EINVAL);
         }
@@ -572,13 +619,7 @@ impl UserSpace {
             Some(start) => start,
             None => return Err(ENOMEM),
         };
-        let mut flags = PRESENT | USER;
-        if writable {
-            flags |= WRITABLE;
-        }
-        if !executable {
-            flags |= NO_EXEC;
-        }
+        let flags = prot_to_flags(prot);
         let mut mapped = 0usize;
         for i in start..start + pages {
             let virt = USER_MMAP_VIRT + i as u64 * PAGE_SIZE;
@@ -629,6 +670,97 @@ impl UserSpace {
             unmap_page(self.pt, &mut self.mmap[i], USER_MMAP_VIRT + i as u64 * PAGE_SIZE);
             self.mmap_flags[i] = 0;
         }
+        Ok(())
+    }
+
+    /// 系统调用 `mprotect(addr, len, prot)`：改写**已映射**页的权限位，返回页数。
+    ///
+    /// 全部校验通过才动手（**没有部分成功**）：页对齐、非空、`addr` 落在支持的窗口里、
+    /// 范围不跨窗口、每一页都已映射。缺一即 `EINVAL`（与 [`UserSpace::munmap_anon`]
+    /// 的「整段已映射」同一约定；Linux 这里用 `ENOMEM`）。
+    ///
+    /// 页帧不动：`mprotect` 不搬家也不清零，`PROT_NONE` → `RW` 回来内容原样还在。
+    pub fn mprotect(&mut self, addr: u64, len: u64, prot: u64) -> Result<usize, i64> {
+        if len == 0 || addr % PAGE_SIZE != 0 {
+            return Err(EINVAL);
+        }
+        let bytes = match len.checked_add(PAGE_SIZE - 1) {
+            Some(v) => v & !(PAGE_SIZE - 1),
+            None => return Err(EINVAL),
+        };
+        let end = match addr.checked_add(bytes) {
+            Some(end) => end,
+            None => return Err(EINVAL),
+        };
+        let window = match UserWindow::of(addr) {
+            Some(window) => window,
+            None => return Err(EINVAL),
+        };
+        if end > window.base() + window.pages() as u64 * PAGE_SIZE {
+            return Err(EINVAL); // 跨窗口/越界：不做半段
+        }
+        let first = ((addr - window.base()) / PAGE_SIZE) as usize;
+        let pages = (bytes / PAGE_SIZE) as usize;
+        for i in first..first + pages {
+            // 「已映射」= `PRESENT` 已置（`PROT_NONE` 只清 `USER`，因此仍算已映射，
+            // 可以从 `PROT_NONE` 改回 `RW`/`RX`）
+            if !self.window_mapped(window, i) {
+                return Err(EINVAL);
+            }
+        }
+        let flags = prot_to_flags(prot);
+        for i in first..first + pages {
+            self.set_page_flags(window, i, flags)?;
+        }
+        Ok(pages)
+    }
+
+    /// 窗口里第 `index` 页是否已映射（以 `PRESENT` 位为准；`PROT_NONE` 的页仍算已映射）。
+    fn window_mapped(&self, window: UserWindow, index: usize) -> bool {
+        self.window_flags(window, index) & PRESENT != 0
+    }
+
+    /// 取窗口里第 `index` 页当前记录的权限位。
+    fn window_flags(&self, window: UserWindow, index: usize) -> u64 {
+        match window {
+            UserWindow::Image => self.image_flags[index],
+            UserWindow::Heap => self.heap_flags[index],
+            UserWindow::Mmap => self.mmap_flags[index],
+            UserWindow::Dyn => self.dyn_flags[index],
+        }
+    }
+
+    /// 把窗口里第 `index` 页的权限位整页改写，并刷新 TLB。
+    ///
+    /// 页帧不变（只重写页表项与标志位记录）。调用方保证该页已映射；
+    /// 槽位为空时返回 `EINVAL`（不静默当作成功）。
+    fn set_page_flags(&mut self, window: UserWindow, index: usize, flags: u64) -> Result<(), i64> {
+        let virt = window.base() + index as u64 * PAGE_SIZE;
+        let frame = match window {
+            UserWindow::Image => {
+                self.image_flags[index] = flags;
+                self.image[index]
+            }
+            UserWindow::Heap => {
+                self.heap_flags[index] = flags;
+                self.heap[index]
+            }
+            UserWindow::Mmap => {
+                self.mmap_flags[index] = flags;
+                self.mmap[index]
+            }
+            UserWindow::Dyn => {
+                self.dyn_flags[index] = flags;
+                self.dyn_pages[index]
+            }
+        };
+        let Some(frame) = frame else {
+            return Err(EINVAL);
+        };
+        unsafe { write_entry(self.pt, table_index(virt, 0), frame.start_address() | flags) };
+        // 改权限位必须刷 TLB：否则 ring3 可能继续用「旧的、更宽的权限」访问同一页
+        // （与 `munmap`/`brk` 收缩的幽灵映射是同一个坑）。
+        paging::flush_tlb(virt);
         Ok(())
     }
 
@@ -688,34 +820,33 @@ impl UserSpace {
         self.check_range(addr, len, true)
     }
 
-    /// 取某虚拟地址所在页的映射标志（未映射返回 `None`）。
+    /// 取某虚拟地址所在页的映射标志（ring3 不可访问或未映射时返回 `None`）。
     ///
-    /// 这是 syscall 层缓冲校验的唯一依据：返回 `None` 的页（含堆/mmap 里**还没碰到**的页）
-    /// 会被当成越界指针拒掉（`-EFAULT`），而不是让内核去写不存在的内容。
+    /// 这是 syscall 层缓冲校验的唯一依据：返回 `None` 的页会被当成越界指针拒掉
+    /// （`-EFAULT`），而不是让内核去写不存在/不该碰的内容。三类页都是 `None`：
+    ///
+    /// 1. 从未映射的页（堆/mmap 窗口里**还没碰到**的页）；
+    /// 2. `munmap`/`brk` 收缩之后归还了的页；
+    /// 3. `mprotect(PROT_NONE)` 关掉的页（`PRESENT` 还在，但 `USER` 已清 ——
+    ///    ring3 摸它会 #PF，内核也不把它当用户缓冲，见 [`accessible`]）。
     fn page_flags(&self, page: u64) -> Option<u64> {
         let stack_end = USER_STACK_TOP;
         if page >= USER_STACK_VIRT && page < stack_end {
-            return Some(PRESENT | WRITABLE | USER | NO_EXEC);
+            return accessible(PRESENT | WRITABLE | USER | NO_EXEC);
         }
         if page >= USER_HEAP_VIRT && page < USER_HEAP_VIRT + USER_HEAP_MAX {
             let index = ((page - USER_HEAP_VIRT) / PAGE_SIZE) as usize;
-            return if self.heap[index].is_some() {
-                Some(USER_RW_FLAGS)
-            } else {
-                None
-            };
+            return accessible(self.heap_flags[index]);
         }
         if page >= USER_MMAP_VIRT && page < USER_MMAP_VIRT + USER_MMAP_MAX {
             let index = ((page - USER_MMAP_VIRT) / PAGE_SIZE) as usize;
-            let flags = self.mmap_flags[index];
-            return if flags & PRESENT == 0 { None } else { Some(flags) };
+            return accessible(self.mmap_flags[index]);
         }
         // 共享库窗口（v0.9 动态链接）：库里的 .rodata/.text 必须能被 syscall 的
         // 缓冲校验认可（例如共享库自己发起的 `write`，缓冲区在库的只读段里）。
         if page >= USER_DYN_BASE && page < USER_DYN_BASE + USER_DYN_MAX {
             let index = ((page - USER_DYN_BASE) / PAGE_SIZE) as usize;
-            let flags = self.dyn_flags[index];
-            return if flags & PRESENT == 0 { None } else { Some(flags) };
+            return accessible(self.dyn_flags[index]);
         }
         if page < USER_VIRT_BASE {
             return None;
@@ -724,11 +855,7 @@ impl UserSpace {
         if index as usize >= USER_IMAGE_MAX_PAGES {
             return None;
         }
-        let flags = self.image_flags[index as usize];
-        if flags & PRESENT == 0 {
-            return None;
-        }
-        Some(flags)
+        accessible(self.image_flags[index as usize])
     }
 }
 
@@ -782,7 +909,90 @@ unsafe fn copy_page(src: u64, dst: u64) {
 ///
 /// W^X 在这里是硬约束：只有 `mmap(PROT_EXEC)` 显式要求时才去掉 `NO_EXEC`，
 /// 而 `PROT_WRITE|PROT_EXEC` 在 syscall 层就被拒（不存在既可写又可执行的自分配内存）。
+/// 它同时是「`PROT_READ|PROT_WRITE` 的翻译结果」（[`prot_to_flags`]）。
 const USER_RW_FLAGS: u64 = PRESENT | WRITABLE | USER | NO_EXEC;
+
+/// 用户页属于哪个窗口。`mprotect` 只支持这 4 个窗口，且要求范围**不跨窗口**。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UserWindow {
+    /// 映像窗口（ELF 的代码/数据段）
+    Image,
+    /// brk 堆窗口
+    Heap,
+    /// 匿名 mmap 窗口
+    Mmap,
+    /// 共享库窗口（v0.9 动态链接的解释器与 `.so`）
+    Dyn,
+}
+
+impl UserWindow {
+    /// 窗口的起始虚拟地址。
+    fn base(self) -> u64 {
+        match self {
+            Self::Image => USER_VIRT_BASE,
+            Self::Heap => USER_HEAP_VIRT,
+            Self::Mmap => USER_MMAP_VIRT,
+            Self::Dyn => USER_DYN_BASE,
+        }
+    }
+
+    /// 窗口的页数。
+    fn pages(self) -> usize {
+        match self {
+            Self::Image => USER_IMAGE_MAX_PAGES,
+            Self::Heap => USER_HEAP_PAGES,
+            Self::Mmap => USER_MMAP_PAGES,
+            Self::Dyn => USER_DYN_PAGES,
+        }
+    }
+
+    /// `addr` 落在哪个窗口里（每个窗口都是 `[base, base + pages*PAGE_SIZE)`）。
+    ///
+    /// 用户栈**不在**其中：它的保护属性固定，`mprotect` 碰它就 `EINVAL`（见模块文档）。
+    fn of(addr: u64) -> Option<Self> {
+        for window in [Self::Image, Self::Heap, Self::Mmap, Self::Dyn] {
+            let base = window.base();
+            if addr >= base && addr < base + window.pages() as u64 * PAGE_SIZE {
+                return Some(window);
+            }
+        }
+        None
+    }
+}
+
+/// `PROT_*` → 页表标志。**`PRESENT` 恒置**：`PROT_NONE` 表达的是「ring3 不可访问」
+/// （清 `USER` 位）而不是「没有映射」—— 页帧与内容都保留，`mprotect` 回来即可用。
+///
+/// 两个 x86_64 事实值得记下来：
+///
+/// - 硬件没有「不可读但可执行」这一档，`PROT_EXEC` 单独出现时实际是**可读可执行**
+///   （Linux 在 x86 上同样如此，所以不算偏离 ABI）；
+/// - 没有 `USER` 的页 ring3 访问会 #PF（`error=P|U`），而内核（ring0）照常可访问 ——
+///   这正是「用户态不可访问、内核还能把帧留着」的实现方式。
+fn prot_to_flags(prot: u64) -> u64 {
+    if prot & (PROT_READ | PROT_WRITE | PROT_EXEC) == 0 {
+        return PRESENT | NO_EXEC; // PROT_NONE：不可读、不可写、不可执行
+    }
+    let mut flags = PRESENT | USER | NO_EXEC;
+    if prot & PROT_WRITE != 0 {
+        flags |= WRITABLE;
+    }
+    if prot & PROT_EXEC != 0 {
+        flags &= !NO_EXEC;
+    }
+    flags
+}
+
+/// ring3 能访问的页必须同时有 `PRESENT` 与 `USER`（页表每一级的 `USER` 都已在
+/// [`UserSpace::new`] 里置好）。少任何一个都返回 `None`：syscall 的缓冲校验据此把
+/// `PROT_NONE` 的内存排除在「合法用户缓冲」之外。
+fn accessible(flags: u64) -> Option<u64> {
+    if flags & (PRESENT | USER) == PRESENT | USER {
+        Some(flags)
+    } else {
+        None
+    }
+}
 
 /// 在自拥有的 PT 上建立一页映射（分配 + 清零），并记录到 `slot`。
 ///

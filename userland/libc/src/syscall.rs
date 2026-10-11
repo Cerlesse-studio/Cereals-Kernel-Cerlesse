@@ -23,9 +23,13 @@
 //! - `mmap(len, prot, flags)` 只支持**私有匿名**映射（`MAP_PRIVATE|MAP_ANONYMOUS`），
 //!   且**没有 offset 参数** —— 内核的 syscall ABI 传 5 个参数（`rdi, rsi, rdx, r10, r8`），
 //!   匿名映射不需要偏移；文件映射要先扩 ABI（见内核模块文档）；
-//! - `PROT_WRITE|PROT_EXEC` 被内核拒绝（W^X），`PROT_NONE` 与 `MAP_FIXED` 同样拒绝
-//!   （需要 `mprotect` / 固定地址放置，两者都还没实现）；
+//! - `PROT_WRITE|PROT_EXEC` 被内核拒绝（W^X）；`MAP_FIXED` 同样拒绝（固定地址放置未实现），
+//!   `PROT_NONE` 现在合法（v1.0 起可以再 `mprotect` 启用）；
 //! - `brk` 沿用 Linux 语义：**不返回错误**，失败时返回原值（用 `ret < addr` 判断）。
+//!
+//! v1.0 第一步补上 `mprotect`（内核侧 `syscall/memory.rs::sys_mprotect`）：改写**已映射**
+//! 页的保护属性，W^X 的「先 `mmap(RW)` 写、再 `mprotect(RX)` 执行」这条路因此成立。
+//! [`PROT_NONE`] 表示「本进程不可访问」（内核保留页帧与内容，可以再改回来）。
 //!
 //! v0.9 第三步加入了进程管理（内核侧 `kernel/src/syscall/process.rs`）：
 //!
@@ -35,7 +39,7 @@
 //!   （内核逐段校验后写进新进程的用户栈，见 `libc::args`）；
 //! - `wait4(pid)`：运行并回收直接子进程，返回退出码。
 //!
-//! 仍未实现的号只剩 `mprotect`（W^X 转换用），它在内核侧落在公共 ENOSYS 桩上。
+//! **v1.0 第一步起没有「号已定义但未实现」的调用了**（`mprotect` 是最后一个，见上）。
 //!
 //! 与 Linux 的调度差异：本内核单 CPU、用户态无抢占，子进程不会与父进程并发运行，
 //! 它要等父进程 `wait4` 才被恢复 —— 标准写法 `if pid == 0 { execve } else { wait4 }`
@@ -94,12 +98,15 @@ pub const EISDIR: isize = -21;
 pub const EINVAL: isize = -22;
 /// `-ENOSPC`：空间不足（fd 用尽 / 文件超过 RAMFS 上限）。
 pub const ENOSPC: isize = -28;
-/// `-ENOSYS`：号合法但内核尚未实现（v0.9 起只剩 `mprotect`）。
+/// `-ENOSYS`：号合法但内核尚未实现（v1.0 第一步实现 `mprotect` 后没有这样的号了，
+/// 保留常量是因为内核仍有 `ENOSYS` 桩与「号越界」两种不可实现的失败）。
 pub const ENOSYS: isize = -38;
 /// `-ECHILD`：`wait4` 找不到该 PID 的直接子进程。
 pub const ECHILD: isize = -10;
 
-/// `mmap` 保护位：可读。
+/// `mmap` / `mprotect` 保护位：不可访问（页帧仍在，可用 [`mprotect`] 再启用）。
+pub const PROT_NONE: i32 = 0x0;
+/// `mmap` / `mprotect` 保护位：可读。
 pub const PROT_READ: i32 = 0x1;
 /// `mmap` 保护位：可写。
 pub const PROT_WRITE: i32 = 0x2;
@@ -206,6 +213,19 @@ pub fn mmap(len: usize, prot: i32, flags: i32) -> isize {
             u64::MAX, // fd = -1
         )
     }
+}
+
+/// `mprotect(addr, len, prot)`：改写已映射页的保护属性（v1.0 第一步）。
+///
+/// 内核要求：`addr` 页对齐、`len > 0`、范围完整落在**同一个**窗口
+/// （映像 / brk 堆 / 匿名 mmap / 共享库）且每一页都已映射，否则 [`EINVAL`]；
+/// [`PROT_WRITE`]|[`PROT_EXEC`] 仍被拒（W^X）。用户栈的保护属性固定（`RW` + `NX`），
+/// `mprotect` 碰它同样是 [`EINVAL`]。
+///
+/// [`PROT_NONE`] 使这一段对本进程不可访问（页帧与内容保留）：内核连「拿它当缓冲」
+/// 都不允许（`write` 这种按页校验的调用会返回 [`EFAULT`]），再 `mprotect` 回来即可用。
+pub fn mprotect(addr: u64, len: usize, prot: i32) -> isize {
+    unsafe { raw(SYS_MPROTECT, addr, len as u64, prot as u64, 0, 0) }
 }
 
 /// `munmap(addr, len)`：整段归还匿名映射（要求页对齐且全段已映射）。
