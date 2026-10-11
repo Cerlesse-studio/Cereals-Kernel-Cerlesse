@@ -143,6 +143,11 @@ panic = "abort"
 - `tools/`（Python）与 `tools-go/`（Go）**不进 Cargo workspace**，各自独立管理。
 - 交叉编译在 Linux 与 Windows 主机上均通过 `rustup target add` 相同目标完成（见 docs/boot.md）。
 
+> 上述 workspace 布局是**当前（v0.9）状态**。纯内核化改造（见 5.11 与 [docs/pure-kernel.md](docs/pure-kernel.md)）
+> 完成后，本仓库的 workspace 收敛为 `members = ["shared", "boot", "abi", "kernel"]`，
+> `libc` 与 `user/*` 及其 `user-release` profile 迁往 **Cerlesse-Userland**（另有自己的 workspace 与
+> `.cargo/config.toml`），本仓库新增 `abi` crate 作为 syscall ABI 的单一事实源。
+
 ---
 
 ## 4. 目录结构
@@ -411,6 +416,24 @@ v0.9 记录的两条踩坑（设计记录，非编号缺陷）：debug 构建下
 > 优先级修正（见 desktop.md 第 5 节）：**先 D0 地基，再 D1 输入，再 D2 显示**；
 > systemd-logind / D-Bus / PipeWire 是用户态组件，KVM 与桌面前置无关（它是「当宿主」的方向）。
 
+### 5.11 纯内核化改造（v0.9 之后，规划；执行上在桌面路线之前）
+
+见 [docs/pure-kernel.md](docs/pure-kernel.md)（现状审计 C1–C9 + **逐文件迁移清单** + 六阶段 Cargo 配置/构建目标/验收）。
+
+| 阶段 | 目标 | Cargo 配置 / 构建目标 | 验收抓手 |
+| ---- | ---- | ---- | ---- |
+| 一 | 冻结当前基线 | 不改 Cargo；新增 `make baseline` | `make baseline` 退出码 0 + `git tag v0.9.0-baseline` |
+| 二 | 边界门禁（内核不得依赖 Shell/libc/cpm） | 不改 Cargo；新增 `tools/check-boundary.py` | `make check-boundary`（含 `--selftest` 负例） |
+| 三 | syscall ABI 单一事实源 | workspace 新增 `abi`；kernel/libc 均依赖它 | `make abi-check`（`cargo test -p abi`）+ `make test-all` 与基线逐项一致 |
+| 四 | 迁移用户空间 | 内核 `members` 收敛为 `shared,boot,abi,kernel`；新增 feature `embed-userland`（默认关）；userland 自带 `.cargo/config.toml` 与 `user-release` profile | 只含内核的 tarball 里 `make kernel && make image` 通过；`make test-kernel-only`；`make image-userland` |
+| 五 | 构建与测试拆分 | 不改 Cargo；Make 目标分层 | 内核 `make test-all` + `make test-orch`（15 → **10 场景**）；userland 侧 5 场景 |
+| 六 | 稳定内核接口 | `abi` 增 `VERSION`（决策：是否抽独立 crate） | `make abi-doc`；`docs/porting.md`；内核 tag `v1.0-kernel` |
+
+> 关键事实（实测，见 pure-kernel.md 第 1 节）：当前删掉 `libc/` 与 `user/` 后 `cargo build -p kernel` **直接失败**
+> （`kernel/build.rs:301` 报「用户程序构建失败」，退出码 **101**），内核映像内嵌用户态 **203,280 字节（≈199 KiB）**；
+> 因此验收标准 1/2/7（不依赖用户态即可编译/启动）现状不成立。改造顺序上，**阶段三（ABI 单一来源）先于
+> 阶段四（动用户态源码）**，避免迁移期 ABI 双写漂移。
+
 ---
 
 ## 6. 测试方案
@@ -514,6 +537,7 @@ qemu-system-x86_64 -machine q35 -m 512M -serial stdio -display none \
 | 2026-10-11 | **v0.9 第一步：用户堆**（运行时前置条件）—— 新增 `kernel/src/syscall/memory.rs`（`mmap`/`munmap`/`brk`：W^X、`MAP_*`/`PROT_*` 白名单、5 参数无 offset 的取舍、逐条错误码）、`address_space.rs` 新增 brk 窗口（256 KiB）与匿名 mmap 窗口（256 KiB，first-fit，清页表项时 `invlpg`）、`libc/heap.rs`（`#[global_allocator]`，bump over mmap）与 `brk/mmap/munmap` 封装、`user/hello` 堆自测、`user.rs` 页帧泄漏检查；`make test-user` 断言 32 → **59 项**，`orchestrate.json` 的 `user` 场景同步；全量回归 PASS（`test-fs` 19 / `test-driver` 22 / `test-fat` 21 / `make go-test` / `make test-orch` 10 场景） |
 | 2026-10-11 | **v0.9 第六步（收官）：内核侧最小动态链接** —— 新增 `kernel/src/syscall/dynamic.rs`（`ET_DYN` 分流：`PT_INTERP` + `DT_NEEDED` → `/lib/<name>` 递归装载，应用 `R_X86_64_RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`64`，`DT_PLTREL=REL` 明确拒绝）；`syscall/elf.rs` 按 `e_type` 分流（`ET_EXEC` 路径不变）；`address_space.rs` 新增共享库窗口（基址 + 1 MiB、32 页）与 `map_dyn_page`/`dyn_page_count`/`phys_of`（内核 CR3 下写重定位），`fork`/`page_flags`/`Drop` 同步；新增夹具 `user/dynhello/`（`as`+`ld` 现编，`kernel/build.rs` 内嵌）与 RAMFS `/lib`（`fs::init` 新增 `libraries` 参数，程序清单 7 → 8）；新增 `make test-dyn`（**10 项**）与 `make dyn-hostcheck`（宿主机 glibc 独立复核）并加入 `test-all`；`test-fs` 20 → **21 项**、`test-programs` 条目数断言 5/7；同步 syscall.md（新增 3.9 + 3.1/3.4/3.8 修订）、architecture.md 第 5 节、roadmap/README/project-structure/api |
 | 2026-10-11 | **H-06 包管理器提案 v1 完成（设计阶段，不进内核主线）**：docs/package-manager.md 从「设想」补成可实施规格 —— 术语字段级定义、七个制品格式（`PKG.toml`/确定性 `.cpk`/`catalog.toml(+sig)`/`cpkg.toml`/receipt/journal/内容寻址 store）、内容哈希 + 三级校验（签名 → 绑定 → 落盘后逐文件）、安全模型（显式信任根、scope 域边界与路径白名单、**纯文件安装/无安装脚本**、setuid 拒绝、威胁—对策表）、事务阶段与原子性边界（文件级 + 可恢复）、效率预算（幂等零写入、文件级去重、`gc`）、CLI 与稳定退出码、MVP 三期（P0 主机侧 `tools/pkgmgr/` → P1 与镜像构建/基线对接 → P2 增量补丁等）、可脚本断言的验收条目（`make test-pkg`）；同步 docs/README.md 索引状态（设计中 → 提案 v1）与 H-06 行 |
+| 2026-10-11 | **新增「纯内核化改造规划」（v0.9 之后，规划）**：新建 docs/pure-kernel.md —— 现状审计 C1–C9（内核构建期嵌套 cargo 构建用户程序、10 处 `include_bytes!` 把 203,280 字节（≈199 KiB）用户态内嵌进内核映像、`fs::init` 硬编码 `/bin`/`/lib`、启动末尾跑用户态自测、ABI 两处镜像、workspace/测试责任混杂、`.cargo/config.toml` 不分家）、实测「删掉 `libc/`+`user/` 后 `cargo build -p kernel` 退出码 **101**」、逐文件迁移清单（内核 83 文件仅 9 个要改；`user/` 33 + `libc/` 7 + `tools`/`tools-go`/`tests` 逐项去向）、目标双仓库结构与 Cargo 配置前后对照、六阶段（冻结基线/边界门禁/ABI 单一来源/用户空间迁移/构建测试拆分/接口稳定）与七条验收标准对照表；本文档新增 5.11 与第 3 节注记，同步 roadmap/project-structure/docs-README/README |
 | 2026-10-11 | **新增「桌面环境兼容路线」（v1.0 之后，规划）**：新建 docs/desktop.md —— 现状审计（逐项有据：显示无/输入无 evdev/无 ioctl-poll/无设备模型与 `/proc`/无音频/无 ACPI/security 占位/fs 只读）、用户态与内核侧归属纠正（logind/D-Bus/PipeWire 是用户态；KVM 与桌面前置无关）、被遗漏的地基（设备模型/`ioctl`/`poll`/file-backed mmap/futex/信号/AF_UNIX/`/proc`+`/sys`/memfd）、D0–D5 分层与 QEMU 可断言验收（monitor `sendkey`/`screendump` 实测可用）、里程碑 v1.1–v1.6；本文档新增 5.10 与 1.3 注记，同步 roadmap/architecture/project-structure/docs-README/README |
 
 

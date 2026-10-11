@@ -301,6 +301,13 @@ Cerlesse 不做「完整 Linux 替代品」，而是按 **Boot → 内存 → �
 
 详细的实现记录、踩坑与验收证据见 [DEVELOPMENT.md](DEVELOPMENT.md) 第 5、9 节。
 
+**下一步（规划）：纯内核化边界收敛** —— 内核只保留机制（syscall / 进程 / 调度 / 内存 / VFS /
+网络栈 / 驱动 / 中断 / IPC / 安全），Shell、init、`libc`、coreutils 与包管理器迁往独立的
+**Cerlesse Userland** 项目。逐文件迁移清单与六阶段（冻结基线 → 边界门禁 → ABI 单一来源 →
+用户空间迁移 → 构建/测试拆分 → 接口稳定）见 [docs/pure-kernel.md](docs/pure-kernel.md)。
+现状：删掉 `libc/`、`user/` 后内核**无法构建**（`cargo build -p kernel` 退出码 101），
+因此「不依赖用户态即可编译内核」正是本改造的第一目标。
+
 ## 已实现能力
 
 - **引导与基础**：UEFI 引导、BootInfo、GDT/IDT、异常诊断（#PF 带 CR2）、串口控制台。
@@ -408,6 +415,9 @@ fs/fat.rs（FAT12/16/32 只读）──▶ fs/vfs.rs + 挂载表 ──▶ open/
 ```
 
 完整目录树与模块职责见 [docs/project-structure.md](docs/project-structure.md)。
+
+> 目录边界规划：本仓库只保留内核 + 引导 + 构建工具，`libc/` 与 `user/*` 将迁往独立的
+> **Cerlesse Userland** 仓库（内核只提供机制），见 [docs/pure-kernel.md](docs/pure-kernel.md)。
 
 ## 常用命令
 
