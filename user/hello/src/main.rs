@@ -1,4 +1,4 @@
-//! hello —— v0.7 的参考用户程序（也是 `/init`）
+//! hello —— v0.7 起的参考用户程序（也是 `/init`）
 //!
 //! 它不是「演示」而是**验收基准**：这段 Rust 编译出的 ELF 会由 `kernel/build.rs`
 //! 内嵌，启动时写进 RAMFS 的 `/init`，再由内核的 ELF Loader 装载到 ring3 运行。
@@ -12,6 +12,8 @@
 //! | `open(O_CREAT)/write /tmp/hello.txt` | VFS 写路径 | `user: write fd=3 len=24` + 内核读回 `fs: readback /tmp/hello.txt len=24` |
 //! | `static mut` 自增 | `RW` 段对 ring3 可写 | `hello: static counter=1` |
 //! | 非法指针 `write` | syscall 参数校验 | `user: EFAULT write ...` / `hello: bad write ret=-14` |
+//! | `brk` / `mmap` / `munmap` | **用户堆**（v0.9 第一步） | `user: brk base=0x8000020000`、`user: mmap len=8192 ... -> 0x8000060000`、`hello: heap PASS` |
+//! | `Vec` / `format!` | `#[global_allocator]` 真的落到内核 | `hello: vec len=200 sum=20100` |
 //! | `nanosleep` | tick 真实推进 | `user: sleep done ticks=2` |
 //! | `exit(42)` | 退出码回收 | `user: exit code=42` |
 //!
@@ -21,9 +23,14 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+
 use libc::syscall::{raw, SYS_WRITE};
 use libc::{
-    close, getpid, nanosleep, open, println, read, write, O_CREAT, O_RDONLY, O_WRONLY,
+    brk, close, getpid, mmap, munmap, nanosleep, open, println, read, write, MAP_ANONYMOUS,
+    MAP_PRIVATE, O_CREAT, O_RDONLY, O_WRONLY, PROT_READ, PROT_WRITE,
 };
 
 /// 可写的静态变量：v0.7 的 ELF Loader 把 `RW` 段映射成 ring3 可写，
@@ -34,6 +41,13 @@ static mut COUNTER: u32 = 0;
 const MOTD_PATH: &str = "/etc/motd";
 /// 用户程序写文件的落点（内核随后读回并打印内容）。
 const OUT_PATH: &str = "/tmp/hello.txt";
+
+/// `brk` 一次增长两页（8 KiB）。
+const HEAP_STEP: u64 = 2 * 4096;
+/// 匿名映射长度（两页 = 8 KiB）。
+const MMAP_LEN: usize = 2 * 4096;
+/// 内核 mmap 窗口上限（256 KiB，见 `address_space::USER_MMAP_MAX`）。
+const MMAP_MAX: usize = 64 * 4096;
 
 /// 内核通过 `_start` 调用该入口；返回值即退出码。
 #[no_mangle]
@@ -83,9 +97,133 @@ pub extern "C" fn main() -> i32 {
     let bad = unsafe { raw(SYS_WRITE, 1, 0xdead_0000_0000, 1, 0, 0) };
     println!("hello: bad write ret={}", bad);
 
-    // ---- 5. nanosleep：2 个 tick = 20ms，内核在等待期间 `sti; hlt` ----
+    // ---- 5. 用户堆：brk / mmap / munmap（v0.9 运行时前置条件） ----
+    let heap_ok = heap_selftest();
+
+    // ---- 6. nanosleep：2 个 tick = 20ms，内核在等待期间 `sti; hlt` ----
     let slept = nanosleep(2);
     println!("hello: slept={}", slept);
 
+    if !heap_ok {
+        println!("hello: heap FAIL");
+        return 43;
+    }
     42
+}
+
+/// 用户堆自测：`brk` 增长、`mmap` 匿名映射、`munmap` 归还、越界/非法参数的负例，
+/// 以及「全局分配器真的能用」（`Vec` + `format!`）。
+fn heap_selftest() -> bool {
+    let mut ok = true;
+
+    // --- brk：查询 → 增长两页 → 新页必须是零 → 写入模式并读回 ---
+    let base = brk(0);
+    println!("hello: brk base={:#x}", base);
+    let grown = brk(base + HEAP_STEP);
+    println!("hello: brk grown={:#x}", grown);
+    if grown != base + HEAP_STEP {
+        return false;
+    }
+    let heap = base as *mut u8;
+    let zeroed = unsafe {
+        core::ptr::read_volatile(heap).eq(&0)
+            && core::ptr::read_volatile(heap.add(4095)).eq(&0)
+            && core::ptr::read_volatile(heap.add(8191)).eq(&0)
+    };
+    println!("hello: heap zeroed={}", zeroed as u8);
+    ok &= zeroed;
+    for i in 0..1024usize {
+        unsafe { core::ptr::write_volatile(heap.add(i), (i & 0xff) as u8) };
+    }
+    let mut pattern_ok = true;
+    for i in 0..1024usize {
+        if unsafe { core::ptr::read_volatile(heap.add(i)) } != (i & 0xff) as u8 {
+            pattern_ok = false;
+        }
+    }
+    println!("hello: heap pattern={}", pattern_ok as u8);
+    ok &= pattern_ok;
+
+    // 越出堆窗口（256 KiB）：Linux 语义 → 返回**原值**，调用方据此判断失败
+    let over = brk(base + 0x10_0000);
+    let refused = over == grown;
+    println!("hello: brk over ret={:#x} refused={}", over, refused as u8);
+    ok &= refused;
+
+    // --- mmap：匿名两页 → 零 → 模式 → 交给内核写串口 → munmap 归还 ---
+    let m = mmap(MMAP_LEN, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    println!("hello: mmap ret={}", m);
+    if m <= 0 {
+        return false;
+    }
+    let map = m as usize as *mut u8;
+    let map_zeroed = unsafe {
+        core::ptr::read_volatile(map).eq(&0) && core::ptr::read_volatile(map.add(MMAP_LEN - 1)).eq(&0)
+    };
+    println!("hello: mmap zeroed={}", map_zeroed as u8);
+    ok &= map_zeroed;
+    for i in 0..MMAP_LEN {
+        unsafe { core::ptr::write_volatile(map.add(i), (i ^ 0xa5) as u8) };
+    }
+    let mut map_ok = true;
+    for i in 0..MMAP_LEN {
+        if unsafe { core::ptr::read_volatile(map.add(i)) } != (i ^ 0xa5) as u8 {
+            map_ok = false;
+        }
+    }
+    println!("hello: mmap pattern={}", map_ok as u8);
+    ok &= map_ok;
+
+    // 把**堆上的**缓冲区交给内核写出去：证明 `write` 的缓冲校验（按页查 `page_flags`）
+    // 认可用户堆页，而不是只认映像窗口与栈。
+    let msg = b"heap buffer through write\n";
+    unsafe { core::ptr::copy_nonoverlapping(msg.as_ptr(), map, msg.len()) };
+    let n = write(1, unsafe { core::slice::from_raw_parts(map, msg.len()) });
+    println!("hello: heap write ret={}", n);
+    ok &= n == msg.len() as isize;
+
+    let un = munmap(m as u64, MMAP_LEN);
+    println!("hello: munmap ret={}", un);
+    ok &= un == 0;
+
+    // --- 负例：每个错误码都要具体（不是「都失败就行」） ---
+    // 1) 缺 MAP_ANONYMOUS（文件映射未实现）→ EINVAL(-22)
+    let file_backed = mmap(4096, PROT_READ, MAP_PRIVATE);
+    println!("hello: mmap file-backed ret={}", file_backed);
+    ok &= file_backed == -22;
+    // 2) MAP_SHARED 不支持 → EINVAL(-22)
+    let shared = mmap(4096, PROT_READ, 0x1 | MAP_ANONYMOUS);
+    println!("hello: mmap shared ret={}", shared);
+    ok &= shared == -22;
+    // 3) 超过 mmap 窗口 → ENOMEM(-12)
+    let too_big = mmap(MMAP_MAX + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    println!("hello: mmap too big ret={}", too_big);
+    ok &= too_big == -12;
+    // 4) W^X：可写 + 可执行 → EINVAL(-22)
+    let wx = mmap(4096, PROT_WRITE | 0x4, MAP_PRIVATE | MAP_ANONYMOUS);
+    println!("hello: mmap wx ret={}", wx);
+    ok &= wx == -22;
+    // 5) munmap 未页对齐 → EINVAL(-22)
+    let misaligned = munmap(m as u64 + 1, MMAP_LEN);
+    println!("hello: munmap misaligned ret={}", misaligned);
+    ok &= misaligned == -22;
+    // 6) 同一段再次 munmap（已经不映射）→ EINVAL(-22)
+    let twice = munmap(m as u64, MMAP_LEN);
+    println!("hello: munmap twice ret={}", twice);
+    ok &= twice == -22;
+
+    // --- 全局分配器：`Vec` 增长（多次分配/重新分配）+ `format!`（String） ---
+    let mut v: Vec<u32> = Vec::new();
+    for i in 1..=200u32 {
+        v.push(i);
+    }
+    let sum: u32 = v.iter().sum();
+    println!("hello: vec len={} sum={}", v.len(), sum);
+    ok &= v.len() == 200 && sum == 20100;
+    let s = alloc::format!("heap string bytes={}", v.len());
+    println!("hello: {}", s);
+    ok &= s.len() == 21;
+
+    println!("hello: heap PASS={}", ok as u8);
+    ok
 }

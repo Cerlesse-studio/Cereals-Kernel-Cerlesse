@@ -28,7 +28,7 @@ USER_RUSTFLAGS := -C relocation-model=static -C code-model=large
 USER_PROFILE   := user-release
 USER_ELF       := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-hello
 
-.PHONY: help build boot kernel image image-exception image-pagefault fat-image run test test-exception test-memory test-pagefault test-keyboard test-scheduler test-ipc test-fs test-user test-driver test-fat test-all user go-test test-orch clean
+.PHONY: help build boot kernel image image-exception image-pagefault fat-image run test test-exception test-memory test-pagefault test-keyboard test-scheduler test-ipc test-fs test-user test-driver test-fat test-all user test-pkg go-test test-orch clean
 
 help:
 	@echo "targets:"
@@ -47,6 +47,7 @@ help:
 	@echo "  fat-image - v0.8: build the FAT test volume (tools/mkfs/mkfs.py from tests/fatroot/data)"
 	@echo "  test-fat - v0.8: assert FAT16/32 on disk mounted in VFS: read/ls/LFN/multi-cluster/EROFS"
 	@echo "  user   - v0.7: build+validate the user-space scaffold alone (libc + user/hello -> static ELF)"
+	@echo "  test-pkg - H-06: assert the .ckc package container (CKC) format + packaging rules (host-side)"
 	@echo "  test-all - run every integration test"
 	@echo "  go-test  - v0.4 H-04/H-05: Go unit tests for tools-go (host side)"
 	@echo "  test-orch - v0.4 H-04: run all 10 scenarios in parallel via Go orchestrator"
@@ -163,6 +164,15 @@ test-fs: image
 
 # v0.7 验收：syscall（syscall/sysret + EFER/STAR/LSTAR/FMASK）+ 用户态 ring3 + 地址空间隔离
 # + **ELF Loader 从 RAMFS 加载 /init** + 文件 syscall（open/read/close/write）。
+# v0.9 第一步追加**用户堆**（brk/mmap/munmap + `#[global_allocator]`）：
+#   - 地址是**可算的**，所以直接断言：brk 起点 0x8000020000（增长两页到 0x8000022000）、
+#     mmap 窗口首次分配落在 0x8000060000（first-fit）；
+#   - `hello: heap zeroed=1` / `hello: mmap zeroed=1`：匿名内存不得泄漏上一任内容；
+#   - `user: write fd=1 len=26` + `hello: heap write ret=26`：把**堆上**的缓冲交给内核写串口，
+#     证明 `write` 的按页缓冲校验（`page_flags`）认可堆页而不只是映像/栈；
+#   - 每个负例都要**具体**的 errno：文件映射/`MAP_SHARED`/W^X/未对齐 munmap = -22，超窗口 = -12；
+#   - `hello: vec len=200 sum=20100`：`Vec`/`format!` 真的走通了全局分配器 → 内核 mmap；
+#   - `user: heap frame reclamation PASS`：两次运行的地址空间（含堆页）整棵归还，不成帧泄漏。
 #
 # 两个程序的来源不同，断言里保留了这个区别：
 #   /init —— `user/hello` 编出的 **ELF**：内核从 RAMFS 读它，由 elf.rs 按段权限装载，
@@ -170,7 +180,7 @@ test-fs: image
 #   probe —— 内嵌位置无关机器码（map_raw），直接读内核映像地址（0x2000000），
 #            必须被 ring3 #PF 拦下（error=P|U）。
 # 硬证据（不是日志措辞）：
-#   - `source=elf` + `segments=4 image_pages=5 writable_pages=2`：ELF 装载真的发生了，
+#   - `source=elf` + `segments=4 image_pages=7 writable_pages=2`：ELF 装载真的发生了，
 #     且 RW 段（.data/.bss）确实被映射成可写；
 #   - `user: read fd=3 want=64 got=23` 紧跟 `got=0`：fd 偏移真的在推进（EOF 语义）；
 #   - `fs: readback /tmp/hello.txt ... written by user program`：用户在 ring3 写的内容
@@ -186,7 +196,7 @@ test-user: image
 		--expect "sched: suspended for user-mode run" \
 		--expect "user: selftest begin" \
 		--expect "user: program=/init source=elf" \
-		--expect "segments=4 image_pages=5 writable_pages=2" \
+		--expect "segments=4 image_pages=7 writable_pages=2" \
 		--expect "user: enter name=init pid=1 entry=0x8000000000" \
 		--expect "hello from user space" \
 		--expect "user: write fd=1 len=22" \
@@ -201,6 +211,32 @@ test-user: image
 		--expect "hello: static counter=1" \
 		--expect "user: EFAULT write ptr=0xdead00000000 len=1" \
 		--expect "hello: bad write ret=-14" \
+		--expect "user: brk query -> 0x8000020000" \
+		--expect "user: brk addr=0x8000022000 -> 0x8000022000 pages=2" \
+		--expect "hello: brk grown=0x8000022000" \
+		--expect "hello: heap zeroed=1" \
+		--expect "hello: heap pattern=1" \
+		--expect "user: brk rejected addr=0x8000120000" \
+		--expect "hello: brk over ret=0x8000022000 refused=1" \
+		--expect "user: mmap len=8192 prot=0x3 flags=0x22 -> 0x8000060000 pages=2" \
+		--expect "hello: mmap zeroed=1" \
+		--expect "hello: mmap pattern=1" \
+		--expect "user: write fd=1 len=26" \
+		--expect "heap buffer through write" \
+		--expect "hello: heap write ret=26" \
+		--expect "user: munmap addr=0x8000060000 len=8192" \
+		--expect "hello: munmap ret=0" \
+		--expect "user: mmap rejected (file-backed mmap is not supported" \
+		--expect "hello: mmap file-backed ret=-22" \
+		--expect "hello: mmap shared ret=-22" \
+		--expect "user: mmap errno=12 len=266240" \
+		--expect "hello: mmap too big ret=-12" \
+		--expect "hello: mmap wx ret=-22" \
+		--expect "hello: munmap misaligned ret=-22" \
+		--expect "hello: munmap twice ret=-22" \
+		--expect "hello: vec len=200 sum=20100" \
+		--expect "hello: heap string bytes=200" \
+		--expect "hello: heap PASS=1" \
 		--expect "user: sleep ticks=2" \
 		--expect "user: sleep done ticks=2" \
 		--expect "user: exit code=42" \
@@ -212,6 +248,7 @@ test-user: image
 		--expect "user: FAULT cr2=0x2000000" \
 		--expect "user: isolation PASS" \
 		--expect "user: probe PASS" \
+		--expect "user: heap frame reclamation PASS" \
 		--expect "user: selftest PASS"
 
 # v0.8 验收：PCI 枚举 → 驱动注册框架 → virtio-blk 挂接 → 块设备读写。
@@ -331,6 +368,18 @@ user:
 	RUSTFLAGS="$(USER_RUSTFLAGS)" $(CARGO) build -p user-hello \
 		--target x86_64-unknown-none --profile $(USER_PROFILE) --target-dir $(BUILD)/user
 	@$(PYTHON) tools/check_user_elf.py $(USER_ELF)
+
+# H-06 P0a 验收：CKC 包容器（后缀 `.ckc`）。**主机侧、不启 QEMU、纯标准库**：
+#
+# 断言的是容器与打包规则本身（详见 tools/pkgmgr/ckc.py 的模块文档）：
+#   - 确定性：同一目录树两次打包逐字节相同、rev 相同；
+#   - 头部逐字段：magic/版本/头长/flags/payload_off/payload_len/保留位，改任一处 → 退出码 2；
+#   - 内容哈希：翻 payload 一个字节 → 退出码 2；
+#   - ustar 结构：条目未排序 / PKG.toml 不在第一 / 非零 mtime / 非零补零 / 符号链接 → 2；
+#   - 打包期规则：超长路径（ENAMETOOLONG）/目标越出 scope/setuid/重复 target/hooks/… → 1；
+#   - 独立复核：系统 `tar` 读同一段 payload，条目与内容必须与 ckc.py 一致（不是自己验自己）。
+test-pkg:
+	$(PYTHON) tests/test_ckc.py
 
 # v0.4 H-04/H-05 主机侧：Go 单元测试（串口分析 + 并行编排器）
 go-test:

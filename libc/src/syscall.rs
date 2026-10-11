@@ -18,13 +18,26 @@
 //! - `write(fd, buf, count)`：`buf` 必须可读；fd 1/2 写串口，fd ≥ 3 写文件；
 //! - `close(fd)`：只接受 fd ≥ 3（0/1/2 是保留位）。
 //!
-//! 尚未实现的号（`fork/execve/wait4`）在内核侧仍落在公共 ENOSYS 桩上。
+//! v0.9 第一步加入用户堆（`mmap` / `munmap` / `brk`，内核侧 `kernel/src/syscall/memory.rs`）：
+//!
+//! - `mmap(len, prot, flags)` 只支持**私有匿名**映射（`MAP_PRIVATE|MAP_ANONYMOUS`），
+//!   且**没有 offset 参数** —— 内核的 syscall ABI 传 5 个参数（`rdi, rsi, rdx, r10, r8`），
+//!   匿名映射不需要偏移；文件映射要先扩 ABI（见内核模块文档）；
+//! - `PROT_WRITE|PROT_EXEC` 被内核拒绝（W^X），`PROT_NONE` 与 `MAP_FIXED` 同样拒绝
+//!   （需要 `mprotect` / 固定地址放置，两者都还没实现）；
+//! - `brk` 沿用 Linux 语义：**不返回错误**，失败时返回原值（用 `ret < addr` 判断）。
+//!
+//! 尚未实现的号（`mprotect`/`fork`/`execve`/`wait4`）在内核侧仍落在公共 ENOSYS 桩上。
 
 /// 系统调用号（与内核表一致；不要用魔法数调用 `raw`）。
 pub const SYS_READ: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_OPEN: u64 = 2;
 pub const SYS_CLOSE: u64 = 3;
+pub const SYS_MMAP: u64 = 9;
+pub const SYS_MPROTECT: u64 = 10;
+pub const SYS_MUNMAP: u64 = 11;
+pub const SYS_BRK: u64 = 12;
 pub const SYS_SLEEP: u64 = 35; // nanosleep
 pub const SYS_GETPID: u64 = 39;
 pub const SYS_FORK: u64 = 57;
@@ -66,6 +79,18 @@ pub const EINVAL: isize = -22;
 pub const ENOSPC: isize = -28;
 /// `-ENOSYS`：号合法但内核尚未实现。
 pub const ENOSYS: isize = -38;
+
+/// `mmap` 保护位：可读。
+pub const PROT_READ: i32 = 0x1;
+/// `mmap` 保护位：可写。
+pub const PROT_WRITE: i32 = 0x2;
+/// `mmap` 保护位：可执行（**不能**与 [`PROT_WRITE`] 同时使用：内核强制 W^X）。
+pub const PROT_EXEC: i32 = 0x4;
+
+/// `mmap` 标志：私有映射（与 [`MAP_ANONYMOUS`] 一起是最小可用组合）。
+pub const MAP_PRIVATE: i32 = 0x2;
+/// `mmap` 标志：匿名映射（本内核**只**支持它，且要求 `fd = -1`）。
+pub const MAP_ANONYMOUS: i32 = 0x20;
 
 /// 原始系统调用：`rax` = 号，`rdi/rsi/rdx/r10/r8` = 参数，返回 `rax`。
 ///
@@ -136,6 +161,37 @@ pub fn open(path: &str, flags: i32) -> isize {
 /// `close(fd)`：释放 fd（0/1/2 是保留位，关闭它们返回 [`EBADF`]）。
 pub fn close(fd: i32) -> isize {
     unsafe { raw(SYS_CLOSE, fd as u64, 0, 0, 0, 0) }
+}
+
+/// `brk(addr)`：调整用户堆顶（内核的 brk 堆窗口 256 KiB）。
+///
+/// `addr = 0` 只查询当前堆顶。返回当前 break —— **失败时返回原值**（Linux 语义），
+/// 调用方用 `ret >= addr` 判断成功；`addr` 会被内核向上取整到页。
+pub fn brk(addr: u64) -> u64 {
+    let ret = unsafe { raw(SYS_BRK, addr, 0, 0, 0, 0) };
+    ret as u64
+}
+
+/// `mmap(len, prot, flags)`：匿名映射 `len` 字节，返回页对齐地址或负 errno。
+///
+/// 内核只接受 `MAP_PRIVATE|MAP_ANONYMOUS`（`fd` 由本函数固定传 -1）、
+/// 拒绝 `PROT_WRITE|PROT_EXEC`（W^X）与未知保护位；新页保证**全零**。
+pub fn mmap(len: usize, prot: i32, flags: i32) -> isize {
+    unsafe {
+        raw(
+            SYS_MMAP,
+            0, // addr 只是提示：内核忽略它（不支持 MAP_FIXED）
+            len as u64,
+            prot as u64,
+            flags as u64,
+            u64::MAX, // fd = -1
+        )
+    }
+}
+
+/// `munmap(addr, len)`：整段归还匿名映射（要求页对齐且全段已映射）。
+pub fn munmap(addr: u64, len: usize) -> isize {
+    unsafe { raw(SYS_MUNMAP, addr, len as u64, 0, 0, 0) }
 }
 
 /// `getpid()`：当前用户程序的 PID（内核分配的顺序号）。

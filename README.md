@@ -6,6 +6,25 @@
 
 ## 当前进度
 
+**H-06 包管理器 P0a 已落地（2026-10-11）**：内核包有了**独有后缀 `.ckc`**
+（**CKC** = Cerlesse Kernel Container）—— 64 字节头（magic `CKC\x01` / 版本 / 头长 / flags /
+payload_len / payload_off / 32 字节 payload_sha256 / 保留位，小端）+ **确定性 ustar** payload
+（归档名 = 安装目标路径去 `/`、`PKG.toml` 第一、其余按字节序、mtime/uid/gid 全 0、仅常规文件、不压缩）。
+**身份 = payload 的 SHA-256**（换算成 `rev`），因此同一棵目录树在任何机器上打包结果逐字节相同。
+实现：`tools/pkgmgr/ckc.py`（纯标准库 `pack`/`verify`/`info`，退出码 0/1/2/4）；
+验收：`make test-pkg`（`tests/test_ckc.py`，**37 项**，含用系统 `tar` 读同一段 payload 的
+**独立复核**）；规格见 docs/package-manager.md 3.2。
+
+**v0.9 已开局（2026-10-11，运行时前置条件第一步：用户堆）**：用户态终于**有堆**了。
+内核侧 `brk`（256 KiB 窗口，Linux 语义：失败返回原值）/ `mmap`（匿名私有映射，256 KiB 窗口，first-fit，
+新页**保证全零**）/ `munmap`（整段归还；清页表项时 `invlpg`，不留幽灵映射），
+拒绝 `PROT_WRITE|PROT_EXEC`（W^X）、文件映射（无 offset 参数）、`PROT_NONE`（需要 `mprotect`）；
+`libc` 侧注册 `#[global_allocator]`（bump over `mmap`），因此用户程序可以用 `Vec`/`String`/`Box`。
+`make test-user` 断言由 32 项增至 **59 项**（零页、模式读回、**堆缓冲经 `write` 交给内核**、
+6 个具体 errno 负例、`Vec`/`format!`，以及「用户态结束后页帧全部归还」的泄漏检查
+`user: frames free before=119159 after=119159` → `user: heap frame reclamation PASS`）。
+关联：docs/syscall.md 3.5、libc/README.md。
+
 **v0.8 已完成（2026-10-11）**：驱动注册框架 + PCI 枚举 + 块设备（legacy virtio-blk）+ **磁盘文件系统（FAT12/16/32 只读，挂到 VFS）** + H-03 `mkfs`。
 **v0.7 已落地（2026-10-11）**：VFS + RAMFS + ELF Loader、文件 syscall（`open`/`read`/`close`），详情见文末。
 
@@ -58,7 +77,7 @@ IRQ 的 EOI 时序错误导致 PIC 停摆（B-11）。
 （**v0.7 已把「摊平内嵌」换成 ELF Loader**，见下一节；`make user` 仍可单独验证脚手架，
 编写新用户程序的约定见 [libc/README.md](libc/README.md)。）
 
-自动化验证（当时）：`make test-user` 19 项串口断言（v0.7 起同一命令增至 **32 项**）PASS；
+自动化验证（当时）：`make test-user` 19 项串口断言（v0.7 增至 **32 项**，v0.9 第一步增至 **59 项**）PASS；
 `tests/orchestrate.json` 的 `user` 场景同步断言脚手架证据（当时共 7 场景，v0.7 增至 8）。
 
 **v0.7 已落地（2026-10-11）**：VFS + RAMFS + ELF Loader —— 用户程序不再需要手工摊平。
@@ -78,12 +97,13 @@ IRQ 的 EOI 时序错误导致 PIC 停摆（B-11）。
 - 构建链：`kernel/build.rs` 校验 ELF（基址/段页对齐/`W^X`/映像窗口/无重定位）后**原样内嵌**；
   `user.ld` 四个段分别 `ALIGN(0x1000)`；`make user` 跑 `tools/check_user_elf.py`（不启 QEMU 验段布局）。
 
-自动化验证：`make test-user`（**32 项**断言：`source=elf` + `segments/image_pages/writable_pages` +
+自动化验证：`make test-user`（**32 项**断言，v0.9 第一步增至 **59 项**：`source=elf` + `segments/image_pages/writable_pages` +
 `open/read/close/write` 全链路 + 内核读回用户写入的文件 + `static counter=1` + `EFAULT` + 退出码/隔离）PASS；
 `make test-fs`（19 项）PASS；`tests/orchestrate.json` 增至 **8 场景**（新增 `fs`）全 PASS。
 
-v0.7 仍**未做**（属 v0.8+）：用户堆（`brk`/`mmap`）、`argc/argv`、`fork/execve/wait4` 与进程对象、
-动态链接、内核高半区迁移；磁盘 FS（FAT32）与 `mkfs`（H-03）属 v0.8，Shell 与 `ls`/`cat` 属 v0.9。
+v0.7 仍**未做**（后续版本补齐）：`argc/argv`、`fork`/`execve`/`wait4` 与进程对象、动态链接、
+内核高半区迁移（用户堆已于 v0.9 第一步补齐）；磁盘 FS（FAT32）与 `mkfs`（H-03）属 v0.8，
+Shell 与 `ls`/`cat` 属 v0.9。
 
 **v0.8 已落地（2026-10-11）**：驱动注册框架 + PCI 枚举 + 块设备（virtio-blk legacy）+ 磁盘文件系统（FAT12/16/32）。
 
@@ -172,11 +192,12 @@ make test-keyboard   # v0.4：经 QEMU monitor 注入按键，断言 IRQ1 回显
 make test-scheduler  # v0.5：断言 ≥3 个内核任务在 PIT 时间片下轮转
 make test-ipc        # v0.5：断言 pipe 创建/写入/读取摘要日志 + 自测 PASS
 make test-fs         # v0.7：断言 VFS 挂载路由 + RAMFS 读/写/ls + 负例 errno
-make test-user       # v0.7：断言 ELF 从 RAMFS 装载 + 文件 syscall 全链路 + 用户写入读回 + 隔离
+make test-user       # v0.7/v0.9：ELF 从 RAMFS 装载 + 文件 syscall + 用户堆（brk/mmap/munmap + Vec）+ 隔离（59 项）
 make test-driver     # v0.8：断言 PCI 枚举 + 驱动挂接 + virtio-blk 扇区读/写/负例
 make fat-image       # v0.8：用 tools/mkfs/mkfs.py 生成 FAT32 测试盘（内容见 tests/fatroot/）
 make test-fat        # v0.8：双盘启动，断言 FAT16/32 挂到 VFS 后的读/ls/LFN/跨簇/偏移读/EROFS
 make user            # v0.7：单独构建并校验用户态脚手架（libc + user/hello → 段页对齐的 ELF）
+make test-pkg        # H-06 P0a：CKC 包容器（.ckc）与打包/校验规则（主机侧，不启 QEMU）
 make test-all        # 全部集成测试
 make go-test         # v0.4 H-04/H-05：Go 单元测试（串口分析 + 并行编排器）
 make test-orch       # v0.4 H-04：Go 编排器并行跑 10 个集成测试场景（tests/orchestrate.json）

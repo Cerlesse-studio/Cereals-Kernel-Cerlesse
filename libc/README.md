@@ -1,9 +1,9 @@
 # libc（最小用户态运行时）
 
-- 版本：v0.6 建立 / **v0.7 补齐文件 syscall**
-- 状态：✅ 已实现（2026-10-11，随 `make test-user` 32 项断言实测通过；`user/hello` 作为 RAMFS 上的
-  `/init` 经 ELF Loader 装载并跑在 ring3）
-- 关联：[docs/syscall.md](../docs/syscall.md) 2.11 / 3.1、[user/hello](../user/hello)、
+- 版本：v0.6 建立 / **v0.7 补齐文件 syscall** / **v0.9 第一步补齐用户堆**
+- 状态：✅ 已实现（2026-10-11，随 `make test-user` **59 项**断言实测通过；`user/hello` 作为 RAMFS 上的
+  `/init` 经 ELF Loader 装载并跑在 ring3，堆自测也在其中）
+- 关联：[docs/syscall.md](../docs/syscall.md) 2.11 / 3.1 / 3.5、[user/hello](../user/hello)、
   [docs/filesystem.md](../docs/filesystem.md) 2.6
 
 ## 1. 这是什么
@@ -14,7 +14,8 @@
 
 | 组成 | 内容 |
 | ---- | ---- |
-| `syscall` | 系统调用号常量 + 裸入口 `raw(nr, a1..a5)` + `write` / `read` / `open` / `close` / `getpid` / `nanosleep` / `exit` |
+| `syscall` | 系统调用号常量 + 裸入口 `raw(nr, a1..a5)` + `write` / `read` / `open` / `close` / `getpid` / `nanosleep` / `exit` / `brk` / `mmap` / `munmap` |
+| `heap` | `#[global_allocator]`（bump over `mmap`，64 KiB 块）—— 用户程序因此可以用 `Vec`/`String`/`Box`（v0.9 第一步） |
 | `console` | `print!` / `println!`（固定 256 字节缓冲，**一次宏调用 = 一次 `write`**） |
 | `_start` | `global_asm!` 放在 `.text.start`：`_start` → 用户 `main` → `exit(main())` |
 | 运行时支撑 | `#[panic_handler]`（打 stderr 后 `exit(101)`）、`no_std`、errno / `O_*` 常量 |
@@ -95,10 +96,44 @@ pub extern "C" fn main() -> i32 {
 3. **静态变量必须归入 `.bss`**：链接在 2^39（large 代码模型）时 rustc 把零初始化静态量放进
    按名字命名的 `.lbss.<symbol>` 段，`user.ld` 必须显式把它们收进 `.bss`，否则它们会变成
    **孤儿段**被 lld 塞在 `.data` 之后，RW 段不再页对齐（实测落在 `0x8000003040`）；
-4. **只能用「映像窗口 + 4 页栈」**：映像（`.text`/`.rodata`/`.data`/`.bss`）上限 64 KiB、
-   栈 16 KiB；**没有用户堆** —— `brk`/`mmap` 仍是 `ENOSYS`，动态内存只能放在栈或静态数组里。
+4. **内存窗口是固定布局**：映像（`.text`/`.rodata`/`.data`/`.bss`）上限 64 KiB、栈 16 KiB，
+   v0.9 第一步又加了 **brk 堆窗口 256 KiB** 与 **匿名 mmap 窗口 256 KiB**（见第 5 节）；
+   超出窗口的 `brk`/`mmap` 会失败（`brk` 返回原值、`mmap` 返回 `-ENOMEM`），
+   而且**没有 `mprotect`**（`PROT_NONE` 与「先写后换只执行」仍不支持）。
 
 `make user` 会跑 `tools/check_user_elf.py`，逐项检查上述 1/2（以及映像窗口、无重定位），
 不用启动 QEMU 就能在改坏链接脚本时立刻发现。
 
-尚未封装的调用（`fork`/`execve`/`wait4`）在内核侧仍是 ENOSYS 桩；用户堆与 `argc/argv` 属 v0.8+。
+尚未封装的调用（`mprotect`/`fork`/`execve`/`wait4`）在内核侧仍是 ENOSYS 桩；`argc/argv` 与
+动态链接属后续版本。
+
+## 5. 用户堆（v0.9 第一步）
+
+```rust
+use libc::{brk, mmap, munmap, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+use alloc::vec::Vec;   // 用户程序里 `extern crate alloc;`
+
+let base = brk(0);                       // 查询当前堆顶
+let grown = brk(base + 8192);            // 增长两页（页对齐）
+let p = base as *mut u8;                 // 新页保证全零，可直接写
+unsafe { core::ptr::write_volatile(p, 7) };
+println!("brk {} -> {}", base, grown);
+
+let m = mmap(4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS); // >0 = 地址，<0 = -errno
+let _ = munmap(m as u64, 4096);
+
+let mut v: Vec<u32> = Vec::new();        // 全局分配器在 heap.rs，走 mmap
+v.push(1);
+```
+
+内核侧语义（完整版见 [docs/syscall.md](../docs/syscall.md) 3.5）：
+
+| 调用 | 语义 | 失败 |
+| ---- | ---- | ---- |
+| `brk(addr)` | `addr = 0` 查询堆顶；否则页对齐增长/收缩（256 KiB 窗口） | **不返回错误**：返回原值（用 `ret < addr` 判断） |
+| `mmap(len, prot, flags)` | 只收 `MAP_PRIVATE\|MAP_ANONYMOUS`，`fd` 固定 -1，**无 offset 参数**；first-fit；新页全零 | `-EINVAL`（位非法/文件映射/`PROT_WRITE\|PROT_EXEC`/`PROT_NONE`）、`-ENOMEM`（超窗口） |
+| `munmap(addr, len)` | 整段归还（要求页对齐且全段已映射） | `-EINVAL` |
+
+分配器的**限制**（写在代码注释里，也写在这里）：`libc::heap` 是只前进的 bump 分配器，
+`dealloc` 是空操作 —— 目前靠「一次运行结束由内核 `UserSpace::Drop` 整棵释放」兜底，
+长驻程序的内存占用会单调上升；回收式分配器与 `mprotect` 属后续版本。

@@ -143,7 +143,7 @@ fd 编号（与 Linux 一致的形状，见 syscall.md 2.7）：
 - [x] **挂载点路由**：`fs: mount point=/mnt fs=ramfs-scratch` + `fs: route /mnt/note.txt fs=ramfs-scratch` + `fs: readback /mnt/note.txt len=7 data=v0.7-ok`
 - [x] 目录列举（`ls` 语义）：`fs: ls / entries=3` + 每项 `name/kind/size/perms`
 - [x] 负例 errno：`fs: negative cases PASS (ENOENT/ENOTDIR/EISDIR/EEXIST/EINVAL)`
-- [x] 文件 syscall 全链路（随 `make test-user`，32 项断言）：`user: open path=/etc/motd flags=0x0 fd=3`
+- [x] 文件 syscall 全链路（随 `make test-user`，v0.7 时 32 项、v0.9 起 59 项断言）：`user: open path=/etc/motd flags=0x0 fd=3`
       → `user: read fd=3 want=64 got=23` → 内容经 `write` 打到串口 → `user: read fd=3 want=64 got=0`（EOF）
       → `user: close fd=3` → `user: open path=/tmp/hello.txt flags=0x41 fd=3` → `user: write fd=3 len=24`
       → 内核读回 `fs: readback /tmp/hello.txt len=24` + `fs: user data: written by user program`

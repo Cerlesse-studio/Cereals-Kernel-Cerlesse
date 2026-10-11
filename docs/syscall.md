@@ -1,11 +1,13 @@
 # 系统调用 / 用户空间 / ELF（阶段文档）
 
-- 阶段：第六阶段（v0.6 – v0.7）
+- 阶段：第六阶段（v0.6 – v0.7）+ 第九阶段开局（v0.9 运行时前置条件）
 - 最后更新：2026-10-11
 - 状态：🟡 v0.7 已落地：**ELF Loader**（从 RAMFS 上的 `/init` 装载，按段权限逐页映射）+ 文件 syscall
   （`read`/`write`/`open`/`close`，对接 VFS/RAMFS）+ 用户 `RW` 段对 ring3 可写；
-  `make test-user` 32 项 / `make test-fs` 19 项串口断言 PASS；
-  `fork/exec/wait`、进程对象、用户堆（`brk`/`mmap`）、`argc/argv` 仍未做（见 3.4）
+  **v0.9 第一步已落地：用户堆**（`brk` 256 KiB / 匿名 `mmap` 256 KiB / `munmap`，
+  用户态 `#[global_allocator]` 可用 `Vec`；见 3.5）；
+  `make test-user` 59 项 / `make test-fs` 19 项串口断言 PASS；
+  `fork/exec/wait`、进程对象、`argc/argv`、动态链接仍未做（见 3.4）
 
 > 本文档顶部保留阶段 / 最后更新 / 状态字段，与项目文档维护约定对齐。
 - 依赖：process.md（进程模型）、memory.md（用户地址空间）
@@ -17,8 +19,9 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
 1. **v0.6 核心**：建立用户态 / 内核态隔离 + 系统调用入口 + 第一批 syscall + 用户态 `hello` 运行。
 2. **v0.7 扩展（本版已完成）**：ELF Loader（从文件装载、按段权限映射）、
    VFS 对接的文件语义（`open`/`read`/`write`/`close`）。
-3. **仍未做**：用户堆（`brk`/`mmap`）、`argc/argv`、`fork`/`execve`/`wait4` 与进程对象（v0.8）、
-   Shell 与 `ls`/`cat` 程序（v0.9）。
+3. **v0.9 第一步（本版已做）**：用户堆 —— `brk`/`mmap`/`munmap` + libc 的全局分配器（见 3.5）。
+4. **仍未做**：`argc/argv`、`fork`/`execve`/`wait4` 与进程对象、`mprotect`（W^X 转换）、
+   动态链接（`PT_INTERP`/`ld.so`）、Shell 与 `ls`/`cat` 程序。
 
 ## 2. v0.6 实际实现（2026-10-10 落地）
 
@@ -111,7 +114,11 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
 | `sleep`（nanosleep） | 35 | ✅ v0.6 | 以 PIT tick（10ms）为单位等待；期间 `sti; hlt` 让 PIT 继续推进 |
 | `getpid` | 39 | ✅ v0.6 | 返回当前用户程序 PID（串口打印 `user: getpid -> N`） |
 | `exit` | 60 | ✅ v0.6 | 记录退出码并结束用户态执行（不返回） |
-| `fork` / `execve` / `wait4` | 57 / 59 / 61 | ⬜ v0.8 | 落在 ENOSYS 桩上（需要进程对象） |
+| `mmap` | 9 | ✅ v0.9 第一步 | 匿名映射：只收 `MAP_PRIVATE\|MAP_ANONYMOUS`、`fd` 必须 -1、**只传 5 个参数（无 offset）**；first-fit 落在 256 KiB 的 mmap 窗口；新页**保证全零**；`PROT_WRITE\|PROT_EXEC` 拒绝（W^X）、`PROT_NONE` 拒绝（没有 `mprotect`） |
+| `munmap` | 11 | ✅ v0.9 第一步 | 整段归还：页对齐 + 全段已映射，否则 `-EINVAL`；执行时清页表项 **并 `invlpg`**（否则 TLB 会留下幽灵映射） |
+| `brk` | 12 | ✅ v0.9 第一步 | 增长/收缩堆顶（窗口 256 KiB）；`addr = 0` 只查询；**Linux 语义：不返回错误**，失败返回原值（`ret < addr` 即失败）；增长全成或全不成 |
+| `fork` / `execve` / `wait4` | 57 / 59 / 61 | ⬜ 后续 | 落在 ENOSYS 桩上（需要进程对象） |
+| `mprotect` | 10 | ⬜ 后续 | 已列入「号已定义但未实现」（`syscall_table::UNIMPLEMENTED`）：`PROT_NONE` 的映射与「先写后换只执行」都依赖它 |
 
 分发表按 `SYS_MAX`(=256) 排满：未实现的号落在公共 ENOSYS 桩，
 「号合法但未实现」与「号越界」是两种可区分的失败路径。
@@ -157,8 +164,8 @@ UserSpace::new() → load_program()
 
 ### 2.9 验收（v0.6）
 
-已通过 `make test-user`（**v0.6 时为 19 项串口断言**，QEMU + OVMF；v0.7 起同一命令增至
-32 项，见 3.3）：
+已通过 `make test-user`（**v0.6 时为 19 项串口断言**，QEMU + OVMF；v0.7 增至 32 项，
+v0.9 第一步增至 59 项，见 3.3 / 3.5）：
 
 - [x] 脚手架生效：`user: program=hello source=libc bytes=6584 code_pages=2`
       （比串口断言更硬的是可重复性：`make user` 不启 QEMU 就能单独构建 `libc` + `user/hello`，
@@ -275,7 +282,12 @@ user/hello (Rust + libc)
 ```text
 0x0000_0080_0000_0000 + 0x0000   页 0..15   用户映像窗口（64 KiB，ELF PT_LOAD 按段权限映射）
 0x0000_0080_0000_0000 + 0x10000  页 16..19  用户栈（16 KiB，RW、NX）
+0x0000_0080_0000_0000 + 0x20000  页 32..95  brk 堆窗口（256 KiB，按需映射，RW、NX；v0.9）
+0x0000_0080_0000_0000 + 0x60000  页 96..159 匿名 mmap 窗口（256 KiB，first-fit，RW 或 RX；v0.9）
 ```
+
+四个窗口都在同一张 PT 覆盖的 2 MiB 内（共 160 页），因此仍然只需要一张页表；
+窗户之间（如页 20..31）没映射 —— ring3 摸到就是 #PF，这是隔离的正常表现。
 
 两个新的构建期/装载期约束（都有实测理由）：
 
@@ -301,11 +313,12 @@ user/hello (Rust + libc)
 
 ### 3.3 验收（v0.7，实测）
 
-`make test-user`（32 项）与 `make test-fs`（19 项）串口断言全部 PASS，关键证据：
+`make test-user`（v0.7 时 32 项；v0.9 第一步增至 59 项，见 3.5）与 `make test-fs`（19 项）
+串口断言全部 PASS，关键证据：
 
-- [x] **ELF 从文件装载**：`fs: create /init` → `user: program=/init source=elf bytes=7992 segments=4
-      image_pages=5 writable_pages=2 entry=0x8000000000`（`source=elf` 与 `segments/writable_pages`
-      是「走的是 ELF Loader 且段权限生效」的证据）；
+- [x] **ELF 从文件装载**：`fs: create /init` → `user: program=/init source=elf bytes=15596 segments=4
+      image_pages=7 writable_pages=2 entry=0x8000000000`（`source=elf` 与 `segments/writable_pages`
+      是「走的是 ELF Loader 且段权限生效」的证据；`bytes`/`image_pages` 随 `/init` 加入堆自测而增长）；
 - [x] **文件 syscall 全链路**：`user: open path=/etc/motd flags=0x0 fd=3` →
       `user: read fd=3 want=64 got=23` → 内容由用户态 `write` 打到串口（`user: write fd=1 len=23`）→
       `user: read fd=3 want=64 got=0`（EOF，证明偏移在推进）→ `user: close fd=3`；
@@ -322,17 +335,52 @@ user/hello (Rust + libc)
 - [ ] 除 `/init` 之外的**多个**用户程序（需要 `argc/argv` 或 shell）→ v0.9；
 - [ ] `ls`/`cat`/`cd` 用户程序 → v0.9（v0.7 在内核侧与 `/init` 里验证了同样的语义）。
 
-### 3.4 v0.7 仍未做（属 v0.8+）
+### 3.4 仍未做（v0.9 起逐步补齐）
 
-- 用户堆：`brk`/`mmap` 仍是 ENOSYS；用户程序只有「映像窗口（按段权限）+ 4 页栈」；
+- ~~用户堆~~ → **已做**（3.5：`brk`/`mmap`/`munmap` + libc 全局分配器）；仍缺 `mprotect`
+  （`PROT_NONE`、W^X 转换）与文件映射；
 - `argc/argv`／环境变量传递：`_start` 不接收参数；
 - `fork`/`execve`/`wait4` 与进程对象（`exit` 仍是「结束当前用户态执行」）；
 - `stac`/`clac` 精细控制（内核目前直接读写用户页）、内核高半区迁移；
 - 动态链接 / `PT_INTERP` / `ET_DYN`（只接受 `ET_EXEC` + 无重定位）。
 
+### 3.5 用户堆（v0.9 第一步，2026-10-11 落地）
+
+v0.9 的运行时前置条件按依赖顺序补：**先有可分配的用户内存**（本版），再有 `argc/argv`、
+`fork`/`execve`/`wait4` 与进程对象，最后才是动态链接（`ld.so`）与 shell。
+理由很直接：glibc、`ld.so`、任何真实程序的第一件事都是要堆。
+
+| 项 | 实现位置 | 说明 |
+| ---- | ---- | ---- |
+| 地址空间窗口 | `syscall/address_space.rs` | brk 窗口 256 KiB（页 32..95）+ 匿名 mmap 窗口 256 KiB（页 96..159），均**按需映射**：没碰过的页 `page_flags` 返回 `None`，因此指向它的用户指针会被 syscall 层判为 `EFAULT` |
+| `brk` / `mmap` / `munmap` | `syscall/memory.rs` | 语义与错误码见 2.7；每个失败路径都留一行 `user: <op> rejected (...)` 或 `user: <op> errno=<n>` |
+| 用户态分配器 | `libc/src/heap.rs` | `#[global_allocator]`（bump over `mmap`，64 KiB 块，`dealloc` 不回收）—— `Vec`/`String`/`Box` 从此可用 |
+| 自测/验收 | `user/hello/src/main.rs` | 堆自测写在参考用户程序里（因此“堆能不能用”是 **ring3 事实**，不是内核侧自说自话） |
+
+四条有实测理由的性质（`make test-user` 逐条断言）：
+
+1. **新页必须是零**：`hello: heap zeroed=1` / `hello: mmap zeroed=1`。把上一任使用者的内容
+   送给新调用方是信息泄漏，所以 `brk`/`mmap` 分配帧时都先清零；
+2. **堆页要能当 syscall 缓冲**：用户程序把**堆上**的 26 字节交给 `write` 打到串口
+   （`user: write fd=1 len=26` + `hello: heap write ret=26`）——证明 `check_range` 经 `page_flags`
+   认可堆/mmap 页，而不是只认映像窗口与栈；
+3. **`munmap` 之后真的访问不到**：清页表项的同时 `invlpg`（`paging::flush_tlb`）。
+   少了刷新就会出现「页帧已归还、TLB 里还是旧映射」的幽灵访问；实测里释放后的同一地址
+   又被下一次 `mmap` 复用（`user: mmap len=65536 ... -> 0x8000060000`），旧映射没有残留；
+4. **用户态结束后页帧全部归还**：`UserSpace::Drop` 释放映像/栈/堆/mmap 四类页帧；
+   `user: frames free before=119159 after=119159` → `user: heap frame reclamation PASS`
+   （内核在 selftest 里直接对比帧分配器的 `free_frames`，不靠日志措辞）。
+
+负例也逐条具体（不是「都失败就行」）：文件映射 / `MAP_SHARED` / `PROT_WRITE|PROT_EXEC` /
+未对齐的 `munmap` / 重复 `munmap` → `-EINVAL`(-22)；超过 256 KiB 窗口 → `-ENOMEM`(-12)。
+
+**仍然没有的**（写下来避免误读）：`mprotect`（因此 `PROT_NONE` 与「先写后换只执行」都不支持）、
+文件映射（`mmap` 无 offset 参数、`fd` 必须 -1）、回收式分配器（`dealloc` 是空操作：
+一次运行结束由内核整棵释放；长驻程序的内存占用会单调上升）。
+
 ## 4. 调用链示例
 
-实际调用链（v0.7）：
+实际调用链（v0.7 + v0.9 用户堆）：
 
 ```text
 用户态 syscall 指令
@@ -341,6 +389,7 @@ user/hello (Rust + libc)
   → syscall_table::parse（号 → handler）
   → file::sys_read/sys_write/sys_open/sys_close
        └─ fs::file（fd 表）→ fs::vfs（挂载表路由）→ fs::ramfs
+  → memory::sys_mmap / sys_munmap / sys_brk（用户堆：地址空间窗口 + 页帧分配）
   → process::sys_exit / sys_getpid / sys_sleep
   → sysretq 回到用户态（恢复 rdi/rsi/rdx/r10/r8/r9；exit 与 ring3 异常走 leave_user 回内核）
 ```
@@ -363,4 +412,5 @@ fd ≥ 3 一律经 VFS 抽象路由，syscall 层不认识具体后端。
 | 2026-10-08 | 本次 docs 迭代统一文档顶部元信息与修订记录 |
 | 2026-10-10 | **v0.6 核心落地**：填入真实入口选型（`syscall`/`sysret`）、寄存器/错误码约定、GDT 布局约束、用户地址空间构造、ring3 异常终止语义、首批 4 个 syscall 与 `make test-user` 验收结果；补记实测坑（固件页表只读 → 惰性清 `USER` 位）与 v0.6 明确未做项 |
 | 2026-10-11 | **v0.6 用户态脚手架可用**：新增 2.11（`libc/` API、`user.ld` 链接约束、large 代码模型/`user-release` profile、构建期摊平与检查项）；2.8 改为「用户程序来源」并区分 `source=libc` 与 `source=asm`；2.4 更新为多代码页映射；验收项增至 19 项 |
+| 2026-10-11 | **v0.9 第一步：用户堆** —— 新增 `syscall/memory.rs`（`brk`/`mmap`/`munmap`，含 W^X、`MAP_*` 白名单、5 参数无 offset 的取舍说明与逐条错误码）+ `address_space.rs` 的堆窗口（256 KiB）与匿名 mmap 窗口（256 KiB，first-fit，含 `invlpg`）；`libc` 新增 `heap`（`#[global_allocator]`，bump over mmap）与 `brk/mmap/munmap` 封装；`user/hello` 加入堆自测（零页、模式读回、堆缓冲 `write`、6 个负例、`Vec`/`format!`）；`user.rs` 新增页帧泄漏检查（`frames free before/after` → `heap frame reclamation PASS`）；`make test-user` 断言由 32 项增至 **59 项**（`orchestrate.json` 的 `user` 场景同步），全量回归（`test-fs` 19 项 / `test-driver` 22 项 / `test-fat` 21 项 / `make go-test`）PASS |
 | 2026-10-11 | **v0.7 落地**：第 3 节从规划改为实现记录 —— ELF Loader（解析/按段权限逐页映射/入口取 `e_entry`）、用户地址布局（映像窗口 64 KiB + 栈 4 页）、段页对齐与 `.lbss` 孤儿段的实测坑、`make user` 的独立 ELF 检查（`tools/check_user_elf.py`）；2.7 填入 `read/open/write/close`（含 fd 表与两条硬规则）；2.10 标注 v0.7 已做项；4 节更新调用链；3.4 列出仍未做项（用户堆/`argc/argv`/`fork` 系/动态链接） |

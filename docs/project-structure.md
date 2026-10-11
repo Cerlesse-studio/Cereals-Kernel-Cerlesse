@@ -26,6 +26,7 @@ Cerlesse/
 │   │   ├── process/             # process/thread/context/pid
 │   │   ├── scheduler/           # scheduler/queue/round_robin
 │   │   ├── syscall/             # ✅ v0.6–v0.7：trampoline/address_space/elf/syscall_table/process/file/user
+│   │   │                        #    ✅ v0.9 第一步：memory（brk/mmap/munmap，用户堆）
 │   │   ├── fs/                  # ✅ v0.7–v0.8：vfs/inode/mount/ramfs/file + fat（FAT12/16/32 只读后端）
 │   │   ├── driver/              # ✅ v0.8：driver（注册框架）/pci/block/virtio_blk + serial（v0.1）/keyboard（v0.4）
 │   │   ├── time/                # timer/clock
@@ -43,11 +44,13 @@ Cerlesse/
 │   └── init/  shell/  ls/  cat/  echo/  ps/   # v0.9 占位
 │
 ├── libc/                        # ✅ v0.6/v0.7：最小用户态运行时（syscall 封装 / _start / print!）
+│                                #    ✅ v0.9 第一步：heap（#[global_allocator]，bump over mmap）
 │
 ├── tools/                       # 主机侧工具
 │   ├── image-builder/           # Python：磁盘镜像组装
 │   ├── check_user_elf.py        # ✅ v0.7：用户程序 ELF 段布局检查（不启 QEMU）
-│   └── mkfs/                    # ✅ v0.8：FAT12/16/32 镜像生成（mkfs.py，mtools 独立复核）
+│   ├── mkfs/                    # ✅ v0.8：FAT12/16/32 镜像生成（mkfs.py，mtools 独立复核）
+│   └── pkgmgr/                  # ✅ H-06 P0a：CKC 包容器（ckc.py，后缀 .ckc；tar 独立复核）
 │
 ├── tools-go/                    # Go：测试编排 / 串口日志分析等主机服务
 │
@@ -74,7 +77,7 @@ Cerlesse/
 | `kernel/src/time/` | PIT/APIC Timer、系统时钟、sleep/yield | v0.4 |
 | `kernel/src/process/` | 进程/线程模型、PID、状态机 | v0.5 |
 | `kernel/src/scheduler/` | 调度队列、Round Robin | v0.5 |
-| `kernel/src/syscall/` | 系统调用入口/分发、用户地址空间、ELF Loader、首批与文件 syscall | v0.6–v0.7 ✅ |
+| `kernel/src/syscall/` | 系统调用入口/分发、用户地址空间、ELF Loader、首批与文件 syscall、**用户堆（`memory.rs`：`brk`/`mmap`/`munmap`）** | v0.6–v0.7 ✅ / v0.9 第一步 ✅ |
 | `kernel/src/fs/` | VFS 抽象（trait + 路径工具）、挂载表路由、RAMFS、fd 表、**FAT12/16/32 只读后端** | v0.7 ✅ / v0.8 ✅ |
 | `kernel/src/driver/` | 串口（v0.1）、键盘（v0.4）、**驱动注册框架 / PCI 枚举 / 块设备抽象 / virtio-blk**（v0.8 ✅） | v0.4 / v0.8 |
 | `kernel/src/driver/{pci,driver,block,virtio_blk}.rs` | `pci` 只回答「总线上有什么」；`driver` 回答「谁来管它」（`Driver` trait + `probe_all`）；`block` 是上层唯一可见的按扇区接口；`virtio_blk` 是具体实现（同时实现 `Driver` 与 `BlockDevice`） | v0.8 ✅ |
@@ -84,9 +87,9 @@ Cerlesse/
 | `kernel/src/ipc/` | 管道、通道、共享内存 | v0.5+ |
 | `kernel/src/network/` | 以太网 → IP → TCP/UDP → Socket | v0.9 |
 | `kernel/src/security/` | 权限、凭证、Capability | v1.0 |
-| `libc/` | 最小用户态运行时：syscall 封装（含 `open/read/close`）、`_start`、`print!/println!`、panic handler | v0.6 ✅ / v0.7 ✅ |
+| `libc/` | 最小用户态运行时：syscall 封装（含 `open/read/close` 与 `brk/mmap/munmap`）、`_start`、`print!/println!`、panic handler、**`heap`（`#[global_allocator]`）** | v0.6 ✅ / v0.7 ✅ / v0.9 第一步 ✅ |
 | `user/` | 用户程序（`hello` ✅ v0.6/v0.7，其 ELF 即 RAMFS 上的 `/init`；init/shell/ls/cat/echo/ps 待 v0.9） | v0.6–v0.9 |
-| `tools/`（Python） | 镜像构建、用户程序 ELF 检查（v0.7）、`mkfs/` FAT 镜像生成（v0.8 ✅） | v0.1 起 |
+| `tools/`（Python） | 镜像构建、用户程序 ELF 检查（v0.7）、`mkfs/` FAT 镜像生成（v0.8 ✅）、**`pkgmgr/ckc.py`（CKC 包容器 `.ckc`，H-06 P0a ✅）** | v0.1 起 |
 | `tools-go/`（Go） | 测试编排、串口日志服务 | v0.4 起 |
 | `tests/` | QEMU 集成测试 | v0.1 起 |
 
@@ -102,4 +105,6 @@ Cerlesse/
 | 2026-10-11 | v0.6 用户态脚手架落地：`libc/` 与 `user/hello` 从占位变为实现并加入 workspace；`kernel/build.rs` 新增构建期用户程序构建与 ELF 摊平；workspace 新增 `user-release` profile 与 `default-members` |
 | 2026-10-11 | v0.7 落地：`kernel/src/fs/` 从占位变为实现（`vfs`/`inode`/`mount`/`ramfs`/`file`），`kernel/src/syscall/` 新增 `elf.rs` 与文件 syscall；`kernel/build.rs` 由「摊平内嵌」改为「校验 ELF 后原样内嵌」（RAMFS `/init`）；新增 `tools/check_user_elf.py`（`make user` 验段布局） |
 | 2026-10-11 | v0.8 前半落地：`kernel/src/driver/` 新增 `pci.rs` / `driver.rs` / `block.rs` / `virtio_blk.rs`（模块表里补上分层职责），`kernel/src/arch/x86_64/port.rs`（端口 I/O），`memory/frame.rs` 追加连续帧分配；`user/{init,shell,ls,...}` 仍为占位 |
+| 2026-10-11 | H-06 P0a：`tools/` 新增 `pkgmgr/ckc.py`（CKC 包容器，后缀 `.ckc`）；目录树与模块表同步标注 |
+| 2026-10-11 | v0.9 第一步：`kernel/src/syscall/` 新增 `memory.rs`（用户堆 syscall），`libc/` 新增 `heap.rs`（`#[global_allocator]`）；目录树与模块表同步标注 |
 | 2026-10-11 | v0.8 收官：`kernel/src/fs/` 新增 `fat.rs`（块设备上的 FAT 只读后端，模块表补一行）；`tools/mkfs/` 从占位变为实现（`mkfs.py`）；`tests/fatroot/`（测试盘内容 + mtools 复核说明）；`tests/test_boot.py` 支持 `--disk2`（双盘启动） |

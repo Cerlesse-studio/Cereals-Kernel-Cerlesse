@@ -1,10 +1,12 @@
-//! libc —— Cerlesse 最小用户态运行时（v0.6 脚手架，v0.7 补齐文件 syscall）
+//! libc —— Cerlesse 最小用户态运行时（v0.6 脚手架，v0.7 文件 syscall，v0.9 用户堆）
 //!
 //! 这一层把「内核 ABI」封装成用户程序可以直接调用的形状，让新用户程序
 //! **不需要**再手写机器码：
 //!
 //! - [`syscall`]：`syscall` 指令封装 + 调用（`write` / `read` / `open` / `close` /
-//!   `getpid` / `nanosleep` / `exit`）；
+//!   `getpid` / `nanosleep` / `exit` / `brk` / `mmap` / `munmap`）；
+//! - [`heap`]：`#[global_allocator]`（bump over `mmap`）—— 用户程序因此可以用
+//!   `Vec`/`String`/`Box`（在此之前只能把数据放在栈或静态数组里）；
 //! - [`console`]：`print!` / `println!`（固定缓冲，一次 `write` 送出一整行）；
 //! - `_start`（本文件底部 `global_asm!`）：`_start` → 用户 `main` → `exit(main())`；
 //! - `#[panic_handler]`：用户态 panic 打到 stderr 后 `exit(101)`，不会卡死在内核里。
@@ -31,20 +33,23 @@
 //!    会被装载器直接拒绝（`user: ELF rejected: W and X segments share a page`）；
 //! 2. **必须固定链接到 `USER_VIRT_BASE`（0x0000_0080_0000_0000）**：链接地址 = 运行地址，
 //!    程序里的绝对地址因此不需要重定位（内核不做加载时重定位，只接受 `ET_EXEC`）；
-//! 3. **程序有可写数据段**（`.data`/`.bss` 映射为 ring3 可写、不可执行），
-//!    但没有用户堆：`brk`/`mmap` 仍是 ENOSYS，动态内存只能放在栈或静态数组里。
+//! 3. **程序有可写数据段**（`.data`/`.bss` 映射为 ring3 可写、不可执行）
+//!    与**用户堆**（`brk` 窗口 256 KiB + 匿名 `mmap` 窗口 256 KiB，见 [`heap`]）；
+//!    `mmap` 只支持私有匿名页、拒绝 `PROT_WRITE|PROT_EXEC`（W^X）、且没有 `offset` 参数。
 //!
 //! 系统调用号与错误约定见 `kernel/src/syscall/syscall_table.rs`（Linux x86_64 语义）。
 
 #![no_std]
 
 pub mod console;
+pub mod heap;
 pub mod syscall;
 
 pub use crate::console::Writer;
 pub use crate::syscall::{
-    close, exit, getpid, nanosleep, open, read, write, EBADF, EFAULT, EISDIR, EINVAL, ENOENT,
-    ENOSPC, ENOSYS, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, STDERR, STDIN, STDOUT,
+    brk, close, exit, getpid, mmap, munmap, nanosleep, open, read, write, EBADF, EFAULT, EISDIR,
+    EINVAL, ENOENT, ENOMEM, ENOSPC, ENOSYS, MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDONLY, O_RDWR,
+    O_WRONLY, PROT_EXEC, PROT_READ, PROT_WRITE, STDERR, STDIN, STDOUT,
 };
 
 use core::arch::global_asm;

@@ -56,7 +56,7 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 | **v0.6 🟡** | Syscall + User Space（2026-10-10 核心已验收：`syscall`/`sysret` 入口 + ring3 + 用户地址空间隔离 + `write/exit/getpid/sleep`；2026-10-11 用户态脚手架可用：`libc/` + `user/hello` 真实用户程序跑在 ring3，`make user` / `make test-user` PASS）；ELF Loader / VFS 文件语义 / 进程对象留到 v0.7 | syscall.md |
 | **v0.7 🟡** | VFS + RAMFS + ELF（2026-10-11 核心已验收：`FileSystem` trait + 挂载表最长前缀路由 + RAMFS 后端 + fd 表 + `open/read/write/close` + **ELF Loader**（RAMFS `/init` 按段权限逐页装载，`RW` 段对 ring3 可写）；`make test-fs` 19 项 / `make test-user` 32 项 PASS）。Shell 里 `ls/cat/cd` 属 v0.9、磁盘 FS（FAT32）与 `mkfs` 属 v0.8 | filesystem.md / syscall.md |
 | **v0.8 ✅** | Driver + PCI + Disk（2026-10-11 验收：驱动注册框架 + PCI 枚举 + 块设备 + **legacy virtio-blk**（`make test-driver` 22 项）；**FAT12/16/32 只读后端挂到 VFS** + H-03 `mkfs`（`make test-fat` 21 项），双盘启动读 `/disk`（启动盘）与 `/mnt/fat`（测试盘）） | drivers.md / filesystem.md |
-| **v0.9** | Shell + User Programs + Network | drivers.md / filesystem.md |
+| **v0.9** 🟡 | Shell + User Programs + Network（**已开局**：运行时前置条件第一步 **用户堆** = `brk`/`mmap`/`munmap` + `libc` 全局分配器，`make test-user` 59 项；下一步 `argc/argv`、进程对象/`fork` 系、动态链接） | syscall.md / drivers.md / filesystem.md |
 | **v1.0** | 完整可启动的类 Linux 小型 OS | — |
 
 每个版本的详细任务清单见 [../DEVELOPMENT.md](../DEVELOPMENT.md)。
@@ -89,4 +89,5 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 | 2026-10-11 | v0.6 用户态脚手架可用：`libc/` 落地（syscall 封装 + `_start` + `print!/println!`）、真实用户程序 `user/hello` 并入 workspace、`kernel/build.rs` 构建期摊平内嵌、`load_program` 支持多代码页；新增 `make user`，`make test-user` 增至 19 项断言 |
 | 2026-10-11 | **v0.8 前半落地**（驱动注册框架 + PCI 枚举 + 块设备 + legacy virtio-blk）：新增 `driver/{driver,pci,block,virtio_blk}.rs` 与 `arch/x86_64/port.rs`、`frame::allocate_contiguous`；启动盘改为 virtio-blk（`disable-modern=on`）；新增 `make test-driver`（22 项）与编排第 9 个场景；该阶段里程碑当时记为 🟡（FAT/`mkfs` 未做，三日内的同一版本内补齐后标 ✅） |
 | 2026-10-11 | **v0.7 核心落地**：VFS + RAMFS + fd 表 + `read/open/write/close` + **ELF Loader**（用户程序改为从 RAMFS `/init` 装载，按段权限逐页映射；`build.rs` 不再摊平）；`user.ld` 四段 `ALIGN(0x1000)`；新增 `make test-fs` 与 `tools/check_user_elf.py`，`make test-user` 增至 32 项；v0.7 里程碑标记 🟡（Shell `ls/cat/cd` → v0.9，磁盘 FS + `mkfs` → v0.8） |
+| 2026-10-11 | **v0.9 开局（运行时前置条件第一步：用户堆）**：`syscall/memory.rs` 实现 `brk`/`mmap`/`munmap`（256 KiB 堆窗口 + 256 KiB 匿名 mmap 窗口、按需映射、新页全零、W^X、`invlpg`），`libc` 提供 `#[global_allocator]`（bump over mmap）与封装，`user/hello` 加入堆自测，`user.rs` 新增页帧泄漏检查；`make test-user` 32 → **59 项** PASS，`make test-orch` 10 场景 PASS；v0.9 里程碑标记 🟡（Shell/网络仍未做） |
 | 2026-10-11 | **v0.8 收官**（FAT 磁盘后端 + H-03 `mkfs`）：`fs/fat.rs`（FAT12/16/32 只读：BPB 按簇数定类型、固定根目录区/簇链目录、8.3 + NT 标志 + LFN 校验和、任意偏移读、`EROFS`/`EUCLEAN`）挂到 VFS（`fs::mount_disks` → `/disk` 启动盘、`/mnt/fat` 测试盘，验证最长前缀路由）；`FileSystem` trait 改为 `&mut self` + `read_all -> Vec<u8>`；`tools/mkfs/mkfs.py` 自己生成 FAT12/16/32 镜像并由 mtools 独立复核；新增 `make fat-image` / `make test-fat`（21 项，双盘）与编排第 10 个场景；v0.8 里程碑标记 ✅ |

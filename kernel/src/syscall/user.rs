@@ -37,6 +37,7 @@ use core::ptr::addr_of;
 use crate::arch::x86_64::{cpu, gdt, paging};
 use crate::driver::serial;
 use crate::fs::{self, vfs};
+use crate::memory::frame;
 use crate::syscall::address_space::UserSpace;
 use crate::syscall::trampoline;
 
@@ -217,10 +218,15 @@ fn verify_user_file() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// v0.7 验收自测：ELF 从 VFS 装载、ring3 五类 syscall 往返、用户写入落盘、地址空间隔离。
+/// 验收自测：ELF 从 VFS 装载、ring3 syscall 往返（含用户堆）、用户写入落盘、地址空间隔离。
+///
+/// 最后一项是**页帧泄漏检查**（v0.9 用户堆）：两次运行的 `UserSpace` 都被 `Drop`，
+/// 包括 `brk`/`mmap` 分配出去又没有 `munmap` 归还的页 —— 帧分配器的 `free_frames`
+/// 必须回到运行前的值，否则说明「用户堆的页帧在地址空间销毁时没还」。
 pub fn selftest() -> Result<(), &'static str> {
     crate::syscall::init();
     serial::println("user: selftest begin");
+    let free_before = frame::stats().free_frames;
 
     // 1) 正常路径：/init（ELF 来自 RAMFS）完成一轮完整 syscall 往返并以 exit(42) 结束
     run_from_vfs("init", INIT_PATH, 1)?;
@@ -247,6 +253,19 @@ pub fn selftest() -> Result<(), &'static str> {
         return Err("probe reached sys_exit: ring3 isolation not enforced");
     }
     serial::println("user: probe PASS (kernel page not reachable from ring3)");
+
+    // 4) 地址空间（含用户堆页）必须整棵归还
+    let free_after = frame::stats().free_frames;
+    serial::print("user: frames free before=");
+    serial::print_dec(free_before as u64);
+    serial::print(" after=");
+    serial::print_dec(free_after as u64);
+    serial::println("");
+    if free_before != free_after {
+        serial::println("user: heap frame reclamation FAIL (address space leaked frames)");
+        return Err("user address space leaked frames");
+    }
+    serial::println("user: heap frame reclamation PASS");
 
     serial::println("user: selftest PASS");
     Ok(())
