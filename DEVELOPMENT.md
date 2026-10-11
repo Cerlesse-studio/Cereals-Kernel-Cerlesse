@@ -1,6 +1,6 @@
 # Cerlesse OS 主开发文档（DEVELOPMENT）
 
-- 阶段：第一阶段
+- 阶段：第八阶段（v0.9 进行中）
 - 最后更新：2026-10-11
 - 状态：v0.1–v0.5 全部完成（v0.4：中断/Timer/键盘/上下文切换 + H-04/H-05 Go 工具，`make go-test` / `make test-orch` 通过；v0.5：线程模型 + Round Robin 时间片调度 + IPC pipe 骨架，`make test-scheduler` / `make test-ipc` 通过）；
   v0.6 核心已落地并通过 `make test-user` 验收（syscall/sysret 入口 + ring3 + 用户地址空间隔离），
@@ -35,29 +35,29 @@
 
 ### 1.1 核心需求（Rust 内核）
 
-| 编号 | 需求 | 版本 |
-| ---- | ---- | ---- |
-| R-01 | UEFI 引导进入 Rust 内核入口，串口输出 | v0.1 |
-| R-02 | GDT/IDT 与异常处理（#PF/#GP/#DF 等） | v0.2 |
-| R-03 | 物理帧分配 + 虚拟内存映射 + 内核堆分配器 | v0.3 |
-| R-04 | 中断控制器（PIC/APIC）、Timer、键盘输入 | v0.4 |
-| R-05 | 进程/线程模型、上下文切换、Round Robin 调度 | v0.5 |
-| R-06 | 系统调用入口与首批 10 个 syscall、用户态隔离 | v0.6 |
-| R-07 | VFS + RAMFS + ELF Loader | v0.7 |
-| R-08 | 驱动框架、PCI 枚举、磁盘驱动 | v0.8 |
-| R-09 | Shell、基础用户程序、简化网络栈 | v0.9 |
-| R-10 | 权限/凭证、可完整启动的类 Linux 小型 OS | v1.0 |
+| 编号 | 需求 | 版本 | 状态 |
+| ---- | ---- | ---- | ---- |
+| R-01 | UEFI 引导进入 Rust 内核入口，串口输出 | v0.1 | ✅ |
+| R-02 | GDT/IDT 与异常处理（#PF/#GP/#DF 等） | v0.2 | ✅ |
+| R-03 | 物理帧分配 + 虚拟内存映射 + 内核堆分配器 | v0.3 | ✅ |
+| R-04 | 中断控制器（PIC/APIC）、Timer、键盘输入 | v0.4 | ✅（APIC 未做） |
+| R-05 | 进程/线程模型、上下文切换、Round Robin 调度 | v0.5 | ✅ |
+| R-06 | 系统调用入口、首批 syscall、用户态隔离 | v0.6 | ✅ |
+| R-07 | VFS + RAMFS + ELF Loader | v0.7 | ✅ |
+| R-08 | 驱动框架、PCI 枚举、磁盘驱动 | v0.8 | ✅ |
+| R-09 | Shell、基础用户程序、简化网络栈 | v0.9 | 🟡（Shell/用户程序 ✅，网络未做） |
+| R-10 | 权限/凭证、可完整启动的类 Linux 小型 OS | v1.0 | ⬜ |
 
 ### 1.2 主机侧需求（Python / Go）
 
-| 编号 | 需求 | 语言 | 版本 |
+| 编号 | 需求 | 语言 | 状态 |
 | ---- | ---- | ---- | ---- |
-| H-01 | 镜像构建脚本（组装 boot + kernel + FS 镜像） | Python | v0.1 |
-| H-02 | QEMU 自动化：启动、超时、串口日志断言 | Python | v0.1 |
-| H-03 | mkfs 工具（FAT12/16/32 镜像生成，`tools/mkfs/mkfs.py`，mtools 复核） | Python | v0.8 ✅ |
-| H-04 | 测试编排服务（并行多场景跑 QEMU 测试） | Go | v0.4 |
-| H-05 | 串口日志实时收集与分析 | Go | v0.4 |
-| H-06 | 包管理器设计与主机侧原型（高效/安全/轻量、Windows 式灵活性参考） | Python（纯标准库，见 docs/package-manager.md 第 11 节） | 设计阶段（**提案 v1 ✅** + **P0a 已落地**：`.ckc` 包容器 `tools/pkgmgr/ckc.py`，`make test-pkg` 37 项 PASS；事务/catalog 属 P0b） |
+| H-01 | 镜像构建脚本（组装 boot + kernel + FS 镜像） | Python | ✅ v0.1 |
+| H-02 | QEMU 自动化：启动、超时、串口日志断言 | Python | ✅ v0.1 |
+| H-03 | `mkfs` 工具（FAT12/16/32 镜像生成） | Python | ✅ v0.8（`tools/mkfs/mkfs.py`，mtools 复核） |
+| H-04 | 测试编排服务（并行多场景跑 QEMU 测试） | Go | ✅ v0.4（`tools-go/cmd/testorch`） |
+| H-05 | 串口日志实时收集与分析 | Go | ✅ v0.4（`tools-go/cmd/serialmon`） |
+| H-06 | 包管理器设计与主机侧原型（高效/安全/轻量、Windows 式灵活性参考） | Python（纯标准库） | 🟡 提案 v1 ✅ + **P0a 已落地**（`.ckc` 容器 `tools/pkgmgr/ckc.py`，`make test-pkg` 37 项）；事务/catalog 属 P0b |
 
 ### 1.3 非目标（见 architecture.md 第 5 节）
 
@@ -88,30 +88,36 @@ boot ──→ arch(x86_64) ──→ interrupt ──→ time
 
 ---
 
-## 3. Cargo Workspace 规划（v0.1 初始化）
+## 3. Cargo Workspace 规划
+
+根 `Cargo.toml` 的 `members` 包含 `shared`/`boot`/`kernel`/`libc`/`user/*`，
+`default-members` 保持 `shared`/`boot`/`kernel`，因此 `cargo build`（不带 `--target`）
+不会连带构建用户程序（用户程序只能为目标 `x86_64-unknown-none` 构建，链接在 2^39）。
+
+约定：
+
+- `shared`：boot 与 kernel 共享的 `BootInfo` 等纯数据结构（`no_std`）。
+- `kernel`：`#![no_std]`，目标 `x86_64-unknown-none`，链接脚本 `kernel/link.ld`（装载 32MiB）。
+- `boot`：UEFI 引导 crate，目标 `x86_64-unknown-uefi`；与内核边界调用必须 `extern "sysv64"`（ADR-006）。
+- `libc`：最小用户态运行时（syscall 封装 + `_start` + `print!/println!` + 堆 + `args`）。
+- `user/*`：`no_std` 用户态程序，产出静态 ELF；当前可运行的有
+  `user/hello`（→ RAMFS `/init`）、`user/shell`（→ `/bin/sh`）、`user/hello-bin`（→ `/bin/hello`，外部程序）；
+  `init/ls/cat/echo/ps` 仍为占位（`cat` 先以 Shell 内建命令形式落地）。
+- `tools/`（Python）与 `tools-go/`（Go）**不进 Cargo workspace**，各自独立管理（仅标准库）。
+- 交叉编译在 Linux 与 Windows 主机上均通过 `rustup target add` 相同目标完成（见 docs/boot.md）。
+
+用户程序专用 profile（workspace 根定义，large 代码模型与 LTO 不兼容）：
 
 ```toml
-# 根 Cargo.toml（v0.1 落地；v0.6 加入 libc 与 user/*，并新增 user-release profile）
-[workspace]
-resolver = "2"
-members = ["shared", "boot", "kernel", "libc", "user/hello"]
-# 用户程序只能为目标 x86_64-unknown-none 构建（链接在 2^39），
-# 因此 `cargo build`（不带 --target）仍只构建前三者。
-default-members = ["shared", "boot", "kernel"]
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-opt-level = 2
-lto = true
-panic = "abort"
-
-# 用户程序专用：large 代码模型与 LTO 不兼容（见 libc/README.md 第 3 节）
 [profile.user-release]
 inherits = "dev"
 opt-level = 2
 lto = false
+debug = false
+debug-assertions = false
+overflow-checks = false
+strip = true
+panic = "abort"
 ```
 
 约定：
@@ -131,180 +137,68 @@ lto = false
 
 ## 4. 目录结构
 
-见 [docs/project-structure.md](docs/project-structure.md)（已同步创建占位文件框架）。
+见 [docs/project-structure.md](docs/project-structure.md)（完整目录树与模块职责表）。
 
 ---
 
 ## 5. 版本任务清单（v0.1 – v1.0）
 
-### v0.1 — Bootloader + Rust Kernel ✅（2026-10-06 完成）
-- [x] 初始化 Cargo Workspace 与 target 配置（shared/boot/kernel；uefi + none 双目标）
-- [x] UEFI Bootloader：解析内存映射、页分配、加载 ELF、BootInfo、ExitBootServices
-- [x] `kernel_main` 入口 + Serial Console 输出（自建栈，sysv64 边界调用）
-- [x] Python 镜像构建脚本（H-01，mtools 组装 64MiB FAT）与 QEMU 启动测试（H-02）
-- [x] 验收：QEMU 打印 "Kernel started!"（`make test` 断言通过）
-- [x] 文档完成：[docs/boot.md](docs/boot.md)（v0.1 实现记录、踩坑记录 ADR-006/007/008）
+### 5.1 里程碑总览
 
-### v0.2 — GDT + IDT + Exception ✅（2026-10-06 完成）
-- [x] 自建 GDT（null/kcode/kdata）+ TSS（IST1 专用双错栈、RSP0 预留）+ ltr
-- [x] IDT 32 个异常向量，汇编 stub（区分有/无错误码）+ 统一保存/恢复（`exception_dispatch`）
-- [x] 异常 handler 诊断输出：向量名、错误码、RIP/CS/RFLAGS/RSP/SS、通用寄存器、#PF 时 CR2
-- [x] 验收（自动化）：`make test` 回归 PASS；`make test-exception` PASS（串口含 `EXCEPTION: divide error` + 完整寄存器转储 + `KERNEL PANIC: unhandled exception`）
-- [x] 文档完成：[docs/boot.md](docs/boot.md)（v0.1/v0.2 实现记录、B-01/B-05/B-06 修复）
+| 版本 | 目标 | 状态 |
+| ---- | ---- | ---- |
+| v0.1 | Bootloader + Rust Kernel | ✅ 2026-10-06 |
+| v0.2 | GDT + IDT + Exception | ✅ 2026-10-06 |
+| v0.3 | Physical/Virtual Memory + Heap | ✅ 2026-10-07 |
+| v0.4 | Interrupt + Timer + Keyboard + H-04/H-05 | ✅ 2026-10-08 |
+| v0.5 | Process + Thread + Scheduler + IPC（pipe） | ✅ 2026-10-08 |
+| v0.6 | Syscall + User Space + 用户态脚手架 | ✅ 2026-10-10 |
+| v0.7 | VFS + RAMFS + ELF Loader | ✅ 2026-10-11 |
+| v0.8 | Driver + PCI + Disk（FAT 只读 + mkfs） | ✅ 2026-10-11 |
+| v0.9 | Shell + User Programs + Network | 🟡 已落地三步 |
+| v1.0 | 完整可启动类 Linux 小型 OS | ⬜ |
 
-### v0.1 缺陷复查与修复（2026-10-06，随 v0.2 一并落地）
+### 5.2 v0.1 – v0.5 完成记录（要点）
 
-| # | 级别 | 问题 | 修复措施 |
-| ---- | ---- | ---- | ---- |
-| B-01 | 高 | `_start` 到 `kernel_main` 内 `cli` 之间存在中断窗口：ExitBootServices 后 IF 仍为 1，而 IDT 还是固件遗留的，中断可能跳进已失效的固件代码 | `_start` 汇编第一行 `cli`，内核入口即刻关中断（v0.4 重新开启） |
-| B-02 | 中 | 内核无自有 GDT/IDT，全程依赖固件遗留状态；任何异常直接 triple fault，不可诊断 | v0.2 本体：自建 GDT/IDT + 异常诊断 |
-| B-03 | 低 | 异常处理无自动化回归（v0.1 仅验证成功路径） | 新增 `make test-exception`（feature 门控触发 #DE） |
-| B-04 | 低 | 启动日志含一次性低地址内存诊断输出（10 行） | 保留：仅打印 <64MiB 区域，用于装载地址冲突诊断；后续改 QEMU 调试开关 |
-| B-05 | **高** | 内核目标默认链接为 **PIE（ELF DYN）**：函数地址表等绝对数据依赖 `.rela.dyn` 的 `R_X86_64_RELATIVE` 加载时重定位，而 bootloader 只按程序头拷贝段、不处理动态重定位 → v0.1 未暴露（全是 RIP 相对访问），v0.2 异常注入时 IDT handler 地址读到错误值，直接把 #DE 分发到垃圾地址 | `.cargo/config.toml` 对 `x86_64-unknown-none` 强制 `-C relocation-model=static`；重建后 ELF 为 EXEC、`There are no relocations`，测试通过 |
+- **v0.1**：Cargo Workspace + 双目标（uefi/none）；UEFI 引导解析内存映射、装载内核 ELF、
+  传 `BootInfo`、`ExitBootServices`；`kernel_main` + 串口；H-01 镜像构建 + H-02 QEMU 测试。
+  验收：串口打印 `Kernel started!`。
+- **v0.2**：自建 GDT + TSS（IST1 双错栈 / `RSP0`）+ ltr；IDT 32 个异常向量 + 汇编 stub
+  （区分有/无错误码）+ 统一保存/恢复；异常诊断输出（向量名/错误码/RIP/CS/RFLAGS/RSP/SS/通用寄存器，
+  #PF 带 CR2）。验收：`make test` 回归 + `make test-exception`（#DE）。
+- **v0.3**：位图帧分配器（1 bit/帧，128KiB 覆盖 4GiB）、4 级页表（translate/map_4k/unmap_4k/TLB/`AddressSpace`）、
+  内核堆（映像末尾预留 1MiB + 首次适配空闲链表 + 合并）。
+  验收：`make test-memory`（含 `Box`/`Vec`/`String`、1024 帧压力、页表自测）+ `make test-pagefault`（#PF + CR2）。
+- **v0.4**：PIC（8259A，IRQ→向量 32..47）+ IRQ 分发注册表；PIT 通道 0 频率 **100Hz（10ms/tick）** +
+  心跳；PS/2 键盘（8042 初始化 + IRQ1 + set 1 解码）；上下文切换原语（callee-saved + 栈切换 + RFLAGS）；
+  H-04/H-05 Go 工具（`go-test` / `test-orch`）。
+  验收：`make test-keyboard`（QEMU monitor 注入真实按键 + PIT 心跳）。
+- **v0.5**：线程控制块与状态机、PID 分配、定长环形就绪队列、Round Robin（200ms 时间片）、
+  PIT/IRQ0 抢占式调度（pid 1/2/3 严格轮转并绕回 pid 0）；IPC 单向 pipe 骨架（64B 环形缓冲，非阻塞语义）。
+  验收：`make test-scheduler` / `make test-ipc`。
 
-复查结论：v0.1 在其自身功能路径（ELF 装载、内存映射、ExitBootServices、ABI 边界）上无回归；
-但 v0.2 的异常注入测试暴露出 B-05 这一高危潜伏缺陷（静态重定位未处理），已在 v0.2 根治。
-异常防御缺失（B-02）同样由 v0.2 补齐并自动化验证。
+### 5.3 v0.6 — Syscall + User Space ✅（2026-10-10 核心，2026-10-11 脚手架收尾）
 
-### v0.3 — Physical/Virtual Memory + Heap ✅（2026-10-07 完成）
-- [x] 解析 BootInfo MemoryMap（UEFI 描述符，仅 `EfiConventionalMemory` 可用）
-- [x] FrameAllocator（位图，1 bit/帧，128KiB 静态位图覆盖 4GiB；保留内核映像/低 1MiB/BootInfo/堆区）
-- [x] 页表 Mapper（4 级 translate / map_4k / unmap_4k / TLB 刷新 / AddressSpace / 恒等映射补齐）
-      —— 内核高半区映射移至 v0.6（ADR-009，与用户态隔离一并完成）
-- [x] 内核堆 + `#[global_allocator]`（内核映像末尾预留 1MiB + 首次适配空闲链表，带合并）
-- [x] 验收（自动化）：`make test-memory` PASS（`Box`/`Vec`/`String` + 1024 帧压力 + 页表映射自测）；
-      `make test-pagefault` PASS（#PF 诊断 + CR2）；`make test` / `make test-exception` 回归 PASS
-- [x] 文档完成：[docs/memory.md](docs/memory.md)（v0.3 实现记录、B-06/B-07、ADR-009/010/011 落地）
+- [x] 入口选型：`syscall`/`sysret` 快速路径（`EFER.SCE` + `IA32_STAR/LSTAR/FMASK`，GDT 按 STAR 布局）；入口切专用 syscall 栈
+- [x] 寄存器约定：号 `rax`；参数 `rdi/rsi/rdx/r10/r8`；返回 `rax`；负数 = `-errno`
+- [x] `syscall/mod.rs` 分发层 + `syscall_table.rs` 全号段表（未实现号落 `-ENOSYS` 桩）
+- [x] 首批 syscall：`write`（串口，先校验用户缓冲指针）/ `getpid` / `nanosleep` / `exit`
+- [x] 用户地址空间隔离：独立 PML4（用户映射固定下标 1 = `0x8000000000`，每级 `USER`），
+      代码页 RO+X、栈页 RW+NX，`Drop` 整棵释放
+- [x] ring3 异常终止语义：`exception_dispatch` 按 `cs & 3` 识别，用户态异常不 panic
+- [x] 用户态执行期收敛：`scheduler::suspend()` + `TSS.RSP0` 切专用陷阱栈
+- [x] 用户态脚手架：`libc/`（syscall 封装 + `_start` + `print!/println!` + `#[panic_handler]`）
+      + `user/hello` 真实 Rust 用户程序；`kernel/build.rs` 构建期构建/校验/内嵌其 ELF；
+      `UserSpace::load_program` 支持多代码页（1..=8）
+- [x] 验收：`make test-user`（19 项 → v0.7 增至 32 → v0.9 增至 61）；`make user` 单独验证脚手架
 
-v0.3 发现并修复的缺陷（随本阶段一并落地）：
+### 5.4 v0.7 — VFS + RAMFS + ELF ✅（2026-10-11）
 
-| # | 级别 | 问题 | 修复措施 |
-| ---- | ---- | ---- | ---- |
-| B-06 | 中 | v0.2 异常名表自向量 9 起错位一位（漏记 #9 coprocessor segment overrun）→ #PF 打印成 `reserved (#14)`、#GP 打印成 `page fault`；v0.2 的 #DE 测试刚好在错位之前 | 按 Intel SDM Table 6-1 重建 32 项名表；新增 `make test-pagefault` 覆盖 #PF 名称 + CR2 |
-| B-07 | 中 | 堆分配器首版把对齐前导 padding 计入已分配块大小 → 块尾越界覆盖后继空闲块头（空闲链表自环、分配死循环） | 块大小改为 `want - pad`；压力测试增加填充模式校验（抓重叠/越界），已回归 |
-
-### v0.4 — Interrupt + Timer + Keyboard ✅（2026-10-08 完成）
-- [x] 中断控制器骨架与 PIC 第一版（初始化、IRQ→向量映射、mask/EOI 原语）
-- [x] `mod interrupt` 绑定到 `controller / exception / irq` 子模块
-- [x] `kernel_main` 中接入 PIC 初始化（默认全屏蔽，不开启外设 IRQ）
-- [x] 这次额外纳入的外部流程文档：`kernel/src/interrupt/doc CONTRIBUTING_CHAIN.md`（当前作为本模块集成上下文快照，不覆盖 DEVELOPMENT.md 本身的阶段定义）
-- [x] PIC 选型策略与当前状态记录（`kernel/src/interrupt/pic_policy.md`、`kernel/src/interrupt/known_state.md`）
-- [x] PIT Timer tick + 系统计时雏形（`kernel/src/time/timer.rs` 设置通道 0 重装载值、`kernel/src/time/clock.rs` 提供 tick 计数）
-- [x] IRQ 分发入口与最小 IRQ0 注册表骨架（`kernel/src/interrupt/irq.rs`），串口心跳防重入保护具备
-- [x] IRQ0（PIT）回调已注册，在串口观测心跳（每 10 个 tick 打印一次 `tick=<n>`，经回归测试环境确认可观察）
-- [x] PIT 通道 0 频率校正为 **100Hz（10ms/tick）**（`time::timer::TICK_RELOAD_100HZ`，心跳节流每 100 tick = 1 秒）
-- [x] IRQ 汇编 stub 修正：向量 32..47 全部走 `irq_common` 分发（原先只有 IRQ0 特例，其余 IRQ 会落入异常分发而 panic）
-- [x] IRQ 统一入口 `irq_common` 保存/恢复全部通用寄存器（见 B-09）
-- [x] `kernel/src/driver/keyboard.rs`：PS/2 键盘控制器初始化（排空输出缓冲、打开 IRQ1 使能位）
-- [x] PS/2 键盘中断输入：IRQ1 扫描码接收 → set 1 解码（字母/数字/Shift/扩展前缀）→ 串口回显 `KB <字符>`
-      （v0.9 起改为**行缓冲 + 终端式原样回显**：`Enter` 交付整行并打印 `kbd: line ready len=N`，
-      旧格式废弃，`make test-keyboard` 断言同步——见 docs/drivers.md 1.6）
-- [x] 上下文切换原语（为 v0.5 铺路）：`arch::x86_64::context` 的 `switch_to` / `init_context` + 内核自测 `context: switch PASS`
-- [x] 并行共享磁盘镜像：QEMU 改用 `snapshot=on`（临时写时复制），多场景并发不抢镜像写锁且不污染原镜像
-- [x] H-04 测试编排器（Go）：`tools-go/cmd/testorch` + `internal/orchestrator`（场景配置校验、并发信号量、场景超时、串口日志二次复核）
-- [x] H-05 串口日志分析（Go）：`tools-go/cmd/serialmon` + `internal/serialparse`（行分类、心跳递增检测、`-expect` 核对、`-allow-panic`）
-- [x] 验收（自动化）：`make go-test`（`go vet` + `go test`）PASS；
-      `make test-orch`（编排器并行跑 6 个集成测试场景 + 串口二次复核）PASS（6 passed / 0 failed）
-
-v0.4 发现并修复的缺陷（随本阶段一并落地）：
-
-| # | 级别 | 问题 | 修复措施 |
-| ---- | ---- | ---- | ---- |
-| B-08 | **高** | IRQ 汇编 stub 只把 IRQ0（`isr_32`）改为调用 `irq_dispatch`，向量 33..47 仍 `jmp isr_common` → 走向 `exception_dispatch`；IRQ1 一触发就 `EXCEPTION: irq(1)` + `KERNEL PANIC` | 16 个 IRQ stub 统一 `push 0/pushN/jmp irq_common`；`make test-keyboard` 覆盖 IRQ1 派发路径 |
-| B-09 | **高** | IRQ 路径直接 `call irq_dispatch` 而不保存通用寄存器，`iretq` 后被中断的代码带着被破坏的 caller-saved 寄存器继续执行 → 随机 #GP（表现为内存初始化的 `bit_used` 解引用垃圾指针） | `irq_common` 参照 `isr_common` 保存/恢复 15 个通用寄存器，并在 `call` 前强制 16 字节栈对齐 |
-
-### v0.5 — Process + Thread + Scheduler + IPC ✅（2026-10-08 完成）
-- [x] Task/Thread 结构与状态机（`process/thread.rs`：`Thread` + `ThreadState`；`process/pid.rs` PID 分配）
-- [x] 内核级上下文切换接入调度流程（`process/context.rs` 转发 `arch/x86_64/context.rs`，含 RFLAGS 保存）
-- [x] 就绪队列与调度策略抽象（`scheduler/queue.rs` 定长环形队列；`scheduler/round_robin.rs` 200ms 时间片）
-- [x] Round Robin 调度器 + PIT 时间片抢占（`scheduler/scheduler.rs`，IRQ0 → `on_tick` → `switch`）
-- [x] 基础 IPC（pipe）—— v0.5 最后一块，单向 pipe 骨架已落地
-    - `kernel/src/ipc/pipe.rs`：固定容量（64B）环形缓冲单向管道，非阻塞语义
-      （写满短写、空读返回 0），创建/写入/读取均打印串口摘要日志
-- [x] IPC 模块占位（pipe 优先；channel / shared_memory 后续）：
-    - `kernel/src/ipc/pipe.rs`（已实现，含 `selftest`）
-    - `kernel/src/ipc/channel.rs`（尚未编写，保留位置；已更新占位说明）
-    - `kernel/src/ipc/shared_memory.rs`（尚未编写，保留位置；已更新占位说明）
-- [x] 验收（自动化）：`make test-scheduler`（pid 1/2/3 三个内核任务依次运行 + `sched: switch pid=3 -> 0` + `sched: round-robin wrap PASS`）；
-      `context: switch PASS` 随 `make test-memory` 断言
-- [x] IPC 验收（v0.5 余项，2026-10-08 通过，新增 `make test-ipc`）：
-    - [x] 能创建单向 pipe（`pipe: create id=1 cap=64`）
-    - [x] 写端可写入、读端可读取已写字节（`pipe: write id=1 len=10` / `pipe: read id=1 len=10` + 读回比对）
-    - [x] 串口可观测到 pipe 创建/读写摘要日志
-    - [x] 调度器巡回不崩溃（pipe 自测在 Round Robin 巡回后执行，`pipe: selftest PASS`；调度回归仍通过）
-- [x] v0.5 收官标记（2026-10-08）：IPC 验收全部通过，v0.5 标记为整体完成；
-      channel / shared_memory 仍为后续占位，不在本轮范围
-
-### v0.4/v0.5 当前完成判断（2026-10-08 复核后更新）：
-- v0.4 整体标记为**已完成**：内核侧（PIC / PIT 100Hz / PS/2 键盘 / 上下文切换原语）已验收，
-  主机侧 H-04/H-05（testorch / serialmon）已落地，`make go-test` 与 `make test-orch`（6 场景并行）均实测通过。
-- v0.5 整体标记为**已完成**：线程模型 + 上下文切换 + Round Robin 时间片调度已验收，
-  IPC（pipe 骨架）已落代码并通过 `make test-ipc` 验收；channel / shared_memory 按计划保留为后续占位。
-- 下一开发顺序按 DEVELOPMENT.md 第 5 节版本顺序继续：v0.6 核心与用户态脚手架均已落地，继续 v0.7（ELF Loader / VFS 文件语义 / 更多 syscall）。
-
-v0.5 踩坑记录（已修复，建议保留）：
-
-| # | 级别 | 问题 | 修复措施 |
-| ---- | ---- | ---- | ---- |
-| B-10 | **高** | 上下文切换未保存 `RFLAGS`。调度切换发生在 IRQ0 中断上下文内（中断门已清 IF），切出后 IF 永久为 0 → 后续 IRQ 不再递交，调度与心跳同时停摆 | `context_switch` 加入 `pushfq`/`popfq`；`init_context` 的新上下文默认 `RFLAGS=0x202`（IF=1） |
-| B-11 | **高** | IRQ 的 EOI 原先在回调**之后**发出；IRQ0 回调会触发任务切换，本调用栈很晚才恢复 → PIC 不再递交 IRQ0 | `irq_dispatch` 改为「先 EOI，后分发」（中断门已清 IF，提前 EOI 无嵌套风险） |
-| B-12 | 中 | 启动上下文切出后没有回到就绪队列，Round Robin 永远绕不回 pid 0，`start()` 无法返回 | `start()` 在切出前把 pid 0 压回队尾 |
-
-### v0.6 — Syscall + User Space（核心 + 用户态脚手架已实现并通过 `make test-user` 验收，2026-10-10 / 收尾 2026-10-11）
-- [x] syscall 指令入口：**选定 `syscall` / `sysret`**（`int 0x80` 方案不保留）
-    - `IA32_LSTAR` → `syscall_entry`；`IA32_STAR` 决定 GDT 用户段布局（udata 必须紧邻 ucode 之前）；
-      `IA32_FMASK` = IF\|DF\|TF，内核在关中断下运行 syscall handler
-    - 寄存器约定：号 `rax`；参数 `rdi/rsi/rdx/r10/r8`；返回值 `rax`；负数 = `-errno`
-- [x] `syscall/mod.rs` 分发层 + `syscall_table.rs` 全号段分发表（未实现号落在 `-ENOSYS` 桩）
-- [x] 已实现的 syscall（v0.6 最小集）
-    - [x] `write`（fd=1/2 写串口；用户缓冲先用当前用户地址空间校验，越界 `-EFAULT`）
-    - [x] `exit`（记录退出码并结束当前用户态执行）
-    - [x] `getpid`（返回当前用户程序 PID）
-    - [x] `sleep`（PIT tick 粒度等待；等待期间 `sti; hlt`）
-- [x] 用户地址空间隔离（`syscall/address_space.rs`）
-    - [x] 独立 PML4 + 用户映射固定在下标 1（0x8000000000），Drop 整棵释放
-    - [x] 内核子树 `USER` 位惰性清理（只在该位确为 1 时写回）
-    - [x] 代码页只读可执行、栈页可写不可执行；每级中间表均置 `USER`
-- [x] ring3 异常终止语义：`exception_dispatch` 用 `cs & 3` 区分来源，用户态异常不再 panic
-- [x] 用户态执行期收敛：`scheduler::suspend()` + `TSS.RSP0` 切到专用陷阱栈
-- [x] 用户态脚手架（2026-10-11 收尾，`make user` + `make test-user` 实测通过）：
-    - [x] `libc/`：syscall 封装（`write`/`getpid`/`nanosleep`/`exit`）、`_start`（`.text.start` → 用户 `main`）、
-      `print!`/`println!`（一次宏调用 = 一次 `write`）、`#[panic_handler]`
-    - [x] `user/hello`：真实 Rust 用户程序（不再是内嵌机器码），进入 workspace 与构建链
-    - [x] `kernel/build.rs`：构建期构建用户程序 → 解析 ELF → 摊平成连续映像 → `include_bytes!` 内嵌
-      （同时断言装载基址 = `USER_VIRT_BASE`、入口在映像第 0 字节、无可装载重定位）
-    - [x] `UserSpace::load_program` 支持多代码页（1..=8 页，实测 `user/hello` 占 2 页），
-      代码区/栈区间固定布局
-    - [x] `make user` 单独验证脚手架（不启 QEMU）；`make test-user` 断言 `user: program=hello source=libc`
-- [x] v0.6 验收（`make test-user`，19 项串口断言实测 PASS）：
-    - [x] 用户态隔离下 syscall 入口/返回可观察（`user: write fd=1 len=22` / `user: getpid -> 1`）
-    - [x] `exit` 能回收退出码（`user: exit code=42` → `user: hello PASS`）
-    - [x] `getpid`/`sleep` 可用（`user: sleep done ticks=2`，计时真实推进）
-    - [x] 隔离硬证据：probe 读内核页被拦下（`vector=0xe error=0x5 cr2=0x2000000`）+ 内核继续运行
-- [x] 推进到 v0.7 的部分（v0.6 时明确未做；2026-10-11 已在 v0.7 完成的部分）：
-    - [x] 用户程序通过 **ELF Loader** 从文件加载运行（RAMFS 上的 `/init`）
-    - [x] `read` / `open` / `close`（与 VFS 对接）
-    - [x] 用户静态数据可写（`RW` 段按段权限映射，实测 `hello: static counter=1`）
-- [ ] 仍未做（属于 v0.8+，不应被读成已完成）：
-    - [x] ~~`fork` / `exec` / `wait`~~ → **v0.9 第三步已做**（2026-10-11，见下方 v0.9 小节与 docs/syscall.md 3.7）
-    - [x] ~~进程/线程对象~~ → **v0.9 第三步已做**（真正的 PCB：每进程地址空间 + 每进程内核栈 + `Ready/Running/Zombie`）
-    - [ ] 高半区迁移（隔离当前靠页表 `USER` 位而非地址空间划分）
-    - [x] ~~用户堆/`brk`/`mmap`~~ → v0.9 第一步已做；~~`argc/argv` 传递~~ → **v0.9 第三步已做**
-
-v0.6 踩坑记录（已修复，建议保留）：
-
-| # | 级别 | 问题 | 修复措施 |
-| ---- | ---- | ---- | ---- |
-| B-13 | **高** | 创建用户地址空间时无条件重写整棵内核页表来清 `USER` 位。OVMF/EDK2 把自己建立的页表页标为**只读** → 启动路径上直接 #PF（实测 `CR2=0x1fc03000`，`error=P\|W`） | `scrub_user_bits` 改为**惰性**：只在 `USER` 确为 1 时才写回，并打印清位数（实测 OVMF 全为 0） |
-| B-14 | **高** | `syscall` 返回路径栈算术写成 `add rsp, 48`。8 次 push 是从栈顶**向下**增长，该写法把 rsp 移到栈顶之上，`pop r11/rcx` 取到垃圾 → `sysretq` 跳飞到 `RIP=0x3` | 改为 `sub rsp, 16` 后 `pop r11` / `pop rcx`（r11/rcx 位于 top-16 / top-8） |
-
-### v0.7 — VFS + RAMFS + ELF（核心已实现并通过验收，2026-10-11）
-- [x] VFS 抽象（`kernel/src/fs/vfs.rs`）：`FileSystem` trait（stat/read/read_all/write/create/mkdir/list/usage）
-      + 路径工具（`normalize`/`components`/`within`）+ 系统级入口（经挂载表路由，错误一律负数 errno）
-- [x] 挂载管理（`fs/mount.rs`）：挂载点 → 后端，**最长前缀路由**（`/mnt/*` 落到 `/mnt` 的后端）
-- [x] Inode/元数据（`fs/inode.rs`）：`NodeKind`、`Metadata`（含 `ls -l` 风格权限串）、`DirEntry`
-- [x] RAMFS（`fs/ramfs.rs`）：`Node { name, kind, data: Vec<u8>, children }`，单文件上限 256 KiB；
-      `fs::init` 建立初始文件树 `/init` + `/etc/motd` + `/tmp`
+- [x] VFS（`fs/vfs.rs`）：`FileSystem` trait + 路径工具（`normalize`/`components`/`within`）+ 系统级入口
+- [x] 挂载管理（`fs/mount.rs`）：**最长前缀路由**（`/mnt/*` 落到 `/mnt` 后端），日志 `fs: route ... fs=...`
+- [x] Inode/元数据（`fs/inode.rs`）：`NodeKind`、`Metadata`、`DirEntry`
+- [x] RAMFS（`fs/ramfs.rs`）：`Node { name, kind, data, children }`，单文件 ≤ 256 KiB；
+      `fs::init` 建初始树 `/init` + `/etc/motd` + `/tmp`（v0.9 加 `/bin`）
 - [x] fd 表与文件 syscall（`fs/file.rs` + `syscall/file.rs`）：0/1/2 保留、动态 fd ≥ 3（最小空闲槽位）、
       `open`（指针 + 长度、`O_CREAT`）/`read`/`write`/`close`，用户缓冲按页校验（`-EFAULT`）
 - [x] **ELF Loader**（`syscall/elf.rs`）：ELF64/`ET_EXEC`/`EM_X86_64` 解析 → 按段权限逐页映射
@@ -434,61 +328,91 @@ v0.6 踩坑记录（已修复，建议保留）：
 - [x] 验收：Shell 能启动外部程序（`make test-proc`，2026-10-11）；基础用户程序可跑（`make test-programs`，2026-10-11）；
      网络最小闭环（`make test-network`，2026-10-11）；动态链接与 ping/HTTP 简例仍待落地
 
-### v1.0 — 完整可启动类 Linux 小型 OS
+### 5.7 v1.0 — 完整可启动类 Linux 小型 OS
+
 - [ ] 用户/组/权限（`-rwxr-xr-x`、UID/GID）
-- [ ] 进程隔离与 syscall 参数校验
+- [ ] 进程隔离与 syscall 参数校验强化
 - [ ] 启动链：Kernel → init → Shell → User Programs
 - [ ] 文档全量修订、发布 v1.0 tag
 - [ ] 验收：QEMU 一键启动到可交互 Shell
+
+### 5.8 缺陷与修复汇总
+
+| 编号 | 版本 | 级别 | 问题 | 修复 |
+| ---- | ---- | ---- | ---- | ---- |
+| B-01 | v0.1 | 高 | `_start`→`kernel_main` 内 `cli` 前存在中断窗口（IDT 仍是固件遗留） | `_start` 第一行 `cli`，入口即刻关中断 |
+| B-02 | v0.1 | 中 | 内核无自有 GDT/IDT，异常直接 triple fault | v0.2 自建 GDT/IDT + 异常诊断 |
+| B-03 | v0.1 | 低 | 异常处理无自动化回归 | 新增 `make test-exception` |
+| B-04 | v0.1 | 低 | 启动日志含一次性低地址内存诊断 | 保留（<64MiB，用于装载冲突诊断） |
+| B-05 | v0.2 | 高 | 内核默认链接为 PIE，绝对数据依赖 `.rela.dyn`；bootloader 不处理动态重定位 → handler 地址错误 | 强制 `relocation-model=static`（ADR-008） |
+| B-06 | v0.3 | 中 | 异常名表自向量 9 起错位一位 | 按 Intel SDM Table 6-1 重建 32 项名表 + `test-pagefault` |
+| B-07 | v0.3 | 中 | 堆分配器把对齐前导 padding 计入块大小 → 越界覆盖空洞头 | 块大小改为 `want - pad` + 填充模式校验 |
+| B-08 | v0.4 | 高 | IRQ 向量 33..47 走入异常分发 → IRQ1 触发即 panic | 16 个 IRQ stub 统一 `jmp irq_common` |
+| B-09 | v0.4 | 高 | IRQ 路径未保存通用寄存器 → 被打断代码带破坏寄存器继续，随机 #GP | `irq_common` 保存/恢复 15 个通用寄存器 |
+| B-10 | v0.5 | 高 | 上下文切换未保存 `RFLAGS`（切出后 IF 永久为 0） | `context_switch` 加 `pushfq`/`popfq`；新上下文 `RFLAGS=0x202` |
+| B-11 | v0.5 | 高 | IRQ EOI 在回调之后（IRQ0 回调触发切换后 PIC 停摆） | 改为「先 EOI，后分发」 |
+| B-12 | v0.5 | 中 | 启动上下文切出后未回就绪队列，Round Robin 绕不回 pid 0 | `start()` 切出前把 pid 0 压回队尾 |
+| B-13 | v0.6 | 高 | 创建用户地址空间时无条件重写整棵内核页表清 `USER`，OVMF 页表页只读 → 启动 #PF | `scrub_user_bits` 惰性：仅当 `USER` 确为 1 时写回 |
+| B-14 | v0.6 | 高 | `syscall` 返回路径栈算术错误（`add rsp,48`）→ `sysretq` 跳飞 `RIP=0x3` | 改为 `sub rsp,16` 后 `pop r11`/`pop rcx` |
+| B-15 | v0.7 | 高 | syscall 入口未恢复 caller-saved 寄存器 → 用户态 `r9` 被破坏，#PF | 入口保存/恢复 `rdi/rsi/rdx/r10/r8/r9` |
+| B-16 | v0.8 | 中 | BAR 窗口大小按 64 位取反，I/O BAR 报出错误尺寸 | 大小在该字**自身位宽**里求 `~mask + 1` |
+| B-17 | v0.8 | 高 | `lba + sectors` 用 `u64` 加法，`lba = MAX-1` 环绕后被误判在容量内 | 改用 `checked_add`，溢出即报错 |
+
+v0.9 记录的两条踩坑（设计记录，非编号缺陷）：debug 构建下 16 KiB 内核栈静默溢出踩坏 `.bss` 帧分配器；
+子进程退出时必须**先恢复 CR3 再 Drop 地址空间**。详见 [docs/process.md](docs/process.md) 1.4 与
+[docs/syscall.md](docs/syscall.md) 3.7。
+
+### 5.9 关键设计决策（ADR）
+
+见 [docs/architecture.md](docs/architecture.md) 第 6 节（ADR-001 … ADR-011）。新增重大决策时追加编号并同步本文。
 
 ---
 
 ## 6. 测试方案
 
-| 层级 | 内容 | 工具 | 开始版本 |
+| 层级 | 内容 | 工具 | 版本 |
 | ---- | ---- | ---- | ---- |
-| 单元测试 | 纯逻辑模块（分配器算法、ELF 解析、路径解析）在 host 上 `cargo test` | Rust | v0.4（v0.3 暂以内核内自测覆盖，见 docs/memory.md 第 5 节） |
+| 单元测试 | 纯逻辑模块（分配器算法、ELF 解析、路径解析）host 上 `cargo test`（**计划**，暂以内核内自测覆盖） | Rust | v0.4 起规划 |
 | 集成测试 | QEMU 启动 → 断言串口日志包含预期输出 | Python (H-02) | v0.1 |
 | 压力测试 | 帧分配、任务轮转、fork 风暴 | Python + Go 编排 | v0.3/v0.5 |
 | 回归测试 | 每个里程碑的验收标准固化为测试用例 | Go 编排服务 | v0.4 |
-| 异常测试 | 故意触发 #DE/#PF，校验诊断输出（`make test-exception` / `make test-pagefault`） | Python | v0.2（#PF 于 v0.3 加入） |
-| 驱动/块设备测试 | PCI 枚举 → 驱动挂接 → 扇区读写/分块一致性/负例（`make test-driver`） | Python | v0.8 |
-| 磁盘文件系统测试 | 双盘启动 → FAT16 启动盘读内核映像 / FAT32 测试盘读·LFN·跨簇公式·偏移读·负例（`make test-fat`） | Python | v0.8 |
-| 包容器测试（主机侧，不启 QEMU） | `.ckc` 容器：确定性、头部逐字段、payload 篡改、ustar 结构规则、打包期规则（超长路径/越界 target/setuid/hooks）+ 系统 `tar` 独立复核（`make test-pkg`） | Python | H-06 P0a |
-| 键盘/交互输入测试 | QEMU monitor `sendkey` 注入真实按键 → 断言 IRQ1 标记、行缓冲整行交付（`make test-keyboard`）；交互式 Shell 全流程（`sh: prompt` → `help` → `cat /etc/motd` → `exit`，`make test-shell`）；**进程调用全流程**（`hello world` → fork/execve/argv → 退出码回收，`ls` → `-ENOENT` → `exit(127)`，`make test-proc`；`--expect-re` 支持正则 + 反向引用） | Python | v0.4（v0.9 起含 Shell / 进程） |
+| 异常测试 | 故意触发 #DE/#PF，校验诊断输出 | Python | v0.2/v0.3 |
+| 驱动/块设备 | PCI 枚举 → 驱动挂接 → 扇区读写/分块一致性/负例 | Python | v0.8 |
+| 磁盘文件系统 | 双盘启动 → FAT16 启动盘读内核映像 / FAT32 测试盘读·LFN·跨簇·偏移·负例 | Python | v0.8 |
+| 包容器（不启 QEMU） | `.ckc` 确定性、头部逐字段、payload 篡改、ustar 规则、打包期规则 + `tar` 独立复核 | Python | H-06 P0a |
+| 键盘/交互/进程 | QEMU monitor `sendkey` 注入真实按键 → 行缓冲/Shell/进程调用全流程（`--expect-re` 支持正则 + 反向引用） | Python | v0.4，v0.9 扩展 |
 
 约定：
 
-- 每个版本任务清单中的"验收"必须落成自动化测试。
+- 每个版本任务清单里的「验收」必须落成自动化测试。
 - 串口是唯一权威日志通道，测试断言只依赖串口输出。
+- 目标与项数见 [docs/api.md](docs/api.md) 第 7 节。
+
+---
 
 ## 7. QEMU 调试方案
 
-启动（计划的 Makefile 目标）：
-
 ```bash
-# 构建镜像后启动（v0.1 起提供；v0.8 起启动盘挂在 virtio-blk 上）
 make run
 # 底层等价于：
 qemu-system-x86_64 -machine q35 -m 512M -serial stdio -display none \
+  -drive if=pflash,format=raw,readonly=on,file=$OVMF_CODE \
+  -drive if=pflash,format=raw,file=build/OVMF_VARS.fd \
   -drive if=none,id=blk0,format=raw,file=build/disk.img \
   -device virtio-blk-pci,drive=blk0,disable-modern=on
 ```
 
-注：`disable-modern=on` 是必需的 —— 内核只实现 legacy virtio（见 docs/drivers.md 1.2）；
-测试脚本会再加 `snapshot=on`（临时写时复制），使并行场景共享同一镜像且不污染原始文件。
+- `disable-modern=on` 必需：内核只实现 legacy virtio（见 docs/drivers.md 1.2）。
+- 测试脚本额外加 `snapshot=on`（临时写时复制），使并行场景共享镜像且不污染原文件。
+- 调试：`-s -S` + `gdb target remote :1234`；崩溃用 `-no-reboot -d int,cpu_reset`；
+  内核 ELF 保留符号，`add-symbol-file kernel.elf` 后可按函数名下断点。
+- 更完整的开发/调试流程见 [docs/software-development.md](docs/software-development.md) 第 5 节。
 
-调试流程：
-
-1. **串口日志**：`-serial stdio`，所有 `println!` 重定向到串口，开发期唯一输出通道。
-2. **GDB 联调**：QEMU 加 `-s -S`，主机 `gdb target remote :1234`，配合 `cargo run`/`gdb` 脚本单步内核。
-3. **崩溃分析**：`-no-reboot -d int,cpu_reset`，配合异常 handler 的寄存器转储定位 triple fault。
-4. **断点**：内核符号保留在 ELF 中，`add-symbol-file kernel.elf` 后可按函数名下断点。
-5. **Windows 主机**：同一套 QEMU 命令（QEMU for Windows），GDB 用 `gdb-multiarch`/`gdb.exe`，Makefile 目标保持跨平台一致。
+---
 
 ## 8. GitHub Issue / 里程碑规划
 
-里程碑与版本一一对应（Milestone 标签 `v0.1` … `v1.0`），Issue 模板分类：
+里程碑与版本一一对应（Milestone 标签 `v0.1` … `v1.0`），Issue 标签分类：
 
 | 标签 | 用途 |
 | ---- | ---- |
@@ -499,14 +423,27 @@ qemu-system-x86_64 -machine q35 -m 512M -serial stdio -display none \
 
 规划规则：
 
-1. 每个里程碑开工时，把第 5 节对应版本的 checklist 拆成 Issues（一个 checklist 项 ≈ 1 个 Issue，粒度过大的再拆）。
+1. 每个里程碑开工时，把第 5 节对应版本的 checklist 拆成 Issues（一个 checklist 项 ≈ 1 个 Issue）。
 2. Issue 标题格式：`[v0.x] 模块: 简述`，例如 `[v0.3] memory: 实现 bitmap FrameAllocator`。
-3. 里程碑关闭条件：该版本任务清单全部勾选 + 验收测试通过 + 对应阶段文档更新。
-4. 第一阶段只建 Milestone `v0.1` 及其 Issues，后续版本的 Issues 在开工前一个版本创建。
+3. 里程碑关闭条件：任务清单全部勾选 + 验收测试通过 + 对应阶段文档更新。
 
 ---
 
-## 9. 修订记录
+## 9. 文档维护约定
+
+1. 每份文档顶部保留 `阶段` / `最后更新` / `状态` 三行。
+2. **设计变更先改文档再改代码**（文档即规格）；未开始的阶段保留占位大纲，
+   但阶段内已落地部分应及时补记，避免文档与代码库状态脱节。
+3. 新增/调整文档时同步 [docs/README.md](docs/README.md) 索引与相关交叉链接；
+   **对外接口变化必须同步 [docs/api.md](docs/api.md)**。
+4. 文档会被反复修改：每次修订在该文档的「修订记录」补一行（日期 + 变更点）。
+5. 面向开发者的流程/规范统一收敛到 [docs/software-development.md](docs/software-development.md)。
+
+---
+
+## 10. 修订记录
+
+> 本表按日期从旧到新排列；每轮迭代的变更点在此追加（不删除历史）。
 
 | 日期 | 变更 |
 | ---- | ---- |
