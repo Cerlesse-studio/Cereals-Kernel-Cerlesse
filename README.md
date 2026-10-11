@@ -137,7 +137,7 @@ IRQ 的 EOI 时序错误导致 PIC 停摆（B-11）。
 解析 ELF、摊平成「从 `USER_VIRT_BASE` 开始的连续映像」并 `include_bytes!` 内嵌；
 `UserSpace::load_program` 按映像大小逐页映射（1..=8 页，`user/hello` 实测 2 页）。
 （**v0.7 已把「摊平内嵌」换成 ELF Loader**，见下一节；`make user` 仍可单独验证脚手架，
-编写新用户程序的约定见 [libc/README.md](libc/README.md)。）
+编写新用户程序的约定见 [libc/README.md](userland/libc/README.md)。）
 
 自动化验证（当时）：`make test-user` 19 项串口断言（v0.7 增至 **32 项**，v0.9 第一步增至 **59 项**）PASS；
 `tests/orchestrate.json` 的 `user` 场景同步断言脚手架证据（当时共 7 场景，v0.7 增至 8）。
@@ -301,12 +301,20 @@ Cerlesse 不做「完整 Linux 替代品」，而是按 **Boot → 内存 → �
 
 详细的实现记录、踩坑与验收证据见 [DEVELOPMENT.md](DEVELOPMENT.md) 第 5、9 节。
 
-**下一步（规划）：纯内核化边界收敛** —— 内核只保留机制（syscall / 进程 / 调度 / 内存 / VFS /
-网络栈 / 驱动 / 中断 / IPC / 安全），Shell、init、`libc`、coreutils 与包管理器迁往独立的
-**Cerlesse Userland** 项目。逐文件迁移清单与六阶段（冻结基线 → 边界门禁 → ABI 单一来源 →
-用户空间迁移 → 构建/测试拆分 → 接口稳定）见 [docs/pure-kernel.md](docs/pure-kernel.md)。
-现状：删掉 `libc/`、`user/` 后内核**无法构建**（`cargo build -p kernel` 退出码 101），
-因此「不依赖用户态即可编译内核」正是本改造的第一目标。
+**纯内核化边界收敛（已执行第一刀）** —— 内核只保留机制（syscall / 进程 / 调度 / 内存 / VFS /
+网络栈 / 驱动 / 中断 / IPC / 安全），Shell、init、`libc`、coreutils 已拆到**独立 workspace**
+[`userland/`](userland/README.md)（规划与六阶段见 [docs/pure-kernel.md](docs/pure-kernel.md)）。
+现状（实测）：
+
+- 把整个 `userland/` 排除出 checkout 后，`cargo build -p kernel --target x86_64-unknown-none`
+  退出码 **0**（改造前是 **101**），`make image` 能单独出可启动镜像，`make test-kernel-only`
+  7/7 断言通过 —— 内核在没有用户态时启动、跑完自测、进入串口诊断空闲状态；
+- 有用户态时：`make image` 先构建 `userland/`（`make userland-images`），内核按
+  `build/userland/images/manifest.txt` 把 8 个程序 + 2 个库内嵌进映像（内核**不认识程序名**）；
+- 边界由 `make check-boundary`（`tools/check-boundary.py`，6 项 + 反向自检）盯住，已并入 `make test-all`。
+
+仍待做（见 pure-kernel.md 第 4、8 节）：`abi/` 单一事实源（阶段三）、测试编排按内核/用户态拆分与
+`git subtree split -P userland` 开独立仓库（阶段五剩余）、基线 tag（阶段一）、接口文档与版本（阶段六）。
 
 ## 已实现能力
 
@@ -323,10 +331,11 @@ Cerlesse 不做「完整 Linux 替代品」，而是按 **Boot → 内存 → �
   磁盘 FAT12/16/32 **只读**后端（8.3 + NT 标志 + LFN、任意偏移读、`EROFS`/`EUCLEAN`）。
 - **驱动**：驱动注册框架（`Driver` trait + `probe_all` + `ProbeStats`）、PCI 枚举（机制 #1 + BAR 探测）、
   块设备抽象、legacy virtio-blk 0.9.5（virtqueue + 轮询 + bounce buffer）。
-- **用户程序**：`libc` 最小运行时（syscall 封装 / `_start` / `print!` / panic handler / 堆 / `argc`-`argv`）；
-  `user/hello`（`/init`）、`user/shell`（`/bin/sh`）、`user/hello-bin`（外部程序 `/bin/hello`）、
-  `user/{ls,cat,echo,ps}`（→ `/bin/*`）、动态链接夹具 `user/dynhello`（→ `/bin/dynhello` +
-  `/lib/{ld.so,libgreet.so}`，由 `as`+`ld` 现编）。
+- **用户程序**（在独立 workspace [`userland/`](userland/README.md) 里）：`libc` 最小运行时（syscall 封装 /
+  `_start` / `print!` / panic handler / 堆 / `argc`-`argv`）；`user/hello`（`/init`）、`user/shell`（`/bin/sh`）、
+  `user/hello-bin`（外部程序 `/bin/hello`）、`user/{ls,cat,echo,ps}`（→ `/bin/*`）、
+  动态链接夹具 `user/dynhello`（→ `/bin/dynhello` + `/lib/{ld.so,libgreet.so}`，由 `as`+`ld` 现编）。
+  内核只按 `manifest.txt` 把它们当普通文件写进 RAMFS，**不认识任何程序名**。
 - **主机侧工具**：镜像构建、ELF 段布局检查、`mkfs`（FAT 镜像，mtools 独立复核）、
   CKC 包容器 `.ckc`（H-06 P0a）、Go 测试编排器 `testorch` 与串口分析 `serialmon`。
 
@@ -340,7 +349,7 @@ Cerlesse 不做「完整 Linux 替代品」，而是按 **Boot → 内存 → �
 | QEMU | `qemu-system-x86_64`（机器 `q35`，512M） |
 | OVMF | `OVMF_CODE.fd` / `OVMF_VARS.fd`（默认 `/usr/share/OVMF/`） |
 | GNU Make + Python 3 | 构建入口与主机侧工具（仅标准库） |
-| binutils（`as` / `ld`） | v0.9 动态链接夹具由内核构建期现编（`user/dynhello/*.s`），构建内核必需 |
+| binutils（`as` / `ld`） | 动态链接夹具由**用户态**构建期现编（`userland/user/dynhello/*.s`）——只影响 `userland/` 与含用户态的镜像；**内核本身不再需要**（纯内核化前它是内核构建依赖） |
 | 可选：mtools（`mdir`/`mtype`） | FAT 镜像独立复核（`make test-fat`） |
 | 可选：Go | `testorch` / `serialmon`（`make go-test` / `make test-orch`） |
 
@@ -394,10 +403,10 @@ root@cerlesse C:>
 ## 项目结构
 
 ```text
-boot/      UEFI 引导（v0.1 ✅）        kernel/   Rust 内核主体（v0.8 ✅，含内存/中断/调度/
-libc/      最小用户态运行时（v0.9 ✅）            syscall/fs/驱动/进程/动态链接）
-shared/    boot/kernel 共享结构         user/     用户程序（hello / shell / hello-bin /
-                                                     ls / cat / echo / ps / dynhello ✅）
+boot/      UEFI 引导（v0.1 ✅）        kernel/   Rust 内核主体（v0.9 ✅，含内存/中断/调度/
+shared/    boot/kernel 共享结构                   syscall/fs/驱动/进程/动态链接）
+userland/  用户态独立 workspace（✅ 纯内核化）—— libc + user/*（hello / shell /
+           hello-bin / ls / cat / echo / ps / dynhello）+ 自己的 Makefile 与 .cargo 配置
 tools/     Python 主机工具              tools-go/ Go 主机服务
 tests/     QEMU 集成测试                docs/     全部开发文档
 ```
@@ -416,8 +425,11 @@ fs/fat.rs（FAT12/16/32 只读）──▶ fs/vfs.rs + 挂载表 ──▶ open/
 
 完整目录树与模块职责见 [docs/project-structure.md](docs/project-structure.md)。
 
-> 目录边界规划：本仓库只保留内核 + 引导 + 构建工具，`libc/` 与 `user/*` 将迁往独立的
-> **Cerlesse Userland** 仓库（内核只提供机制），见 [docs/pure-kernel.md](docs/pure-kernel.md)。
+> 目录边界：本仓库 = 内核 + 引导 + 构建工具 + **用户态 workspace（`userland/`）**。
+> 内核只提供机制，用户态提供功能；两者唯一的接触面是构建产物
+> `build/userland/images/manifest.txt`（见 [docs/pure-kernel.md](docs/pure-kernel.md)、
+> [userland/README.md](userland/README.md)）。`userland/` 可随时用
+> `git subtree split -P userland` 搬到独立仓库，内核侧无需改动。
 
 ## 常用命令
 
@@ -442,7 +454,11 @@ make test-driver     # v0.8：断言 PCI 枚举 + 驱动挂接 + virtio-blk 扇�
 make fat-image       # v0.8：用 tools/mkfs/mkfs.py 生成 FAT32 测试盘（内容见 tests/fatroot/）
 make test-fat        # v0.8：双盘启动，断言 FAT16/32 挂到 VFS 后的读/ls/LFN/跨簇/偏移读/EROFS
 make test-network    # v0.9：virtio-net + Ethernet/ARP/IPv4/UDP（ARP 网关解析 + DHCP UDP 往返，13 项）
-make user            # v0.7/v0.9：单独构建并校验七个 Rust 用户程序（hello/shell/hello-bin/ls/cat/echo/ps → 段页对齐的 ELF；动态链接夹具由内核构建期现编）
+make userland-images # 纯内核化：构建用户态（独立 workspace）—— 7 个程序 + 3 个动态链接对象 + manifest.txt
+make image-kernel    # 纯内核化：不内嵌用户态的镜像（内核单独可构建可启动）
+make test-kernel-only # 纯内核化：断言内核在没有用户态时启动 + 自测 + 进入串口诊断空闲（7 项）
+make check-boundary  # 纯内核化：内核不得依赖用户态（6 项门禁 + --selftest 反向自检）
+make check           # 主机侧门禁：check-boundary + go-test
 make test-pkg        # H-06 P0a：CKC 包容器（.ckc）与打包/校验规则（主机侧，不启 QEMU）
 make test-all        # 全部集成测试
 make go-test         # v0.4 H-04/H-05：Go 单元测试（串口分析 + 并行编排器）

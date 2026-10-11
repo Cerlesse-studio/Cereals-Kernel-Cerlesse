@@ -105,15 +105,12 @@ boot ──→ arch(x86_64) ──→ interrupt ──→ time
 - `shared`：boot 与 kernel 共享的 `BootInfo` 等纯数据结构（`no_std`）。
 - `kernel`：`#![no_std]`，目标 `x86_64-unknown-none`，链接脚本 `kernel/link.ld`（装载 32MiB）。
 - `boot`：UEFI 引导 crate，目标 `x86_64-unknown-uefi`；与内核边界调用必须 `extern "sysv64"`（ADR-006）。
-- `libc`：最小用户态运行时（syscall 封装 + `_start` + `print!/println!` + 堆 + `args`）。
-- `user/*`：`no_std` 用户态程序，产出静态 ELF；当前可运行的有
-  `user/hello`（→ RAMFS `/init`）、`user/shell`（→ `/bin/sh`）、`user/hello-bin`（→ `/bin/hello`，外部程序）；
-  `init/ls/cat/echo/ps` 曾为占位，现已全部落地（`hello` → `/init`、`shell` → `/bin/sh`、`ls`/`cat`/`echo`/`ps` → `/bin/*`）；
-  `user/init` 本身仍未使用。
 - `tools/`（Python）与 `tools-go/`（Go）**不进 Cargo workspace**，各自独立管理（仅标准库）。
 - 交叉编译在 Linux 与 Windows 主机上均通过 `rustup target add` 相同目标完成（见 docs/boot.md）。
 
-用户程序专用 profile（workspace 根定义，large 代码模型与 LTO 不兼容）：
+用户态（`libc` + `user/*`）自纯内核化起是**另一个 workspace**（`userland/Cargo.toml`，
+根 `Cargo.toml` 用 `exclude = ["userland"]` 排除），其中定义用户程序专用 profile
+（large 代码模型与 LTO 不兼容）：
 
 ```toml
 [profile.user-release]
@@ -132,21 +129,22 @@ panic = "abort"
 - `shared`：boot 与 kernel 共享的 `BootInfo` 等纯数据结构（no_std）。
 - `kernel`：`#![no_std]`，目标 `x86_64-unknown-none`，链接脚本 `kernel/link.ld`（32MiB）。
 - `boot`：UEFI 引导 crate，目标 `x86_64-unknown-uefi`；与内核边界调用必须 `extern "sysv64"`（ADR-006）。
-- `libc`：最小用户态运行时（syscall 封装 + `_start` + `print!/println!`，v0.6 起加入 workspace）。
-- `user/*`：`no_std` 用户态程序，产出静态 ELF（v0.6 起加入 workspace）；
-  当前 `user/hello`（→ RAMFS `/init`）、`user/shell`（→ `/bin/sh`）、`user/hello-bin`（→ `/bin/hello`）
-  与 `user/{ls,cat,echo,ps}`（→ `/bin/*`，v0.9 第五步）均为可运行的真实程序；
-  `user/init` 仍是占位（内核实际跑的 `/init` 是 `user/hello` 的构建产物）。
-- `user/dynhello/`：**不是 Rust crate**，而是 v0.9 动态链接的汇编夹具（`dynhello.s`/`libgreet.s`/`ldso.s`）；
-  由 `kernel/build.rs` 用 binutils（`as`+`ld`）在构建期现编并内嵌为 RAMFS `/bin/dynhello` 与 `/lib/*`
+- `userland/libc`：最小用户态运行时（syscall 封装 + `_start` + `print!/println!` + 堆 + `args`），
+  属于用户态 workspace（根 `Cargo.toml` 的 `exclude`）。
+- `userland/user/*`：`no_std` 用户态程序，产出静态 ELF；`hello`（→ RAMFS `/init`）、
+  `shell`（→ `/bin/sh`）、`hello-bin`（→ `/bin/hello`，外部程序）、`ls`/`cat`/`echo`/`ps`（→ `/bin/*`）
+  均已落地；`user/init` 仍是占位（内核实际跑的 `/init` 是 `user/hello` 的产物）。
+- `userland/user/dynhello/`：**不是 Rust crate**，而是动态链接的汇编夹具（`dynhello.s`/`libgreet.s`/`ldso.s`）；
+  由 `userland/Makefile` 用 binutils（`as`+`ld`）现编到 `build/userland/images/`，再由清单交给内核内嵌
   （裸目标 `x86_64-unknown-none` 不支持 `cdylib`，所以这一组工件不走 cargo）。
 - `tools/`（Python）与 `tools-go/`（Go）**不进 Cargo workspace**，各自独立管理。
 - 交叉编译在 Linux 与 Windows 主机上均通过 `rustup target add` 相同目标完成（见 docs/boot.md）。
 
-> 上述 workspace 布局是**当前（v0.9）状态**。纯内核化改造（见 5.11 与 [docs/pure-kernel.md](docs/pure-kernel.md)）
-> 完成后，本仓库的 workspace 收敛为 `members = ["shared", "boot", "abi", "kernel"]`，
-> `libc` 与 `user/*` 及其 `user-release` profile 迁往 **Cerlesse-Userland**（另有自己的 workspace 与
-> `.cargo/config.toml`），本仓库新增 `abi` crate 作为 syscall ABI 的单一事实源。
+> **纯内核化（已执行，见 5.11 与 [docs/pure-kernel.md](docs/pure-kernel.md)）**：本仓库的 workspace
+> 已收敛为 `members = ["shared", "boot", "kernel"]`（`abi` 待阶段三加入）；`libc` 与 `user/*`
+> 连同 `user-release` profile、`.cargo/config.toml`（`code-model=large`）已迁入 `userland/` 独立
+> workspace，内核通过 `build/userland/images/manifest.txt` 按清单内嵌。
+> 因此 `cargo build -p kernel` **在没有 `userland/` 时也能成功**，启动后进入串口诊断模式。
 
 ---
 
@@ -418,7 +416,16 @@ v0.9 记录的两条踩坑（设计记录，非编号缺陷）：debug 构建下
 
 ### 5.11 纯内核化改造（v0.9 之后，规划；执行上在桌面路线之前）
 
-见 [docs/pure-kernel.md](docs/pure-kernel.md)（现状审计 C1–C9 + **逐文件迁移清单** + 六阶段 Cargo 配置/构建目标/验收）。
+见 [docs/pure-kernel.md](docs/pure-kernel.md)（现状审计 C1–C9 + **逐文件迁移清单** + 六阶段 Cargo 配置/构建目标/验收 + 第 8 节执行记录）。
+
+**执行状态（2026-10-11）**：阶段二 ✅（`tools/check-boundary.py`：6 项 + `--selftest`，已并入 `make test-all`）、
+阶段四 ✅（`libc/`+`user/` → `userland/` 独立 workspace；内核 `build.rs` 改写为「按 `manifest.txt` 内嵌」；
+新增 `userland-images`/`image-kernel`/`kernel-nouserland`/`test-kernel-only` 目标）、
+阶段五 🟡（Makefile 已按责任分层；`orchestrate.json` 拆分、`.ckc` 测试迁出、`git subtree split` 未做）、
+阶段一/三/六 ⬜。实测：无 `userland/` 的 checkout 里 `cargo build -p kernel` 退出码 **0**（改造前 **101**）、
+`make image` 能单独出镜像、`make test-kernel-only` **7/7** PASS；有用户态时 `make image` 内嵌
+**8 程序 + 2 库**，15 个集成场景与 `test-user`(61)/`test-shell`(11)/`test-proc`(8+4)/`test-programs`(17+5)/
+`test-dyn`(10)/`test-fs`(21) 全部 PASS。
 
 | 阶段 | 目标 | Cargo 配置 / 构建目标 | 验收抓手 |
 | ---- | ---- | ---- | ---- |
@@ -537,6 +544,7 @@ qemu-system-x86_64 -machine q35 -m 512M -serial stdio -display none \
 | 2026-10-11 | **v0.9 第一步：用户堆**（运行时前置条件）—— 新增 `kernel/src/syscall/memory.rs`（`mmap`/`munmap`/`brk`：W^X、`MAP_*`/`PROT_*` 白名单、5 参数无 offset 的取舍、逐条错误码）、`address_space.rs` 新增 brk 窗口（256 KiB）与匿名 mmap 窗口（256 KiB，first-fit，清页表项时 `invlpg`）、`libc/heap.rs`（`#[global_allocator]`，bump over mmap）与 `brk/mmap/munmap` 封装、`user/hello` 堆自测、`user.rs` 页帧泄漏检查；`make test-user` 断言 32 → **59 项**，`orchestrate.json` 的 `user` 场景同步；全量回归 PASS（`test-fs` 19 / `test-driver` 22 / `test-fat` 21 / `make go-test` / `make test-orch` 10 场景） |
 | 2026-10-11 | **v0.9 第六步（收官）：内核侧最小动态链接** —— 新增 `kernel/src/syscall/dynamic.rs`（`ET_DYN` 分流：`PT_INTERP` + `DT_NEEDED` → `/lib/<name>` 递归装载，应用 `R_X86_64_RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`64`，`DT_PLTREL=REL` 明确拒绝）；`syscall/elf.rs` 按 `e_type` 分流（`ET_EXEC` 路径不变）；`address_space.rs` 新增共享库窗口（基址 + 1 MiB、32 页）与 `map_dyn_page`/`dyn_page_count`/`phys_of`（内核 CR3 下写重定位），`fork`/`page_flags`/`Drop` 同步；新增夹具 `user/dynhello/`（`as`+`ld` 现编，`kernel/build.rs` 内嵌）与 RAMFS `/lib`（`fs::init` 新增 `libraries` 参数，程序清单 7 → 8）；新增 `make test-dyn`（**10 项**）与 `make dyn-hostcheck`（宿主机 glibc 独立复核）并加入 `test-all`；`test-fs` 20 → **21 项**、`test-programs` 条目数断言 5/7；同步 syscall.md（新增 3.9 + 3.1/3.4/3.8 修订）、architecture.md 第 5 节、roadmap/README/project-structure/api |
 | 2026-10-11 | **H-06 包管理器提案 v1 完成（设计阶段，不进内核主线）**：docs/package-manager.md 从「设想」补成可实施规格 —— 术语字段级定义、七个制品格式（`PKG.toml`/确定性 `.cpk`/`catalog.toml(+sig)`/`cpkg.toml`/receipt/journal/内容寻址 store）、内容哈希 + 三级校验（签名 → 绑定 → 落盘后逐文件）、安全模型（显式信任根、scope 域边界与路径白名单、**纯文件安装/无安装脚本**、setuid 拒绝、威胁—对策表）、事务阶段与原子性边界（文件级 + 可恢复）、效率预算（幂等零写入、文件级去重、`gc`）、CLI 与稳定退出码、MVP 三期（P0 主机侧 `tools/pkgmgr/` → P1 与镜像构建/基线对接 → P2 增量补丁等）、可脚本断言的验收条目（`make test-pkg`）；同步 docs/README.md 索引状态（设计中 → 提案 v1）与 H-06 行 |
+| 2026-10-11 | **纯内核化：阶段二/四/五（部分）执行完成** —— 新增 `tools/check-boundary.py`（内核不得调用外部命令/内嵌用户态字节/依赖用户态包，6 项 + `--selftest` 反向自检）与 `make check-boundary`，并入 `make test-all`；`libc/`(7 文件) + `user/`(33 文件) 整体移入 `userland/` 独立 workspace（自带 `Cargo.toml`/`.cargo/config.toml`/`Makefile`，产出 `build/userland/images/{manifest.txt,*.elf}`；动态链接夹具与 `dyn-hostcheck` 随之搬走）；`kernel/build.rs` 重写为「读清单 → 复制 → 生成 include 源码」（删掉约 300 行嵌套 cargo/as/ld，**内核不再需要 binutils**），`syscall/user.rs` 的 10 处 `include_bytes!` 收敛为一次 `include!` + 清单契约校验 + 空清单诊断分支，`fs::selftest` 的根目录条目数改为「`4 + /init 是否存在`」推导；根 `Cargo.toml` 收敛为 `shared/boot/kernel` + `exclude userland`；新增 `userland-images`/`image-kernel`/`kernel-nouserland`/`test-kernel-only`。实测：无 `userland/` 的 checkout 里 `cargo build -p kernel` 退出码 **0**（改造前 **101**）、`make image` + `make test-kernel-only` 7/7 PASS（验收标准 1/2/7 成立）；全新 checkout `make image` 正确内嵌 8 程序 + 2 库；15 个编排场景与全部用户态测试 PASS；执行中发现并修掉「`image` 可能先编内核再出用户态镜像」的顺序缺陷 |
 | 2026-10-11 | **新增「纯内核化改造规划」（v0.9 之后，规划）**：新建 docs/pure-kernel.md —— 现状审计 C1–C9（内核构建期嵌套 cargo 构建用户程序、10 处 `include_bytes!` 把 203,280 字节（≈199 KiB）用户态内嵌进内核映像、`fs::init` 硬编码 `/bin`/`/lib`、启动末尾跑用户态自测、ABI 两处镜像、workspace/测试责任混杂、`.cargo/config.toml` 不分家）、实测「删掉 `libc/`+`user/` 后 `cargo build -p kernel` 退出码 **101**」、逐文件迁移清单（内核 83 文件仅 9 个要改；`user/` 33 + `libc/` 7 + `tools`/`tools-go`/`tests` 逐项去向）、目标双仓库结构与 Cargo 配置前后对照、六阶段（冻结基线/边界门禁/ABI 单一来源/用户空间迁移/构建测试拆分/接口稳定）与七条验收标准对照表；本文档新增 5.11 与第 3 节注记，同步 roadmap/project-structure/docs-README/README |
 | 2026-10-11 | **新增「桌面环境兼容路线」（v1.0 之后，规划）**：新建 docs/desktop.md —— 现状审计（逐项有据：显示无/输入无 evdev/无 ioctl-poll/无设备模型与 `/proc`/无音频/无 ACPI/security 占位/fs 只读）、用户态与内核侧归属纠正（logind/D-Bus/PipeWire 是用户态；KVM 与桌面前置无关）、被遗漏的地基（设备模型/`ioctl`/`poll`/file-backed mmap/futex/信号/AF_UNIX/`/proc`+`/sys`/memfd）、D0–D5 分层与 QEMU 可断言验收（monitor `sendkey`/`screendump` 实测可用）、里程碑 v1.1–v1.6；本文档新增 5.10 与 1.3 注记，同步 roadmap/architecture/project-structure/docs-README/README |
 

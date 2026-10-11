@@ -1,16 +1,21 @@
-# user/dynhello —— v0.9 动态链接最小闭环的夹具
+# userland/user/dynhello —— v0.9 动态链接最小闭环的夹具
 
 这里不是普通的 Rust 用户程序（`user/{hello,shell,ls,…}`）。裸目标
 `x86_64-unknown-none` **不支持 `cdylib`**，而动态链接恰恰需要「共享库 + 带
 PLT/GOT 的 PIE」，所以这一组工件由 **binutils**（`as` + `ld`）在**构建期**
-现场汇编 / 链接，由 `kernel/build.rs::build_dynamic_fixtures` 产出到
-`$OUT_DIR/dyn/` 并被内核 `include_bytes!` 内嵌：
+现场汇编 / 链接：由 `userland/Makefile` 的 `dyn` 目标产出到
+`build/userland/images/`，再由 `manifest.txt` 交给内核内嵌（纯内核化之前这一步
+在 `kernel/build.rs` 里，内核因此需要 binutils）：
 
 | 源 | 产物 | 角色 |
 | ---- | ---- | ---- |
-| `dynhello.s` | `dyn/dynhello` | ET_DYN PIE：`PT_INTERP=/lib/ld.so` + `DT_NEEDED=libgreet.so` |
-| `libgreet.s` | `dyn/libgreet.so` | ET_DYN 共享库：导出 `greet` |
-| `ldso.s` | `dyn/ld.so` | `PT_INTERP` 指向的解释器占位（ET_DYN） |
+| `dynhello.s` | `images/dynhello` | ET_DYN PIE：`PT_INTERP=/lib/ld.so` + `DT_NEEDED=libgreet.so` |
+| `libgreet.s` | `images/libgreet.so` | ET_DYN 共享库：导出 `greet` |
+| `ldso.s` | `images/ld.so` | `PT_INTERP` 指向的解释器占位（ET_DYN） |
+
+结构自检由 [`tools/check_dyn_fixture.py`](../../tools/check_dyn_fixture.py) 完成
+（ET_DYN + `PT_INTERP` + `DT_NEEDED`）；`manifest.txt` 里的三行是
+`P /bin/dynhello dynhello`、`L /lib/ld.so ld.so`、`L /lib/libgreet.so libgreet.so`。
 
 启动时三个产物都作为**普通文件**落进 RAMFS：`/bin/dynhello`、`/lib/libgreet.so`、
 `/lib/ld.so`。内核从 VFS 按 `PT_INTERP` / `DT_NEEDED` 里的**名字**读它们 ——
@@ -45,7 +50,7 @@ user: exit code=42
 user: dynamic link PASS (PT_INTERP + libgreet.so + RELATIVE/JUMP_SLOT)
 ```
 
-## 边界（刻意，见 docs/architecture.md 第 5 节）
+## 边界（刻意，见 [docs/architecture.md](../../../docs/architecture.md) 第 5 节）
 
 「完整 ELF 动态链接」是**非目标**。本版实现的是最小闭环：
 
@@ -57,7 +62,7 @@ user: dynamic link PASS (PT_INTERP + libgreet.so + RELATIVE/JUMP_SLOT)
 
 ## 独立复核：用宿主机的 glibc ld.so 跑同一份夹具
 
-`make dyn-hostcheck` 会把**同一批 `.s`** 用宿主机真实的动态链接器
+`make -C userland dyn-hostcheck`（内核仓库的 `make dyn-hostcheck` 是它的转发）会把**同一批 `.s`** 用宿主机真实的动态链接器
 （`/lib64/ld-linux-x86-64.so.2`）重新汇编 / 链接并在 Linux 上执行。
 两个完全不同实现的装载器（内核 vs glibc）都要把它跑出相同的两行输出与
 `exit(42)`，才说明 ELF 结构 / 机器码 / 重定位语义是对的 —— 与
@@ -66,7 +71,7 @@ user: dynamic link PASS (PT_INTERP + libgreet.so + RELATIVE/JUMP_SLOT)
 ## 手动构建
 
 ```bash
-# 内核构建会自动做这一步；这里只用于单独调试
+# `make -C userland dyn` 会自动做这一步；这里只用于单独调试（在 userland/ 下执行）
 as -o /tmp/dynhello.o user/dynhello/dynhello.s
 as -o /tmp/libgreet.o user/dynhello/libgreet.s
 as -o /tmp/ldso.o     user/dynhello/ldso.s
@@ -75,5 +80,6 @@ ld -shared -o /tmp/ld.so /tmp/ldso.o
 ld -pie --dynamic-linker=/lib/ld.so -L/tmp -lgreet -o /tmp/dynhello /tmp/dynhello.o
 ```
 
-> 构建内核因此需要 **binutils**（`as`/`ld`）在 `PATH` 上；`ld` 也可以用
-> `rust-lld -flavor gnu` 代替。`make dyn-hostcheck` 会明确提示缺失的工具。
+> **用户态**构建因此需要 **binutils**（`as`/`ld`）在 `PATH` 上；`ld` 也可以用
+> `rust-lld -flavor gnu` 代替。`make -C userland dyn` 会明确提示缺失的工具；
+> **内核**构建不再需要 binutils。

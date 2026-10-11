@@ -1,0 +1,18 @@
+# Cerlesse Userland 的目标配置（只作用于用户态；见 docs/pure-kernel.md 阶段四）
+#
+# 为什么需要这一份：v0.9 之前用户程序与内核共用仓库根的 `.cargo/config.toml`，
+# 而两者的需求**并不相同** ——
+#
+#   1. `relocation-model=static`：`x86_64-unknown-none` 默认 PIE，会产生
+#      `.rela.dyn` 重定位段；用户程序固定链接在 2^39（`user.ld`）、内核装载时
+#      不做重定位（`kernel/src/syscall/elf.rs` 会拒绝带 SHF_ALLOC 的重定位段）。
+#   2. `code-model=large`：链接地址 2^39 超出 small 模型 ±2GiB 的绝对寻址范围，
+#      不加就在链接期报 `R_X86_64_32S out of range`。内核装载在 32MiB，**不需要**
+#      这一条，所以它只写在这里，不再影响内核构建。
+#
+# `target-dir` 落在仓库根的 `build/`（已 gitignore），不污染 `userland/`。
+[target.x86_64-unknown-none]
+rustflags = ["-C", "relocation-model=static", "-C", "code-model=large"]
+
+[build]
+target-dir = "../build/userland-target"

@@ -1,0 +1,37 @@
+# Cerlesse Userland —— 独立 workspace（内核仓库不引用这里的任何包）
+#
+# 见 docs/pure-kernel.md（阶段四）。与内核的**唯一接触面**是编译产物：
+# `../build/userland/images/`（程序 ELF + `manifest.txt`），由 `make images` 产出，
+# 内核构建脚本按清单把它们内嵌进内核映像；没有它内核一样能构建（进入串口诊断模式）。
+#
+# 注意：本文件是**另一个 workspace 的根**。仓库根 `Cargo.toml` 用
+# `exclude = ["userland"]` 把它排除在外，两边各自 `cargo` 解析、各自 `target-dir`
+# （见 `.cargo/config.toml` 与 `Makefile`）。
+[workspace]
+resolver = "2"
+members = [
+    "libc",
+    "user/hello",
+    "user/shell",
+    "user/hello-bin",
+    "user/ls",
+    "user/cat",
+    "user/echo",
+    "user/ps",
+]
+
+# 用户程序专用 profile：相对 dev 有两处必须调整
+#   - `lto = false`：large 代码模型（用户程序链接在 2^39）与 LTO 不兼容
+#     （实测 rust-lld 报 "failed to load bitcode of module core-*.o"）；
+#   - `panic = "abort"`（dev 默认 unwind）+ 关掉 debug-assertions/overflow-checks：
+#     用户程序越小越好（映像窗口 16 页 = 64 KiB，见 kernel/src/syscall/address_space.rs）。
+# 这也是它必须定义在**本 workspace 根**的原因：profile 只能由 workspace 根定义。
+[profile.user-release]
+inherits = "dev"
+opt-level = 2
+lto = false
+debug = false
+debug-assertions = false
+overflow-checks = false
+strip = true
+panic = "abort"

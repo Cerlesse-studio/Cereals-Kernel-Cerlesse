@@ -245,10 +245,17 @@ pub fn selftest() -> Result<(), &'static str> {
         serial::print(" perms=");
         serial::println(entry.meta.perms());
     }
-    // 根目录条目数：`init` + `bin` + `lib` + `etc` + `tmp`（v0.9 动态链接加上了 `/lib`）。
-    // 这是精确断言而不是「至少有几个」：新增/潦掉的根条目必须同步改这里与
-    // `make test-fs` 的期望，否则「文件树悄悄变了」不会被发现。
-    if entries.len() != 5 {
+    // 根目录条目数：内核自己建立的是 `bin` / `lib` / `etc` / `tmp` 四个目录（[`init`]），
+    // 再加上**用户态提供的** `/init`（有用户态镜像时才有）。
+    //
+    // 期望值是**推导出来的**而不是写死 5：内核不依赖用户态存在 —— 纯内核启动时
+    // 根目录就是 4 项（`make test-kernel-only`），嵌了用户态镜像才是 5 项。
+    // 但它仍然是精确断言：多出/少掉根条目会被抓到（"文件树悄悄变了"）。
+    let expected_root_entries = 4 + usize::from(vfs::stat("/init").is_ok());
+    if entries.len() != expected_root_entries {
+        serial::print("fs: root entries expected=");
+        serial::print_dec(expected_root_entries as u64);
+        serial::println("");
         return Err("fs: root directory entry count mismatch");
     }
 

@@ -119,7 +119,7 @@ qemu ... -no-reboot -d int,cpu_reset   # 崩溃/triple fault 时转储中断与 
 5. **注释解释「为什么」**：关键取舍、踩坑原因、与 Linux 的差异都写在模块头与函数上（中文）。
 6. **ADR**：重大设计决策追加到 [architecture.md](./architecture.md) 第 6 节并同步 DEVELOPMENT。
 7. **链接约束**：内核固定装载 32MiB、静态非 PIE；用户程序 large 代码模型 + 段页对齐 +
-   `.lbss.*` 归入 `.bss`（见 [../libc/README.md](../libc/README.md) 第 3、4 节）。
+   `.lbss.*` 归入 `.bss`（见 [../libc/README.md](../userland/libc/README.md) 第 3、4 节）。
 8. **命名与格式**：模块用 `snake_case`、类型用 `CamelCase`；提交前跑 `cargo fmt` / `cargo clippy`
    （如本机已安装）并保持与既有风格一致。
 
@@ -168,7 +168,7 @@ qemu ... -no-reboot -d int,cpu_reset   # 崩溃/triple fault 时转储中断与 
 
 复制 `user/hello/` 改包名 → 加进根 `Cargo.toml` 的 `members` 与 `kernel/build.rs` 的
 `USER_PROGRAMS` → 在 `kernel/src/syscall/user.rs` 用 `include_bytes!` 取回并写入 RAMFS → `make user`。
-细节见 [../libc/README.md](../libc/README.md) 第 3 节。
+细节见 [../libc/README.md](../userland/libc/README.md) 第 3 节。
 
 ### 10.3 新增一个文件系统后端
 

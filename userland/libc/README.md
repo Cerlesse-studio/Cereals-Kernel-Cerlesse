@@ -1,19 +1,19 @@
 # libc（最小用户态运行时）
 
 - 版本：v0.6 建立 / **v0.7 补齐文件 syscall** / **v0.9 第一步补齐用户堆** / **v0.9 第二步补齐 `stdin`** /
-  **v0.9 第三步补齐进程调用与 `argc`/`argv`**
+  **v0.9 第三步补齐进程调用与 `argc`/`argv`** / **纯内核化：随用户态移入独立 workspace**（现位于 `userland/libc/`）
 - 状态：✅ 已实现（2026-10-11，随 `make test-user` **61 项** + `make test-shell` **11 项** + `make test-proc` **8 项 + 4 正则**断言实测通过；
   `user/hello` 作为 RAMFS 上的 `/init`、`user/shell` 作为 `/bin/sh`、`user/hello-bin` 作为 `/bin/hello`
   （**由 Shell `fork` + `execve` 起来**），三者都经 ELF Loader 装载并跑在 ring3）
-- 关联：[docs/syscall.md](../docs/syscall.md) 2.11 / 3.1 / 3.5 / 3.6 / 3.7、[user/hello](../user/hello)、
-  [user/shell](../user/shell)、[user/hello-bin](../user/hello-bin)、[docs/process.md](../docs/process.md) 1.4、
-  [docs/filesystem.md](../docs/filesystem.md) 2.6
+- 关联：[docs/syscall.md](../../docs/syscall.md) 2.11 / 3.1 / 3.5 / 3.6 / 3.7、[user/hello](../user/hello)、
+  [user/shell](../user/shell)、[user/hello-bin](../user/hello-bin)、[docs/process.md](../../docs/process.md) 1.4、
+  [docs/filesystem.md](../../docs/filesystem.md) 2.6、[userland/README.md](../README.md)（工作区与构建入口）
 
 ## 1. 这是什么
 
 `libc` 把内核 ABI 封装成用户程序可以直接调用的形状，让新用户程序**不必再手写机器码**。
-它是用户态脚手架的底座：`libc`（运行时）+ `user/*`（用户程序）+ `kernel/build.rs`
-（构建、校验 ELF 并内嵌）+ 内核 ELF Loader（`syscall/elf.rs`）。
+它是用户态脚手架的底座：`libc`（运行时）+ `user/*`（用户程序）+ `userland/Makefile`
+（构建 + `tools/check_user_elf.py` 校验 + 写 `manifest.txt`）+ 内核按清单内嵌与 ELF Loader（`syscall/elf.rs`）。
 
 | 组成 | 内容 |
 | ---- | ---- |
@@ -78,11 +78,14 @@ pub extern "C" fn main() -> i32 {
 ## 3. 新增一个用户程序
 
 1. 复制 `user/hello/`（`Cargo.toml` + `build.rs` + `user.ld` + `src/main.rs`）并改包名；
-2. 在 workspace 根 `Cargo.toml` 的 `members` 里加上 `"user/<程序名>"`；
-3. 在 `kernel/build.rs` 的 `USER_PROGRAMS` 列表里加上 `(包名, "<文件名>.elf")`，
-   并在 `kernel/src/syscall/user.rs` 用 `include_bytes!` 取它、`fs::init` 写进 RAMFS
-   （现有两个：`user-hello` → `/init`、`user-shell` → `/bin/sh`）；
-4. 单独验证脚手架：`make user` —— 编译 + 链接 + `tools/check_user_elf.py` 检查段布局。
+2. 在 `userland/Cargo.toml` 的 `members` 里加上 `"user/<程序名>"`；
+3. 在 `userland/Makefile` 的 `PROGRAMS` 里加上包名、在 recipe 里 `cp` 出 ELF，
+   并在 `manifest.txt` 里加一行 `P <RAMFS 路径> <文件名>`（内核按清单写进 RAMFS，**不认识程序名**）；
+4. 单独验证脚手架：`make -C userland images` —— 编译 + 链接 + `tools/check_user_elf.py` 检查段布局。
+
+> 注意：内核侧**不需要**改任何东西（这正是纯内核化的目的）——只要清单里的路径
+> 出现在 `kernel/src/syscall/user.rs` 的契约常量里就保持一致，否则 `selftest` 会
+> 明确报出缺哪条路径。
 
 构建参数不是可选的（改错会在链接期或 ring3 立刻炸）：
 
@@ -91,7 +94,7 @@ pub extern "C" fn main() -> i32 {
 | 目标 | `x86_64-unknown-none` | 裸机用户态，无宿主 libc |
 | 代码模型 | `-C code-model=large` | 链接地址 2^39 超出 small 模型 ±2GiB，否则 `R_X86_64_32S out of range` |
 | 重定位模型 | `-C relocation-model=static` | 内核不做加载时重定位（ELF Loader 只接受 `ET_EXEC`） |
-| profile | `user-release`（workspace 根定义） | large 模型与 LTO 不兼容，该 profile `lto = false`、`opt-level = 2` |
+| profile | `user-release`（`userland/Cargo.toml` 定义） | large 模型与 LTO 不兼容，该 profile `lto = false`、`opt-level = 2` |
 | 链接脚本 | `user.ld`（由各程序的 `build.rs` 传入） | 固定链接到 `USER_VIRT_BASE`，每个段 `ALIGN(0x1000)` |
 
 ## 4. 四条硬约束（都有实测理由）
@@ -134,7 +137,7 @@ let mut v: Vec<u32> = Vec::new();        // 全局分配器在 heap.rs，走 mma
 v.push(1);
 ```
 
-内核侧语义（完整版见 [docs/syscall.md](../docs/syscall.md) 3.5）：
+内核侧语义（完整版见 [docs/syscall.md](../../docs/syscall.md) 3.5）：
 
 | 调用 | 语义 | 失败 |
 | ---- | ---- | ---- |
@@ -179,7 +182,7 @@ loop {
 ## 7. 进程调用与命令行参数（v0.9 第三步）
 
 三个包装的后端是真正的进程对象（独立地址空间 + 独立内核栈 + 停在 `syscall` 里的完整
-寄存器帧），内核侧实现见 [docs/process.md](../docs/process.md) 1.4：
+寄存器帧），内核侧实现见 [docs/process.md](../../docs/process.md) 1.4：
 
 | 调用 | 返回 | 说明 |
 | ---- | ---- | ---- |

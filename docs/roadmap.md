@@ -93,9 +93,9 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
    `RELATIVE`/`JUMP_SLOT`，见 syscall.md 3.9）于 2026-10-11 落地 —— v0.9 至此收官。
 8. **第八阶段（v1.0）**：整合、安全机制、发布。
 9. **第九阶段（v1.0 之后，规划）**：桌面环境兼容 —— 内核侧地基与接口对齐（D0–D5），见 [desktop.md](desktop.md)。
-10. **第十阶段（v0.9 之后，规划；执行上排在第九阶段之前）**：纯内核化边界收敛 —— 内核只提供机制，
-    Shell / init / libc / coreutils / 包管理器迁往独立 **Cerlesse Userland**（六阶段：冻结基线 → 边界门禁 →
-    ABI 单一来源 → 用户空间迁移 → 构建/测试拆分 → 接口稳定），见 [pure-kernel.md](pure-kernel.md)。
+10. **第十阶段（v0.9 之后，进行中；执行上排在第九阶段之前）**：纯内核化边界收敛 —— 内核只提供机制，
+    用户态已拆到独立 workspace `userland/`（阶段二/四 ✅、阶段五 🟡；阶段一/三/六 未做），
+    见 [pure-kernel.md](pure-kernel.md)（含第 8 节执行记录）。
 
 ## 5. 修订记录
 
@@ -120,5 +120,6 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 | 2026-10-11 | **v0.8 收官**（FAT 磁盘后端 + H-03 `mkfs`）：`fs/fat.rs`（FAT12/16/32 只读：BPB 按簇数定类型、固定根目录区/簇链目录、8.3 + NT 标志 + LFN 校验和、任意偏移读、`EROFS`/`EUCLEAN`）挂到 VFS（`fs::mount_disks` → `/disk` 启动盘、`/mnt/fat` 测试盘，验证最长前缀路由）；`FileSystem` trait 改为 `&mut self` + `read_all -> Vec<u8>`；`tools/mkfs/mkfs.py` 自己生成 FAT12/16/32 镜像并由 mtools 独立复核；新增 `make fat-image` / `make test-fat`（21 项，双盘）与编排第 10 个场景；v0.8 里程碑标记 ✅ |
 | 2026-10-11 | **v0.9 第五步：基础用户程序（`ls`/`cat`/`echo`/`ps`）与目录/进程枚举** —— 新增 `syscall/dir.rs`（`getdents`：VFS `list()` → 定长 88 字节记录；号 78 沿用 Linux 但格式不同）与 `syscall/process.rs::sys_getprocs`（定长 40 字节记录；号 **256**，`syscall_table.rs` 确立「`0..=255` Linux 语义 / `>= 256` Cerlesse 扩展」并把 `SYS_MAX` 改为 257）；`process/process.rs` 新增定长 `comm`（`create` 填充、`execve` 改写为程序名）；`libc` 新增 `getdents`/`getprocs` + `dirent_*`/`procinfo_*` 解析器；新增 `user/{ls,cat,echo,ps}`（`kernel/build.rs`、workspace、`fs::init` 清单 3 → 7），Shell 帮助文本同步；新增 `make test-programs`（17 项 + 5 正则）与编排场景 `programs`（13 → **14 场景**）；`make test-proc` 的负例由 `ls` 改 `foo` |
 | 2026-10-11 | **v0.9 第六步（收官）：内核侧最小动态链接** —— 新增 `syscall/dynamic.rs`（`ET_DYN` 分流：`PT_INTERP` + `DT_NEEDED` → `/lib/<name>` 递归装载，应用 `R_X86_64_RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`64`；`DT_PLTREL=REL` 明确拒绝）；`address_space.rs` 新增共享库窗口（基址 + 1 MiB、32 页）与 `map_dyn_page`/`phys_of`；新增夹具 `user/dynhello/`（`as`+`ld` 现编）与 RAMFS `/lib`（清单 7 → 8）；新增 `make test-dyn`（10 项）与 `make dyn-hostcheck`（宿主机 glibc 独立复核）；`test-fs` 20 → 21、`test-programs` 条目数 5/7；v0.9 里程碑标记 ✅（见 syscall.md 3.9） |
+| 2026-10-11 | **纯内核化执行（阶段二/四/五部分）**：`libc/`+`user/` 迁入 `userland/` 独立 workspace，内核构建改为「按 `manifest.txt` 内嵌」（无用户态也能构建 + 启动到串口诊断模式），新增 `tools/check-boundary.py` 边界门禁与 `image-kernel`/`test-kernel-only`/`userland-images` 目标；第十阶段由「规划」改为「进行中」，详见 pure-kernel.md 第 8 节 |
 | 2026-10-11 | **新增「纯内核化改造规划」（v0.9 之后，规划）**：新建 docs/pure-kernel.md —— 现状审计 C1–C9（内核构建期嵌套 cargo 构建用户程序、10 处 `include_bytes!` 把 203,280 字节（≈199 KiB）用户态内嵌进内核映像、`fs::init` 硬编码 `/bin`/`/lib`、启动末尾跑用户态自测、ABI 两处镜像、workspace 与测试责任混杂），实测删掉 `libc/`+`user/` 后 `cargo build -p kernel` 退出码 **101**；逐文件迁移清单（内核 83 文件仅 9 个要改；`user/` 33 + `libc/` 7 + `tools`/`tools-go`/`tests` 逐项去向）；六阶段与七条验收标准对照；同步 docs/README、DEVELOPMENT（5.11）、project-structure（第 4 节）与 README |
 | 2026-10-11 | **新增「桌面环境兼容路线」（v1.0 之后，规划）**：新建 docs/desktop.md —— 现状审计（显示/输入/ioctl/设备模型/`/proc`/futex/音频/ACPI 等逐项有据）、用户态与内核侧归属纠正（logind/D-Bus/PipeWire 是用户态，KVM 与桌面前置无关）、被遗漏的地基清单、D0–D5 分层与 QEMU 可断言验收（monitor `sendkey`/`screendump` 实测可用）、里程碑 v1.1–v1.6；同步 roadmap（第九阶段 + 「禁止提前做」项修正）、DEVELOPMENT（5.10）、architecture 第 5 节、project-structure（规划新增目录）与 README |

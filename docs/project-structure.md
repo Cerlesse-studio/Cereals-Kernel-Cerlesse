@@ -42,32 +42,27 @@ Cerlesse/
 │   │   ├── security/            # permission/credential/capability
 │   │   └── main.rs              # 内核入口（v0.1 ✅：_start + kernel_main）
 │   ├── link.ld                  # 链接脚本：装载到 32MiB（ADR-007）
-│   ├── build.rs                 # 注入链接脚本 + 构建用户程序并校验/内嵌其 ELF（v0.7）；v0.9 追加动态链接夹具（as+ld）
+│   ├── build.rs                 # 只注入链接脚本；用户态镜像按 manifest.txt 内嵌（清单缺失 = 空清单）
 │   └── Cargo.toml
 │
-├── user/                        # 用户态程序（v0.6 起加入 workspace）
-│   ├── hello/                   # ✅ v0.6/v0.7：真实 Ring3 用户程序（libc + user.ld + build.rs）
-│   │                            #   构建产物由内核内嵌为 RAMFS 上的 /init
-│   ├── shell/                   # ✅ v0.9：交互式 Shell（提示符 root@cerlesse C:>、内建命令、
-│   │                            #    外部命令走 fork/execve/wait4），内嵌为 RAMFS 上的 /bin/sh
-│   ├── hello-bin/               # ✅ v0.9 第三步：**外部程序**（打印 pid/argc/argv 后 exit(1)），
-│   │                            #    内嵌为 RAMFS 上的 /bin/hello —— 不由内核直接运行，只被 Shell 跑起来
-│   ├── ls/                      # ✅ v0.9 第五步：/bin/ls（getdents 列举目录，带 kind/size）
-│   ├── cat/                     # ✅ v0.9 第五步：/bin/cat（open/read/write/close 打印文件）
-│   ├── echo/                    # ✅ v0.9 第五步：/bin/echo（argc/argv + 一次 write）
-│   ├── ps/                      # ✅ v0.9 第五步：/bin/ps（getprocs 打印进程表）
-│   ├── dynhello/                # ✅ v0.9 第六步：**汇编夹具**（as+ld 现编；→ /bin/dynhello + /lib/{ld.so,libgreet.so}）
-│   └── init/                    # v0.9 占位（内核实际跑的 /init 是 user/hello 的构建产物）
-│
-├── libc/                        # ✅ v0.6/v0.7：最小用户态运行时（syscall 封装 / _start / print!）
-│                                #    ✅ v0.9 第一步：heap（#[global_allocator]，bump over mmap）
-│                                #    ✅ v0.9 第二步：EAGAIN 与 read(0) 行缓冲语义
-│                                #    ✅ v0.9 第三步：args（argc/argv）与可用的 fork/execve/wait4
-│                                #    ✅ v0.9 第五步：getdents/getprocs 与 dirent_*/procinfo_* 解析器
+├── userland/                    # ✅ 纯内核化：**用户态独立 workspace**（自 2026-10-11 起，见 pure-kernel.md）
+│   ├── Cargo.toml               # workspace：libc + user/*；含 user-release profile
+│   ├── .cargo/config.toml       # code-model=large + relocation-model=static（**只对用户态**）
+│   ├── Makefile                 # images / check / dyn / dyn-hostcheck → build/userland/images/manifest.txt
+│   ├── libc/                    # ✅ 最小用户态运行时（syscall 封装 / _start / print! / heap / args）
+│   ├── tools/check_dyn_fixture.py  # ✅ 动态链接夹具结构自检（ET_DYN + PT_INTERP + DT_NEEDED）
+│   └── user/
+│       ├── hello/               # ✅ Ring3 用户程序 → RAMFS /init（libc + user.ld + build.rs）
+│       ├── shell/               # ✅ 交互式 Shell → /bin/sh（fork/execve/wait4 跑外部命令）
+│       ├── hello-bin/           # ✅ 外部程序 → /bin/hello（由 Shell fork+execve 起来）
+│       ├── ls/ cat/ echo/ ps/   # ✅ coreutils → /bin/*
+│       ├── dynhello/            # ✅ 汇编夹具（as+ld 现编）→ /bin/dynhello + /lib/{ld.so,libgreet.so}
+│       └── init/                # v0.9 占位（内核实际跑的 /init 是 user/hello 的产物）
 │
 ├── tools/                       # 主机侧工具
 │   ├── image-builder/           # Python：磁盘镜像组装
-│   ├── check_user_elf.py        # ✅ v0.7：用户程序 ELF 段布局检查（不启 QEMU）
+│   ├── check-boundary.py        # ✅ 纯内核化：内核/用户态边界门禁（6 项 + --selftest）
+│   ├── check_user_elf.py        # ✅ v0.7：用户程序 ELF 段布局检查（现由 userland/Makefile 调用）
 │   ├── mkfs/                    # ✅ v0.8：FAT12/16/32 镜像生成（mkfs.py，mtools 独立复核）
 │   └── pkgmgr/                  # ✅ H-06 P0a：CKC 包容器（ckc.py，后缀 .ckc；tar 独立复核）
 │
@@ -78,7 +73,7 @@ Cerlesse/
 │
 ├── docs/                        # 全部开发文档（见 docs/README.md）
 │
-├── Cargo.toml                   # Cargo Workspace（shared/boot/kernel/libc/user/*，含 user-release profile）
+├── Cargo.toml                   # Cargo Workspace（**只有 shared/boot/kernel**；exclude userland）
 ├── Makefile                     # 构建/QEMU/测试入口（v0.1 ✅）
 ├── DEVELOPMENT.md               # 主开发文档
 └── README.md
@@ -106,9 +101,10 @@ Cerlesse/
 | `kernel/src/ipc/` | 管道、通道、共享内存 | v0.5+ |
 | `kernel/src/network/` | 以太网 → IP → TCP/UDP → Socket | v0.9 |
 | `kernel/src/security/` | 权限、凭证、Capability | v1.0 |
-| `libc/` | 最小用户态运行时：syscall 封装（含 `open/read/close`、`brk/mmap/munmap` 与 `fork/execve/wait4`）、`_start`（入口寄存器 `argc`/`argv`）、`print!/println!`、panic handler、`heap`（`#[global_allocator]`）、`args` | v0.6 ✅ / v0.7 ✅ / v0.9 ✅ |
-| `user/` | 用户程序（`hello` ✅ v0.6/v0.7 → `/init`；`shell` ✅ v0.9 → `/bin/sh`；`hello-bin` ✅ v0.9 第三步 → `/bin/hello`（外部程序）；**`ls` / `cat` / `echo` / `ps` ✅ v0.9 第五步 → `/bin/*`**；**`dynhello/` ✅ v0.9 第六步 —— 不是 Rust crate，而是 `as`+`ld` 现编的动态链接夹具 → `/bin/dynhello` + `/lib/{ld.so,libgreet.so}`**；`init/` 仍为占位） | v0.6–v0.9 |
-| `tools/`（Python） | 镜像构建、用户程序 ELF 检查（v0.7）、`mkfs/` FAT 镜像生成（v0.8 ✅）、**`pkgmgr/ckc.py`（CKC 包容器 `.ckc`，H-06 P0a ✅）** | v0.1 起 |
+| `userland/` | **用户态独立 workspace**（不属于内核）：`libc/`（运行时）+ `user/*`（程序）+ `Makefile`（构建 + ELF 校验 + `manifest.txt`）+ `.cargo/config.toml`（large 代码模型只对用户态生效）；与内核的唯一接触面是 `build/userland/images/` | 纯内核化 ✅ |
+| `userland/libc/` | 最小用户态运行时：syscall 封装（含 `open/read/close`、`brk/mmap/munmap` 与 `fork/execve/wait4`）、`_start`（入口寄存器 `argc`/`argv`）、`print!/println!`、panic handler、`heap`（`#[global_allocator]`）、`args` | v0.6 ✅ / v0.7 ✅ / v0.9 ✅ |
+| `userland/user/` | 用户程序（`hello` ✅ v0.6/v0.7 → `/init`；`shell` ✅ v0.9 → `/bin/sh`；`hello-bin` ✅ v0.9 第三步 → `/bin/hello`（外部程序）；**`ls` / `cat` / `echo` / `ps` ✅ v0.9 第五步 → `/bin/*`**；**`dynhello/` ✅ v0.9 第六步 —— 不是 Rust crate，而是 `as`+`ld` 现编的动态链接夹具 → `/bin/dynhello` + `/lib/{ld.so,libgreet.so}`**；`init/` 仍为占位） | v0.6–v0.9 |
+| `tools/`（Python） | 镜像构建、**`check-boundary.py`（内核/用户态边界门禁，纯内核化 ✅）**、用户程序 ELF 检查（v0.7，现由 userland/Makefile 调用）、`mkfs/` FAT 镜像生成（v0.8 ✅）、**`pkgmgr/ckc.py`（CKC 包容器 `.ckc`，H-06 P0a ✅）** | v0.1 起 |
 | `tools-go/`（Go） | 测试编排、串口日志服务 | v0.4 起 |
 | `tests/` | QEMU 集成测试 | v0.1 起 |
 
@@ -127,34 +123,38 @@ Cerlesse/
 | `kernel/src/acpi/` | FADT/MADT 解析、S5、热区/电池桩 | D4 |
 | `kernel/src/ipc/{unix,eventfd,memfd}.rs` | AF_UNIX/`SO_PEERCRED`、eventfd/timerfd、memfd | D0/D4 |
 
-## 4. 纯内核化目标结构（规划，尚未执行）
+## 4. 纯内核化（已执行大部分，见 [pure-kernel.md](pure-kernel.md) 第 8 节）
 
-见 [pure-kernel.md](pure-kernel.md)：内核只保留机制，Shell / init / libc / coreutils / 包管理器
-搬往独立仓库 **Cerlesse-Userland**。
+内核只保留机制；用户态已拆成**独立 workspace** `userland/`（本轮），后续用
+`git subtree split -P userland` 可整体搬到 `Cerlesse-Userland` 仓库。
 
 ```text
-Cerlesse-Kernel-Cerlesse/            Cerlesse-Userland/（新仓库）
-├── boot/       引导器（独立组件）     ├── libc/        用户态运行时
-├── shared/     boot↔kernel 纯数据     ├── init/        第一个用户态进程（现 user/hello）
-├── abi/        【新增】syscall ABI    ├── shell/       命令解释器（现 user/shell）
-├── kernel/     内核主体               ├── coreutils/   ls / cat / echo / ps
-├── tools/      构建工具（镜像/FAT）   ├── cpm/         包管理器（现 tools/pkgmgr）
-├── tools-go/   内核场景编排/串口      ├── examples/    示例程序（现 user/hello-bin）
-├── tests/      内核场景 + fatroot     ├── tests/       用户态 ABI 测试 + dynlink 夹具
-└── docs/                              └── Makefile / Cargo.toml / .cargo
+Cerlesse-Kernel-Cerlesse/（内核）      userland/（用户态独立 workspace）
+├── boot/       引导器（独立组件）      ├── libc/        用户态运行时
+├── shared/     boot↔kernel 纯数据      ├── user/hello   → RAMFS /init
+├── kernel/     内核主体                ├── user/shell   → /bin/sh
+├── tools/      构建工具 / 边界门禁      ├── user/{ls,cat,echo,ps}  coreutils
+├── tools-go/   内核场景编排/串口        ├── user/hello-bin  → /bin/hello
+├── tests/      内核场景 + fatroot      ├── user/dynhello  动态链接夹具
+├── docs/                              └── Makefile / Cargo.toml / .cargo
+└── userland/   用户态（上面一列）
 ```
 
-现状与目标之间只差 **9 个内核文件**的改动（`kernel/Cargo.toml`、`kernel/build.rs`、
-`kernel/src/syscall/user.rs`、`kernel/src/fs/mod.rs`、`kernel/src/main.rs`、
-`kernel/src/syscall/{syscall_table,dir,process,mod}.rs`）与 `libc/` + `user/*` 的整体迁移；
-`kernel/src/{arch,memory,interrupt,time,process,scheduler,fs,driver,network,ipc,security}` 与 `boot/`、`shared/` 不变。
+唯一接触面是构建产物 `build/userland/images/manifest.txt`：内核构建脚本按它把镜像
+内嵌进内核映像，**清单不存在时内核照样构建与启动**（进入串口诊断模式，
+`make test-kernel-only`）。本轮实际只改了 3 个内核文件（`kernel/build.rs`、
+`kernel/src/syscall/user.rs`、`kernel/src/fs/mod.rs`）；`kernel/src/{arch,memory,interrupt,
+time,process,scheduler,fs,driver,network,ipc,security}`、`boot/`、`shared/` 未动。
 目标结构里 `kernel/src/` 仍沿用现有模块划分，不新增 `boot/`、`block/`、`sync/`、`lib/` 等目录（非目标）。
+`abi/`（syscall ABI 单一事实源，阶段三）与 `tests/orchestrate-kernel.json`（阶段五剩余项）
+**尚未创建**。
 
 ## 5. 修订记录
 
 | 日期 | 变更 |
 | ---- | ---- |
-| 2026-10-11 | 纯内核化规划：新增第 4 节（目标结构：内核/用户态双仓库、新增 `abi/`、8 个内核文件改动清单）；修订记录顺延为第 5 节 |
+| 2026-10-11 | 纯内核化**执行阶段二/四/五（部分）**：`libc/`(7) 与 `user/`(33) 移入 `userland/` 独立 workspace（目录树重写为本节的 userland/ 子树，含 `Cargo.toml`/`.cargo/config.toml`/`Makefile`/`tools/check_dyn_fixture.py`）；`kernel/build.rs` 改为「按 `manifest.txt` 内嵌」（不再构建用户程序）；新增 `tools/check-boundary.py`；根 `Cargo.toml` 收敛为 `shared/boot/kernel` + `exclude userland`；第 4 节由「规划」改为「已执行大部分」（实测：无 userland 的 checkout 仍能 `make image` + `make test-kernel-only`） |
+| 2026-10-11 | 纯内核化规划：新增第 4 节（目标结构：内核/用户态双仓库、新增 `abi/`、9 个内核文件改动清单）；修订记录顺延为第 5 节 |
 | 2026-10-11 | v1.0 之后规划：新增第 3 节（桌面路线预计新开的模块：`dev`/`procfs`/`sysfs`/`input`/`display`/`sound`/`acpi`/`ipc` 扩展 —— 均未创建，进入里程碑时回填） |
 | 2026-10-11 | v0.9 第六步（最小动态链接）：`kernel/src/syscall/dynamic.rs` 与 `address_space.rs` 的共享库窗口（基址 + 1 MiB、32 页）落地，`elf.rs` 按 `e_type` 分流；新增汇编夹具 `user/dynhello/`（`as`+`ld` 现编）与 RAMFS `/lib`，`kernel/build.rs` 的程序清单 7 → 8 —— 目录树、模块表与 `user/` 描述同步 |
 | 2026-10-11 | v0.9 第五步（基础用户程序）：`kernel/src/syscall/dir.rs`（`getdents`）与 `process.rs::sys_getprocs` 落地；`user/{ls,cat,echo,ps}` 从占位变为实现（RAMFS `/bin/*`），`kernel/build.rs` 的程序清单 3 → 7；`libc/` 新增 `getdents`/`getprocs` 与 `dirent_*`/`procinfo_*` 解析器 —— 目录树、模块表与 `libc/` 描述同步 |

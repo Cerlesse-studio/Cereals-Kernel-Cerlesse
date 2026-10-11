@@ -2,8 +2,9 @@
 
 - 阶段：第一阶段 / 边界规划（v0.9 之后、桌面路线之前执行）
 - 最后更新：2026-10-11
-- 状态：📋 规划（尚未开工）——本文档是**逐文件迁移清单**与**六阶段验收规格**；
-  正文所有「现状」条目都在本仓库实测过（文件行号、命令输出、体积数字见正文）
+- 状态：🟡 执行中（2026-10-11）——**阶段二 ✅、阶段四 ✅、阶段五 🟡**；阶段一（基线 tag）、
+  阶段三（`abi` 单一来源）、阶段六 未做。执行记录与实测证据见第 8 节；
+  本文档同时是**逐文件迁移清单**与**六阶段验收规格**
 
 > 本文档顶部保留 阶段 / 最后更新 / 状态 字段，与项目文档维护约定对齐（见 [README.md](README.md)）。
 > 关联：[architecture.md](architecture.md)（第 5 节非目标）、[project-structure.md](project-structure.md)（目录与职责）、
@@ -48,6 +49,10 @@ Shell · init · libc ·            系统调用 ABI · 进程/线程 · 调度 
 | 多数内核测试不依赖用户程序 | `make test-memory` / `test-scheduler` / `test-ipc` / `test-driver` / `test-fat` / `test-network` 的断言只看内核自身行为（`test-network` 无网卡时跳过）；**例外**：`make test-fs` 断言 `fs: create /init`、`fs: ls / entries=5`、`/bin`、`/lib` 的落盘，因此依赖 C3（阶段四必须改写，见第 6 节风险表） |
 
 ### 1.2 违反边界的耦合（C1–C9，全部可复现）
+
+**执行状态（2026-10-11）**：C1 ✅ · C2 ✅ · C3 ✅ · C4 ✅ · C5 ✅ · C6 ⬜ 待办（阶段三）·
+C7 🟡 部分 · C8 ✅ · C9 🟡 部分。下面每一条描述的是**改造前**的实测事实（保留为对照），
+证据与命令见第 8 节。
 
 **C1 内核构建期用嵌套 cargo 构建用户程序 —— 内核离不开用户态源码。**
 `kernel/build.rs` 的 `USER_PROGRAMS`（7 个 Rust 用户程序）与 `build_dynamic_fixtures()`（3 个 as/ld 夹具）
@@ -110,8 +115,11 @@ EXIT=101
 - 边界违反集中在 **4 处代码**（C1–C4）、**2 处配置**（C5、C8）、**1 处 ABI 事实源**（C6）、**1 处测试划分**（C7）。
 - 内核的**能力主体**（syscall / 进程 / 调度 / 内存 / VFS / FAT / 驱动 / 网络）已经是内核服务，**不需要搬动**；
   要搬的是 `libc/` + `user/*`（用户态产品功能）及其构建、测试、校验链路。
-- 因此这是**边界收敛**，不是重写：`kernel/` 下 83 个文件中只有 **9 个需要改动**（见 3.1），
+- 因此这是**边界收敛**，不是重写：`kernel/` 下 83 个文件中规划只有 **9 个需要改动**（见 3.1），
   其余文件连同 `fs/fat.rs`、`network/*`、`driver/*` 一个字都不用动。
+- **实际执行下来更小**：阶段四只改了 3 个内核文件（`kernel/build.rs` 重写、
+  `kernel/src/syscall/user.rs` 改镜像来源、`kernel/src/fs/mod.rs` 修一条写死的断言），
+  加上根 `Cargo.toml` 与 `Makefile`；`kernel/src/main.rs` **不需要改**。
 
 ## 2. 目标仓库结构
 
@@ -124,14 +132,20 @@ Cerlesse-Kernel-Cerlesse/          # 本仓库（内核 + 引导 + 构建工具 
 │   ├── src/{arch,memory,interrupt,time,process,scheduler,syscall,fs,driver,network,ipc,security}（沿用现有模块划分）
 │   ├── link.ld
 │   ├── build.rs                   # 只注入 link.ld（不再构建用户程序）
-│   └── Cargo.toml                 # deps: shared, abi；feature: embed-userland
+│   └── Cargo.toml                 # deps: shared（+ abi，阶段三）
 ├── tools/                         # image-builder / mkfs / check-boundary.py【新增】
 ├── tools-go/                      # testorch / serialmon（内核场景编排 + 串口分析）
 ├── tests/                         # 内核场景（orchestrate-kernel.json + fatroot/）
+├── userland/                      # 【新增】用户态独立 workspace（阶段五后可拆到独立仓库）
 ├── docs/
 ├── Makefile
-└── Cargo.toml                     # workspace: shared, boot, abi, kernel
+└── Cargo.toml                     # workspace: shared, boot, abi, kernel + exclude userland
 ```
+
+> **执行上的一个变化**：用户态先以 `userland/` 子目录形式拆成**独立 workspace**
+> （本轮已落地，见第 8 节），而不是立刻开新仓库 —— 这样二进制拆分可验证，
+> 而 git 历史不碎；真正搬到 `Cerlesse-Userland` 仓库时用 `git subtree split -P userland`
+> 即可（阶段五剩余项）。
 
 ```text
 Cerlesse-Userland/                 # 新仓库（用户态 + 用户态测试）
@@ -155,11 +169,22 @@ Cerlesse-Userland/                 # 新仓库（用户态 + 用户态测试）
 
 列含义：**处置** = 保留 / 迁移 / 新增 / 删除；**阶段** 见第 4 节（一–六）。
 
-### 3.1 `kernel/`（83 文件；只有 9 个需要改动）
+### 3.1 `kernel/`（83 文件；规划 9 个需要改动，实际改了 3 个）
+
+**执行状态**：`kernel/build.rs` ✅（重写为「读清单 → 复制镜像 → 生成 include 源码」，
+删除约 300 行嵌套 cargo / as / ld 逻辑）、`kernel/src/syscall/user.rs` ✅（10 处 `include_bytes!`
+→ 一次 `include!` + 清单契约校验 + 空清单诊断分支）、`kernel/src/fs/mod.rs` ✅（根目录条目数
+由「`/init` 是否存在」**推导**，不再写死 5）。`kernel/src/main.rs` **未改**（空清单分支在
+`selftest()` 里，`main.rs` 无需知道）。`kernel/Cargo.toml` 与 `syscall/{syscall_table,dir,process,mod}.rs`
+属阶段三（`abi` 单一来源），**未做**。
+
+> 规划时写的 `embed-userland` **Cargo feature 没有采用**：实际用「环境变量 +
+> 清单文件」表达「内嵌/不内嵌」，好处是 `cargo build -p kernel` 本身可用（不需要记住
+> feature 组合），且清单不存在时自然退化为纯内核构建。
 
 | 文件 | 现状 | 改造 | 阶段 |
 | ---- | ---- | ---- | ---- |
-| `kernel/Cargo.toml` | deps 只有 `shared` | 增加 `abi`；新增 feature `embed-userland`（默认**关**） | 三·四 |
+| `kernel/Cargo.toml` | deps 只有 `shared` | 增加 `abi`（**未做**，阶段三） | 三 |
 | `kernel/build.rs` | 432 行：注入 `link.ld` + 构建 7 用户程序 + 3 动态夹具 + ELF 校验 | 删掉 `USER_PROGRAMS` / `build_user_program` / `build_dynamic_fixtures` / `validate_image` / `assert_alloc_free`（约 300 行），只留 `link.ld` 注入 | 四 |
 | `kernel/src/syscall/user.rs` | 10 处 `include_bytes!(env!("OUT_DIR")/…)` + 用户态运行驱动 | 程序清单改为**可注入**（空清单合法）；`#[cfg(feature = "embed-userland")]` 之外不引用任何用户态字节 | 四 |
 | `kernel/src/fs/mod.rs` | `init(programs, libraries)` 建 `/bin`、`/lib`、`/etc/motd`、`/tmp` | 空清单合法：只建 `/etc/motd` + `/tmp`；`/bin`、`/lib` 按需建立 | 四 |
@@ -260,6 +285,15 @@ Cerlesse-Userland/                 # 新仓库（用户态 + 用户态测试）
 
 每阶段给出：**目标 / 改动 / Cargo 配置 / 构建与测试目标 / 验收**。原则是**渐进迁移**，不允许一次性重写。
 
+| 阶段 | 状态 | 落地内容 |
+| ---- | ---- | ---- |
+| 一 冻结基线 | ⬜ 未做 | `make baseline` 与 `v0.9.0-baseline` tag 待补（QEMU 证据已在各 `build/serial-*.log`） |
+| 二 边界门禁 | ✅ 完成 | `tools/check-boundary.py`（6 项 + `--selftest`）、`make check-boundary`、并入 `make test-all` |
+| 三 ABI 单一来源 | ⬜ 未做 | `abi/` crate 与 `make abi-check` 待做（C6 仍未消除） |
+| 四 用户空间迁移 | ✅ 完成 | `libc/` + `user/` → `userland/`（独立 workspace）；内核侧改 3 个文件；`make image-kernel` / `make test-kernel-only` |
+| 五 构建与测试拆分 | 🟡 部分 | Makefile 分层与 `userland-images` 已落地；`tests/orchestrate.json` 未拆、`test_ckc.py` 未迁、`git subtree` 未执行 |
+| 六 接口稳定 | ⬜ 未做 | `abi` 版本号、`docs/porting.md`、`make abi-doc` 待做 |
+
 ### 阶段一：冻结当前基线
 
 | 项 | 内容 |
@@ -325,13 +359,13 @@ Cerlesse-Userland/                 # 新仓库（用户态 + 用户态测试）
 
 | # | 标准 | 现状 | 达成阶段 | 验证命令 |
 | ---- | ---- | ---- | ---- | ---- |
-| 1 | 不依赖 Shell、init、libc、包管理器即可编译内核 | ❌ 实测 `EXIT=101`（C1） | 四 | 在 `git archive` 出的内核 tarball 里 `make kernel` |
-| 2 | 内核能单独生成可启动镜像 | ❌ 依赖 C1 | 四 | `make image`（无 `libc/`、`user/`） |
+| 1 | 不依赖 Shell、init、libc、包管理器即可编译内核 | ✅ **成立**（改造前实测 `EXIT=101`，C1） | 四 | 把整个 `userland/` 目录排除出 checkout 后：`cargo build -p kernel --target x86_64-unknown-none`（实测 EXIT=0） |
+| 2 | 内核能单独生成可启动镜像 | ✅ **成立** | 四 | 同上 checkout：`make image`（提示不内嵌用户态）或显式 `make image-kernel`（实测 EXIT=0） |
 | 3 | QEMU 可验证启动、异常、内存、调度 | ✅ 已有（`test`/`test-exception`/`test-memory`/`test-scheduler`） | 一（冻结） | `make test test-exception test-memory test-scheduler` |
 | 4 | syscall ABI 有文档，用户态不依赖内核私有实现 | 🟡 文档有（`docs/syscall.md`），但常量两处镜像（C6） | 三·六 | `make abi-check` + `make abi-doc` |
-| 5 | ELF 加载、进程创建、文件访问由独立测试程序验证 | 🟡 已由 `/init`、`/bin/*` 验证，但程序内嵌在内核里（C2） | 四·五 | userland 仓库 `make test-all`（独立仓库、独立测试程序） |
-| 6 | 内核与用户态分别构建、分别测试、独立演进 | ❌ 同一 workspace（C5） | 四·五 | 两侧各自的 `make test-all`；两侧 tarball 各自可构建 |
-| 7 | 用户态缺失时内核仍能启动并进入可诊断状态 | ❌ 启动末尾直接跑用户态自测（C4） | 四 | `make test-kernel-only`（断言诊断模式串口输出） |
+| 5 | ELF 加载、进程创建、文件访问由独立测试程序验证 | 🟡→✅（程序现在由 `userland/` 自己构建，内核只按清单内嵌） | 四·五 | `make -C userland images` + `make test-user`(61) / `test-proc`(8+4 正则) / `test-programs`(17+5) / `test-dyn`(10)，均实测 PASS |
+| 6 | 内核与用户态分别构建、分别测试、独立演进 | 🟡 独立 workspace ✅；独立 **Git 仓库** ⬜ | 五 | 内核侧 `make image` / `make test-*`；用户态侧 `make -C userland images` 与 `dyn-hostcheck`（**不需要内核源码**）；`git subtree split -P userland` 待执行 |
+| 7 | 用户态缺失时内核仍能启动并进入可诊断状态 | ✅ **成立** | 四 | `make test-kernel-only`（7 项断言，实测 PASS；在无 `userland/` 的 checkout 里同一条命令也 PASS） |
 
 ## 6. 风险与回退
 
@@ -339,11 +373,13 @@ Cerlesse-Userland/                 # 新仓库（用户态 + 用户态测试）
 | ---- | ---- | ---- |
 | 迁移期 ABI 双写漂移 | 内核与 libc 对同一号/errno 理解不一致，症状是运行期怪异返回值 | **阶段三先做单一来源**，之后才允许动用户态；`make abi-check` 进 CI |
 | 构建期 ELF 校验丢失 | `user.ld` 改坏后要到 QEMU 里才发现 | 校验**两处都留**：构建期校验移到 userland CI（`check_user_elf.py`），内核 `syscall/elf.rs` 的运行期 `ELF rejected: …` 校验保持不动 |
-| `make test-fs` / `test-user` 断言写死用户程序文件 | 无用户态时断言失败（`fs: ramfs files=N`、`fs: ls / entries=5`） | 阶段四把 `test-fs` 改为**自建测试文件**（不依赖 `/init`、`/bin/sh`）；用户态相关断言随 5 个场景迁到 userland |
+| `make test-fs` / `test-user` 断言写死用户程序文件 | 无用户态时断言失败（`fs: ramfs files=N`、`fs: ls / entries=5`） | ✅ 已处理：内核 **`fs::selftest` 的根目录条目数改为推导**（`4 + /init 是否存在`）——这正是纯内核启动第一次跑时真正拦住的地方（`fs: FAIL: fs: root directory entry count mismatch`，见第 8 节）；`make test-fs`（有用户态）继续断言 5 项，纯内核路径由 `make test-kernel-only` 覆盖 |
+| **构建顺序**（执行中新发现） | `make image` 可能先编内核再出用户态镜像，于是「有用户态的完整镜像」静默变成纯内核镜像 | ✅ `image: boot userland-images` + 在 recipe 里子 make 调 `kernel`（「先出镜像 → 再编内核 → 最后组装」）；改写后在**全新 checkout** 实测：`warning: embedded userland: 8 programs + 2 libraries` |
 | 嵌套 cargo 与外层 target 锁 | 构建期互相等锁 / 复用错误 rustflag（历史上踩过 `CARGO_ENCODED_RUSTFLAGS`） | 阶段四整段删除嵌套构建，问题自然消失；userland 自己 `cargo build` |
 | `.cargo/config.toml` 拆开后用户程序丢了 `code-model=large` | 链接期 `R_X86_64_32S out of range` | 新仓库自带 `.cargo/config.toml`，并在 userland `make` 里断言 `check_user_elf.py` 通过（含基址/页对齐/W^X/无重装载重定位） |
 | git 历史与 CI 断档 | 迁移后 blame 丢失 / PR 流水线改两处 | 用 `git subtree split`（或 filter-repo）保历史；CI 按仓库各自配置，跨仓库用 `CERLESSE_USERLAND_DIR` 环境变量做集成回归 |
-| 阶段四一次改动面大 | 内核启动链被破坏 | 阶段一基线 + 阶段二门禁 + 阶段四「feature 默认关、旧路径保留在 feature 内」双轨，逐项对齐基线后再删旧路径 |
+| 阶段四一次改动面大 | 内核启动链被破坏 | ✅ 无用户态分支放在 `selftest()` 开头，两条路径共用后面的代码；改完逐项重跑：`test-all` 的 15 个场景断言全部满足（13 个来自编排日志 + `test-scheduler`/`test-network` 单跑） |
+| 内核「不认识程序名」退化 | 清单与内核期望不一致时报错难懂 | ✅ 在 `syscall/user.rs` 保留契约常量（8 程序路径 + 2 库路径），`selftest` 开头逐条校验清单，缺失时打印具体路径再报错 |
 
 ## 7. 非目标
 
@@ -354,8 +390,33 @@ Cerlesse-Userland/                 # 新仓库（用户态 + 用户态测试）
 - 不要求两侧在**没有任何对方**的情况下都能跑完整集成测试：userland 的 QEMU 测试需要内核镜像路径，这是**显式依赖**而不是边界违反。
 - 本文档不排期；顺序即依赖顺序（一 → 六），阶段三之前不要动用户态源码。
 
-## 8. 修订记录
+## 8. 执行记录（2026-10-11）
+
+本轮做了**阶段二（边界门禁）、阶段四（用户空间迁移）、阶段五的一部分**，未动阶段一/三/六。
+全部结论都有本机实测支撑（命令 + 结果）：
+
+| # | 验证 | 结果 |
+| ---- | ---- | ---- |
+| 1 | 改造前：删掉 `libc/`+`user/` 后 `cargo build -p kernel` | ❌ `EXIT=101`（`kernel/build.rs:301`）—— 这是本文档的起点 |
+| 2 | 改造后：无 `userland/` 的 checkout 里 `cargo build -p kernel --target x86_64-unknown-none` | ✅ EXIT=0 |
+| 3 | 同上 checkout：`make image`（提示不内嵌用户态）+ `make test-kernel-only` | ✅ 7/7 断言（`Kernel started!` → `fs: disk selftest PASS` → `sched: round-robin wrap PASS` → `pipe: selftest PASS` → `user: no userland images embedded; entering diagnostic idle loop` → `user: kernel-only boot PASS`） |
+| 4 | 全新 checkout（含 userland）：`make image` | ✅ `embedded userland: 8 programs + 2 libraries`（验证「先出镜像再编内核」的顺序） |
+| 5 | 用户态独立构建：`make -C userland images` | ✅ 7 个程序（每个过 `check_user_elf.py` 段布局校验）+ 3 个动态链接对象（`check_dyn_fixture.py`：ET_DYN + `PT_INTERP` + `DT_NEEDED`）+ `manifest.txt` |
+| 6 | `make -C userland dyn-hostcheck`（宿主 glibc） | ✅ `dyn-hostcheck PASS (glibc ld.so, exit=42)` |
+| 7 | 边界门禁：`make check-boundary` | ✅ 6/6 通过（改造前 5/6 违规）；`--selftest` 6/6 违规样本全部被抓到 |
+| 8 | 全量回归：15 个编排场景 + `test-user`(61) / `test-shell`(11) / `test-proc`(8+4) / `test-programs`(17+5) / `test-dyn`(10) / `test-fs`(21) / `test`/`test-memory`/`test-scheduler`/`test-network` | ✅ 全部 PASS（编排日志 13 个场景逐条核对 + `scheduler`/`network` 单跑） |
+
+**改动面**：内核侧 3 个文件（`kernel/build.rs` 重写、`kernel/src/syscall/user.rs`、`kernel/src/fs/mod.rs`）
++ 根 `Cargo.toml`/`Makefile`；`libc/`(7 文件) 与 `user/`(33 文件) 整体移入 `userland/`（git 记录为 rename，
+历史不丢）+ 新增 `userland/{Cargo.toml,.cargo/config.toml,Makefile,README.md,tools/check_dyn_fixture.py}`
+与 `tools/check-boundary.py`。
+
+**下一轮建议顺序**：阶段三（`abi/` 单一来源，消除 C6）→ 阶段五剩余（`orchestrate.json` 按责任拆、
+`test_ckc.py` 随 `cpm` 迁出、`git subtree split -P userland` 开新仓库）→ 阶段一（基线 tag）→ 阶段六。
+
+## 9. 修订记录
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-11 | **执行阶段二/四/五（部分）**：新增 `tools/check-boundary.py`（6 项边界门禁 + `--selftest` 反向自检）与 `make check-boundary`/`make check`，并入 `make test-all`；`libc/`+`user/` 移入 `userland/`（独立 workspace：自带 `Cargo.toml`/`.cargo/config.toml`/`Makefile`，产出 `build/userland/images/{manifest.txt,*.elf}`，`dyn`/`dyn-hostcheck`/`check_dyn_fixture.py` 随迁）；`kernel/build.rs` 重写为「读清单 → 复制 → 生成 `include` 源码」（删除约 300 行嵌套 cargo/as/ld，内核不再需要 binutils），`syscall/user.rs` 的 10 处 `include_bytes!` 收敛为一次 `include!` + 契约校验 + 空清单诊断分支，`fs::selftest` 根目录条目数改为推导；根 `Cargo.toml` 收敛为 `shared/boot/kernel` + `exclude userland`，新增 `userland-images`/`image-kernel`/`kernel-nouserland`/`test-kernel-only` 目标。实测：无 `userland/` 的 checkout 里 `make image`+`make test-kernel-only` 通过（验收标准 1/2/7 成立）、全新 checkout `make image` 正确内嵌 8 程序 + 2 库、15 个场景与全部用户态测试 PASS；执行中发现并修掉「`image` 可能先编内核再出镜像」的顺序缺陷 |
 | 2026-10-11 | 创建本文档：现状审计（C1–C9，含「删掉 `libc/`+`user/` 后内核构建 `EXIT=101`」与内核内含 203,280 字节（≈199 KiB）用户态的实测）、目标结构与两仓库划分、逐文件迁移清单（`kernel/` 83 文件逐项 + `user/`33 + `libc/`7 + `shared`/`boot`6 + `tools`/`tools-go`15 + `tests`/10 + 仓库根与 docs）、六阶段（冻结基线 / 边界门禁 / ABI 单一来源 / 用户空间迁移 / 构建与测试拆分 / 接口稳定）、七条验收标准对照表、风险与回退、非目标 |
