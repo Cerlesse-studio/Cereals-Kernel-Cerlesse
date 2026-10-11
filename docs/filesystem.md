@@ -8,6 +8,8 @@
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
 - 依赖：syscall.md（open/read/write/close）、memory.md（内核堆：RAMFS 的数据就在堆上）
+- 后续（规划）：磁盘/分区/卷/盘符、挂载点策略、文件系统探测与更多格式（exFAT/ext2/ext4/NTFS/ISO9660）
+  归 **CSS 存储管理**（[storage.md](./storage.md)，提案 v1）；本文只描述**当前**的 VFS/RAMFS/FAT 实现
 
 ## 1. 概述
 

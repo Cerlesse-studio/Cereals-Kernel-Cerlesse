@@ -142,6 +142,7 @@ tests/     QEMU 集成测试与编排    docs/      开发文档（每个子系�
 | [docs/filesystem.md](docs/filesystem.md) · [docs/drivers.md](docs/drivers.md) | VFS、RAMFS、FAT / 驱动框架、PCI、virtio、网络栈 |
 | [docs/roadmap.md](docs/roadmap.md) · [docs/desktop.md](docs/desktop.md) | 路线图 / v1.0 之后的桌面环境兼容路线 |
 | [docs/ckm.md](docs/ckm.md) · [docs/package-manager.md](docs/package-manager.md) | CKM（内核级权限控制与扩展管理）规划：权限模型、内核接口、扩展生命周期 / `.ckc` 包格式与事务 |
+| [docs/storage.md](docs/storage.md) | CSS（存储管理）规划：卷模型与稳定标识、Windows 式盘符 + Linux 式挂载双视图、VFS 收口、与 CKM 的权限/持久化对接 |
 
 ## 当前状态
 
@@ -158,6 +159,10 @@ Cerlesse Kernel + CKM 内核控制核心 + CKM 用户态管理服务 + 可插拔
 内核只提供强制权限与组件状态机制（CKM Core），扩展安装/事务/修复由持权的用户态服务完成，
 系统文件通过可撤销的覆盖层修改 —— 分层思路参考 KernelSU，但不照搬 Android 的 root 机制；
 第一版**不做**动态内核模块装载与图形界面。
+
+存储侧有一条并列的路线（[CSS 存储管理提案](docs/storage.md)）：**像 Windows 一样管理磁盘与卷**
+（盘符、卷标、稳定卷标识、多挂载点），**像 Linux 一样通过统一 VFS 兼容多种文件系统**
+（新格式只是再实现一个 `FileSystem`）。第一版只做 GPT/MBR **只读**扫描与卷管理，写能力按格式逐阶段开放。
 
 逐版本的实现记录、验收证据与踩坑见 [DEVELOPMENT.md](DEVELOPMENT.md) 第 5 节，路线图见 [docs/roadmap.md](docs/roadmap.md)。
 

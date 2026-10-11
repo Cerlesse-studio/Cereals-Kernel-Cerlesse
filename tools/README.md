@@ -7,7 +7,7 @@
 | `image-builder/` | 组装 boot + kernel + 文件系统磁盘镜像（64 MiB FAT，mtools） | v0.1 | ✅ |
 | `check-boundary.py` | **内核/用户态边界门禁**（内核不得调用外部命令/内嵌用户态字节/依赖用户态包），含 `--selftest` 反向自检 | 纯内核化阶段二 | ✅ |
 | `check_user_elf.py` | 用户程序 ELF 段布局检查（基址/页对齐/`W^X`/映像窗口/无重定位）——**由 `userland/Makefile` 调用**（它检查的是用户态产物） | v0.7 | ✅ |
-| `mkfs/` | 文件系统镜像生成（FAT12/16/32 空盘或预置目录树，供磁盘 FS 测试） | v0.8 | ✅ |
+| `mkfs/` | 文件系统镜像生成（FAT12/16/32 空盘或预置目录树，供磁盘 FS 测试）；**CSS-1 起追加 GPT/MBR 分区表镜像生成**（见 `docs/storage.md` 第 9 节，尚未实现） | v0.8（✅）/ CSS-1（📋） | ✅ |
 | `pkgmgr/ckc.py` | **CKC 包容器（后缀 `.ckc`）**：`pack` / `verify` / `info`（确定性 ustar + 64 字节头） | H-06 P0a | ✅ |
 | （tests/ 驱动） | QEMU 启动与串口日志断言 | v0.1 | ✅ |
 
@@ -42,6 +42,24 @@ mtype -i build/fat.img ::hello.txt
 
 镜像在 `make test-fat` 里作为第二块 virtio-blk 盘挂到 `/mnt/fat`，
 内核侧逐项断言文件名/大小/内容（跨簇、空文件、长文件名、二级子目录），见 `tests/fatroot/README.md`。
+
+### 存储夹具的独立复核（CSS 规划）
+
+CSS（[docs/storage.md](../docs/storage.md)）的验收要求「内核与宿主侧两套独立实现都认同一张盘」，
+沿用 `mkfs` + mtools 的思路。宿主侧工具现状（本仓库开发环境**实测**）：
+
+| 用途 | 可用 | 缺失 |
+| ---- | ---- | ---- |
+| FAT 文件内容 | `mtools`（`mdir`/`mtype`/`mformat`/`mlabel`） | `mkfs.fat` |
+| **MBR 分区表** | `partx -s <img>`（实测能列出 NR/START/END/SECTORS） | — |
+| **GPT 分区表** | （无）—— 实测 `partx`/`blkid` 对镜像文件**不枚举** GPT（合规主/备表头也一样），`blkid -p` 只报最外层 `PTTYPE`（GPT 镜像报 `PMBR`、DOS 镜像报 `dos`） | `sfdisk`、`fdisk`、`parted`、`sgdisk` |
+| ext2 / ext4 | `mkfs.ext2`、`mkfs.ext4`、`dumpe2fs`、`debugfs`、`e2fsck` | — |
+| exFAT | — | `mkfs.exfat` / `exfatprogs`（**因此 exFAT 目前没有独立复核手段**） |
+
+所以 CSS-1 的 **MBR** 复核以 `partx -s <img>` 为准（第三方实现，与内核解析互相印证）；
+**GPT** 在本机没有现成工具，先以「`mkfs.py` 生成 + 内核解析」两套自写实现互查（弱证据），
+装好 `gdisk`/`parted` 后补一次独立复核（见 `docs/storage.md` 开放问题 4）；
+FAT 仍以 `mtools` 为准；ext2/ext4 夹具用系统 `mkfs.ext*` 生成、用 `dumpe2fs` 复核。
 
 ## `pkgmgr/ckc.py` —— CKC 包容器（`.ckc`）
 

@@ -15,7 +15,9 @@
   同日再加 **「纯内核化改造规划」（v0.9 之后，规划；执行上在桌面路线之前）**：边界收敛 ——
   `libc/`+`user/*` 迁往独立 Cerlesse Userland，内核提供机制/用户态提供功能，见 [pure-kernel.md](pure-kernel.md)；
   同日再加 **「CKM 设计提案」（v1.0 之后，规划）**：内核级强制权限控制 + 特权用户态服务 + 可插拔扩展系统
-  + 独立恢复环境（分层借鉴 KernelSU，但不照搬 Android root 机制），见 [ckm.md](ckm.md)）
+  + 独立恢复环境（分层借鉴 KernelSU，但不照搬 Android root 机制），见 [ckm.md](ckm.md)；
+  同日再加 **「CSS 存储管理系统」（v1.0 之后，规划；与 CKM 同期）**：磁盘→分区→卷→盘符/挂载点，
+  Windows 式盘符 + Linux 式统一 VFS，见 [storage.md](storage.md)）
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
 
@@ -78,6 +80,13 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 > → CKM Manager（`ckm` CLI）→ 覆盖层 → 恢复环境；分 CKM-1…CKM-7 七期，第一版不做动态内核模块装载与 GUI，
 > 依赖关系：CKM-1 依赖 v1.0 的凭证/权限，CKM-2 依赖可写持久化；与桌面路线互不阻塞，见 [ckm.md](ckm.md)。
 >
+> **v1.0 之后（规划，与 CKM 同期）**：**CSS（Cerlesse Storage System）存储管理** ——
+> 磁盘/分区识别（GPT/MBR **只读**扫描）→ 卷与稳定标识（`vol_id`：文件系统 UUID > 分区位置 > 整盘）→
+> Windows 式盘符（`C:`/`D:`）与 Linux 式挂载（`/volumes/<label>`、`/media/<label>`）双视图 →
+> 可写文件系统（FAT → exFAT → ext2；ext4/NTFS 先只读）→ `ckm storage` 管理程序；分 CSS-1…CSS-6，
+> 第一版不写分区表、不做 RAID/LVM/加密卷/GUI，权限与持久化复用 CKM（能力位 + 判定点 + 可写区），
+> 见 [storage.md](storage.md)。
+>
 > **v1.0 之后（规划）**：桌面环境兼容路线（内核侧地基与接口对齐）——
 > D0 地基（设备模型 + `ioctl` + `poll`）→ D1 输入（evdev/uinput）→ D2 显示（fbdev → DRM/KMS）
 > → D3 音频（ALSA 子集）→ D4 会话/电源（ACPI 子集 + cgroup）→ D5 收尾；
@@ -110,11 +119,15 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 11. **第十一阶段（v1.0 之后，规划）**：CKM 内核级权限控制与扩展管理 —— CKM Core（内核）/
     CKM Service（`ckmd`）/ CKM Manager（`ckm`）/ 覆盖层 / 恢复环境，分 CKM-1…CKM-7；
     第一版不做动态内核模块装载与 GUI，见 [ckm.md](ckm.md)。
+12. **第十二阶段（v1.0 之后，规划；与第十一阶段同期）**：CSS 存储管理 —— 分区扫描 / 卷与稳定标识 /
+    盘符与多挂载点 / 可写文件系统 / `ckm storage` 界面，分 CSS-1…CSS-6；第一版不写分区表，
+    见 [storage.md](storage.md)。
 
 ## 5. 修订记录
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-11 | **新增「CSS 存储管理系统规划」（v1.0 之后）** —— 新建 [storage.md](storage.md)：卷模型（设备→分区→卷→盘符/挂载点 + 稳定 `vol_id`）、Windows 式盘符与 Linux 式挂载双视图、VFS 收口与挂载表带卷身份、与 CKM 的接口（能力位 / 判定点 / 号段 261–266）、文件系统支持路线、CSS-1…CSS-6 分期与 11 条验收；本文件标第十二阶段并补 v1.0 之后规划段 |
 | 2026-10-06 | 第一阶段初稿：10 个里程碑 + 25 步依赖顺序 |
 | 2026-10-06 | v0.1 完成，里程碑表标记 ✅ |
 | 2026-10-06 | v0.2 完成（GDT/IDT/异常 + B-01/B-05 修复），里程碑表标记 ✅ |
