@@ -2,7 +2,7 @@
 
 - 阶段：第一阶段 / 文档中心
 - 最后更新：2026-10-11
-- 状态：🟡 持续更新（2026-10-11 同步 v0.9 第六步（**内核侧最小动态链接**：`PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`）实现记录；同日已同步第五步基础用户程序、第四步简化网络栈、第三步进程对象、第二步交互式 Shell、第一步用户堆、v0.8 收官与 H-06 包管理器 `.ckc` 提案 P0a；同日新增 **desktop.md**（v1.0 之后的桌面环境兼容路线，规划））
+- 状态：🟡 持续更新（2026-10-11 同步 v0.9 第六步（**内核侧最小动态链接**：`PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`）实现记录；同日已同步第五步基础用户程序、第四步简化网络栈、第三步进程对象、第二步交互式 Shell、第一步用户堆、v0.8 收官与 H-06 包管理器 `.ckc` 提案 P0a；同日新增 **desktop.md**（v1.0 之后的桌面环境兼容路线，规划）；同日新增 **pure-kernel.md**（纯内核化改造规划：现状审计 + 逐文件迁移清单 + 六阶段 Cargo/构建/验收规格））
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
 
@@ -28,6 +28,7 @@
 | [syscall.md](./syscall.md) | 阶段：系统调用 / 用户空间 / ELF | 🟡 v0.7 核心已完成（`syscall`/`sysret` 入口 + ring3 隔离 + `read/write/open/close`+ `write/exit/getpid/sleep` + **ELF Loader** 从 RAMFS `/init` 按段权限装载），v0.9 已落地六步：**用户堆**（3.5）、**`stdin` + 交互式 Shell**（3.6）、**`fork`/`execve`/`wait4` + `argc`/`argv`**（3.7，外部程序 `/bin/hello` 真的能跑）、**基础用户程序 + `getdents`/`getprocs`**（3.8，`/bin/{ls,cat,echo,ps}`）、**内核侧最小动态链接**（3.9，`ET_DYN` + `PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`，`/bin/dynhello` + `/lib/*`）；`make test-user` 61 项 / `make test-shell` 11 项 / `make test-proc` 8 项 + 4 正则 / `make test-programs` 17 项 + 5 正则 / `make test-dyn` 10 项 PASS；仍未做：`mprotect`/环境变量/**完整**动态链接（见 3.4/3.9） |
 | [filesystem.md](./filesystem.md) | 阶段：VFS / RAMFS / 磁盘文件系统 | ✅ v0.7 + **v0.8 磁盘后端**已完成（VFS trait + 挂载表最长前缀路由 + RAMFS + fd 表；**FAT12/16/32 只读后端** + `tools/mkfs/mkfs.py`，`make test-fs` 21 项 / `make test-fat` 21 项 PASS） |
 | [desktop.md](./desktop.md) | **桌面环境兼容路线（v1.0 之后，规划）**：现状审计、用户态/内核侧归属、D0–D5 分层里程碑与 QEMU 验收 | 📋 规划（2026-10-11 新增） |
+| [pure-kernel.md](./pure-kernel.md) | **纯内核化改造规划（v0.9 之后，规划）**：现状审计（C1–C9，含实测证据）、逐文件迁移清单、内核/用户态双仓库划分、六阶段（Cargo 配置 / 构建目标 / 验收）、七条验收标准对照、非目标 | 📋 规划（2026-10-11 新增） |
 
 ## 阶段说明
 
@@ -54,8 +55,19 @@
   **完整**动态链接（用户态 `ld.so`）与 `mprotect` 等仍归后续（见 architecture.md 第 5 节）。
 - **第九阶段（v1.0 之后）**📋：**桌面环境兼容**（内核侧地基与接口对齐，D0 地基 → D1 输入 →
   D2 显示 → D3 音频 → D4 会话/电源 → D5 收尾）—— 规划见 [desktop.md](./desktop.md)，未开工。
+- **第十阶段（v0.9 之后，规划；执行上排在第九阶段之前）**📋：**纯内核化边界收敛** ——
+  内核只提供底层机制，Shell / init / libc / coreutils / 包管理器迁往独立的 **Cerlesse Userland** 项目；
+  六阶段（冻结基线 → 边界门禁 → ABI 单一来源 → 用户空间迁移 → 构建/测试拆分 → 接口稳定），
+  规划见 [pure-kernel.md](./pure-kernel.md)，未开工。
 - **后续**：每进入一个新阶段就编写/修订对应的主题文档；阶段内已落地部分也要及时补记当前状态（例如 v0.4 中断控制器）。
 - 本套文档**会在开发过程中被反复修改**——修改前请在对应文档顶部记录修订日期与变更点。
+-  本次（2026-10-11，第十三轮）修订重点：**新增纯内核化改造规划** —— 新建 `pure-kernel.md`
+  （现状审计 C1–C9：内核构建期嵌套 cargo 构建用户程序、10 处 `include_bytes!` 把 203,280 字节（≈199 KiB）用户态内嵌进内核映像、
+  `fs::init` 硬编码 `/bin`/`/lib`、启动末尾跑用户态自测；**逐文件迁移清单**（`kernel/` 83 个文件里只有 9 个要改，
+  `user/` 33 + `libc/` 7 + `tools`/`tools-go`/`tests` 各文件逐项去向）；**六阶段**：冻结基线 / 边界门禁 /
+  ABI 单一来源（新增 `abi/`）/ 用户空间迁移（feature `embed-userland`） / 构建与测试拆分 / 接口稳定；
+  七条「纯内核化」验收标准对照表；实测证据：删掉 `libc/`+`user/` 后 `cargo build -p kernel` 退出码 **101**）。
+  同步 roadmap.md（第十阶段）、DEVELOPMENT.md（5.11）、project-structure.md（第 4 节目标结构）与 README.md。
 -  本次（2026-10-11，第十二轮）修订重点：**新增桌面环境兼容路线（规划）** —— 新建 `desktop.md`
   （现状审计 + 用户态/内核侧归属纠正 + D0–D5 分层 + v1.1–v1.6 里程碑）；同步 architecture.md 第 5 节、
   roadmap.md（第九阶段 + 「禁止提前做」项修正）、DEVELOPMENT.md（5.10）、project-structure.md（规划新增目录）

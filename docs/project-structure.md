@@ -127,10 +127,34 @@ Cerlesse/
 | `kernel/src/acpi/` | FADT/MADT 解析、S5、热区/电池桩 | D4 |
 | `kernel/src/ipc/{unix,eventfd,memfd}.rs` | AF_UNIX/`SO_PEERCRED`、eventfd/timerfd、memfd | D0/D4 |
 
-## 4. 修订记录
+## 4. 纯内核化目标结构（规划，尚未执行）
+
+见 [pure-kernel.md](pure-kernel.md)：内核只保留机制，Shell / init / libc / coreutils / 包管理器
+搬往独立仓库 **Cerlesse-Userland**。
+
+```text
+Cerlesse-Kernel-Cerlesse/            Cerlesse-Userland/（新仓库）
+├── boot/       引导器（独立组件）     ├── libc/        用户态运行时
+├── shared/     boot↔kernel 纯数据     ├── init/        第一个用户态进程（现 user/hello）
+├── abi/        【新增】syscall ABI    ├── shell/       命令解释器（现 user/shell）
+├── kernel/     内核主体               ├── coreutils/   ls / cat / echo / ps
+├── tools/      构建工具（镜像/FAT）   ├── cpm/         包管理器（现 tools/pkgmgr）
+├── tools-go/   内核场景编排/串口      ├── examples/    示例程序（现 user/hello-bin）
+├── tests/      内核场景 + fatroot     ├── tests/       用户态 ABI 测试 + dynlink 夹具
+└── docs/                              └── Makefile / Cargo.toml / .cargo
+```
+
+现状与目标之间只差 **9 个内核文件**的改动（`kernel/Cargo.toml`、`kernel/build.rs`、
+`kernel/src/syscall/user.rs`、`kernel/src/fs/mod.rs`、`kernel/src/main.rs`、
+`kernel/src/syscall/{syscall_table,dir,process,mod}.rs`）与 `libc/` + `user/*` 的整体迁移；
+`kernel/src/{arch,memory,interrupt,time,process,scheduler,fs,driver,network,ipc,security}` 与 `boot/`、`shared/` 不变。
+目标结构里 `kernel/src/` 仍沿用现有模块划分，不新增 `boot/`、`block/`、`sync/`、`lib/` 等目录（非目标）。
+
+## 5. 修订记录
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-11 | 纯内核化规划：新增第 4 节（目标结构：内核/用户态双仓库、新增 `abi/`、8 个内核文件改动清单）；修订记录顺延为第 5 节 |
 | 2026-10-11 | v1.0 之后规划：新增第 3 节（桌面路线预计新开的模块：`dev`/`procfs`/`sysfs`/`input`/`display`/`sound`/`acpi`/`ipc` 扩展 —— 均未创建，进入里程碑时回填） |
 | 2026-10-11 | v0.9 第六步（最小动态链接）：`kernel/src/syscall/dynamic.rs` 与 `address_space.rs` 的共享库窗口（基址 + 1 MiB、32 页）落地，`elf.rs` 按 `e_type` 分流；新增汇编夹具 `user/dynhello/`（`as`+`ld` 现编）与 RAMFS `/lib`，`kernel/build.rs` 的程序清单 7 → 8 —— 目录树、模块表与 `user/` 描述同步 |
 | 2026-10-11 | v0.9 第五步（基础用户程序）：`kernel/src/syscall/dir.rs`（`getdents`）与 `process.rs::sys_getprocs` 落地；`user/{ls,cat,echo,ps}` 从占位变为实现（RAMFS `/bin/*`），`kernel/build.rs` 的程序清单 3 → 7；`libc/` 新增 `getdents`/`getprocs` 与 `dirent_*`/`procinfo_*` 解析器 —— 目录树、模块表与 `libc/` 描述同步 |
