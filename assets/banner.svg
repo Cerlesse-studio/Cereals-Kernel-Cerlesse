@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" width="1920" height="1080" role="img" aria-labelledby="bannerTitle bannerDesc">
+  <title id="bannerTitle">Cerlesse OS — an x86_64 kernel written from scratch in Rust</title>
+  <desc id="bannerDesc">Dark cover: project name, one-line positioning, three short labels and the layer pipeline from boot to network.</desc>
+
+  <defs>
+    <radialGradient id="glow" cx="0.5" cy="0.34" r="0.62">
+      <stop offset="0" stop-color="#C8A96A" stop-opacity="0.16"/>
+      <stop offset="0.55" stop-color="#C8A96A" stop-opacity="0.04"/>
+      <stop offset="1" stop-color="#C8A96A" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="rule" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#C8A96A" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#C8A96A" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#C8A96A" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="floor" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#050505" stop-opacity="1"/>
+      <stop offset="1" stop-color="#0B0A08" stop-opacity="1"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1920" height="1080" fill="#050505"/>
+  <rect width="1920" height="1080" fill="url(#floor)"/>
+  <rect width="1920" height="1080" fill="url(#glow)"/>
+
+  <!-- thin frame, magazine-cover restraint -->
+  <rect x="64" y="64" width="1792" height="952" fill="none" stroke="#ffffff" stroke-opacity="0.06" stroke-width="1.5"/>
+
+  <g font-family="Helvetica Neue, Helvetica, Arial, system-ui, sans-serif" text-anchor="middle">
+    <text x="960" y="304" font-size="34" letter-spacing="10" fill="#C8A96A">X86_64 &#183; UEFI &#183; QEMU</text>
+
+    <text x="960" y="486" font-size="128" font-weight="600" letter-spacing="6" fill="#F5F3EF">CERLESSE OS</text>
+
+    <text x="960" y="576" font-size="46" fill="#9C9A95">A monolithic kernel written from scratch in Rust</text>
+
+    <line x1="640" y1="650" x2="1280" y2="650" stroke="url(#rule)" stroke-width="2"/>
+
+    <text x="960" y="744" font-size="38" fill="#EDEAE3" letter-spacing="2">no_std &#160;&#183;&#160; ring3 isolation &#160;&#183;&#160; fork &#183; execve &#183; wait4</text>
+
+    <text x="960" y="932" font-size="28" fill="#6E6C68" letter-spacing="1">boot &#8594; memory &#8594; interrupts &#8594; processes &#8594; syscalls &#8594; VFS &#8594; drivers &#8594; shell &#8594; network</text>
+  </g>
+</svg>
