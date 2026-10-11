@@ -1,12 +1,13 @@
 # Cerlesse OS — 构建入口（v0.1 实现）
 # 详见 DEVELOPMENT.md 第 5、7 节。
 #
-# v0.6 起用户程序（user/*，见 libc/）由 kernel/build.rs 在内核构建时自动重建，
-# 因此 image/test-* 都不需要额外的先后顺序；`make user` 只用于单独验证脚手架。
-#
-# v0.7：用户程序不再被摊平，而是以 **ELF 原样内嵌**（`$OUT_DIR/user_hello.elf`），
-# 启动时写进 RAMFS 的 `/init`，由内核 ELF Loader 装载 —— 所以 `make user` 会跑
-# tools/check_user_elf.py 校验段布局（基址/页对齐/W^X/映像窗口/无重定位）。
+# 纯内核化（见 docs/pure-kernel.md 阶段四）：本 Makefile 只管**内核侧**
+#   - 引导/内核构建、镜像组装、QEMU 测试；
+#   - 「内核不依赖用户态」由 image-kernel / test-kernel-only 与 `make check-boundary`
+#     （tools/check-boundary.py）保证。
+# 用户态是**独立 workspace**：`make userland-images` 转发到 `make -C userland images`，
+# 产物是 $(USERLAND_IMAGES)/manifest.txt —— 内核构建脚本按它内嵌；清单不存在时
+# 内核照样构建与启动（进入串口诊断模式）。
 
 CARGO ?= cargo
 QEMU  ?= qemu-system-x86_64
@@ -20,24 +21,13 @@ OVMF_VARS ?= /usr/share/OVMF/OVMF_VARS.fd
 BOOT_EFI := target/x86_64-unknown-uefi/debug/boot.efi
 KERNEL_ELF := target/x86_64-unknown-none/debug/kernel
 
-# v0.6 用户程序：链接在 2^39（USER_VIRT_BASE），small 代码模型会产生
-# R_X86_64_32S 重定位而链接失败，必须用 large 代码模型；large 模型与 LTO
-# 不兼容，所以用 workspace 的 user-release profile（lto = false）。
-# 这三个取值与 kernel/build.rs 的 USER_* 常量成对维护，改一处要同步另一处。
-USER_RUSTFLAGS := -C relocation-model=static -C code-model=large
-USER_PROFILE   := user-release
-USER_ELF       := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-hello
-# v0.9：第二个用户程序 —— 交互式 Shell（RAMFS 上落在 /bin/sh，见 kernel/build.rs）。
-USER_SHELL_ELF := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-shell
-# v0.9 第三步：外部程序（RAMFS 上落在 /bin/hello，由 Shell fork+execve 起来）。
-USER_HELLO_BIN_ELF := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-hello-bin
-# v0.9 第五步：基础用户程序（RAMFS 上落在 /bin/{ls,cat,echo,ps}，同样由 Shell 起来）。
-USER_LS_ELF   := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-ls
-USER_CAT_ELF  := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-cat
-USER_ECHO_ELF := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-echo
-USER_PS_ELF   := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-ps
+# 用户态（独立 workspace）：本 Makefile 不碰它的 rustflags / profile ——
+# large 代码模型、user-release profile、user.ld 都在 userland/ 里管，
+# 两边各自一个 `.cargo/config.toml`（见 userland/.cargo/config.toml）。
+USERLAND        := userland
+USERLAND_IMAGES := $(BUILD)/userland/images
 
-.PHONY: help build boot kernel image image-exception image-pagefault fat-image run test test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn dyn-hostcheck test-scheduler test-ipc test-fs test-user test-driver test-fat test-network test-all user test-pkg go-test test-orch clean
+.PHONY: help build boot kernel kernel-nouserland image image-kernel image-exception image-pagefault fat-image run test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn dyn-hostcheck test-scheduler test-ipc test-fs test-user test-driver test-fat test-network test-all user userland-images test-pkg go-test test-orch check-boundary check clean
 
 help:
 	@echo "targets:"
@@ -52,7 +42,7 @@ help:
 	@echo "  test-proc - v0.9: fork/execve/wait4 through the shell: external program + argv + missing program + reap"
 	@echo "  test-programs - v0.9: run /bin/{ls,cat,echo,ps} from the shell (getdents + getprocs + file syscalls)"
 	@echo "  test-dyn - v0.9: dynamic linking loop (PT_INTERP + libgreet.so + RELATIVE/JUMP_SLOT)"
-	@echo "  dyn-hostcheck - v0.9: cross-check the same dynamic fixture with the host glibc ld.so (binutils)"
+	@echo "  dyn-hostcheck - v0.9: forwards to `make -C userland dyn-hostcheck` (host glibc ld.so cross-check)"
 	@echo "  test-scheduler - v0.5: assert >=3 kernel tasks rotate under PIT time slices"
 	@echo "  test-ipc - v0.5: assert pipe create/write/read summary logs + selftest"
 	@echo "  test-fs - v0.7: assert VFS mount routing + RAMFS read/write/ls + negative errno cases"
@@ -61,7 +51,12 @@ help:
 	@echo "  fat-image - v0.8: build the FAT test volume (tools/mkfs/mkfs.py from tests/fatroot/data)"
 	@echo "  test-fat - v0.8: assert FAT16/32 on disk mounted in VFS: read/ls/LFN/multi-cluster/EROFS"
 	@echo "  test-network - v0.9: assert virtio-net + Ethernet/ARP/IPv4/UDP (ARP gateway + DHCP UDP round-trip)"
-	@echo "  user   - v0.7/v0.9: build+validate the user-space scaffold alone (libc + user/hello + user/shell + user/hello-bin)"
+	@echo "  userland-images - build the userland (independent workspace): programs + dyn fixtures + manifest"
+	@echo "  user   - alias of userland-images"
+	@echo "  image-kernel - kernel-only disk image (no userland images embedded)"
+	@echo "  test-kernel-only - pure-kernel acceptance: boot + self-tests + diagnostic idle loop without userland"
+	@echo "  check-boundary - assert the kernel does not depend on userland (tools/check-boundary.py)"
+	@echo "  check   - host-side gate: check-boundary + go-test"
 	@echo "  test-pkg - H-06: assert the .ckc package container (CKC) format + packaging rules (host-side)"
 	@echo "  test-all - run every integration test"
 
@@ -77,11 +72,27 @@ boot:
 kernel:
 	$(CARGO) build -p kernel --target x86_64-unknown-none
 
-image: boot kernel
+# 完整镜像。**顺序很重要**：内核构建脚本按 manifest.txt 内嵌用户态镜像，
+# 所以必须是「先出镜像 → 再编内核 → 最后组装」；在内核之前就编好的话，
+# 内核会（在污染后的缓存里）以「无用户态」的状态被构建出来。
+# 内核对用户态的依赖仅此一步，而且是**构建输入文件**而非源码。
+image: boot userland-images
+	@$(MAKE) --no-print-directory kernel
 	$(PYTHON) tools/image-builder/build_image.py \
 		--boot $(BOOT_EFI) \
 		--kernel $(KERNEL_ELF) \
 		--out $(BUILD)/disk.img
+
+# 纯内核镜像：显式置空 CERLESSE_USERLAND_DIR → 内核构建脚本生成空清单，
+# 于是内核必须在「没有用户态」的前提下自己构建出来。
+kernel-nouserland:
+	CERLESSE_USERLAND_DIR= $(CARGO) build -p kernel --target x86_64-unknown-none
+
+image-kernel: boot kernel-nouserland
+	$(PYTHON) tools/image-builder/build_image.py \
+		--boot $(BOOT_EFI) \
+		--kernel $(KERNEL_ELF) \
+		--out $(BUILD)/disk-kernel.img
 
 run: image
 	cp $(OVMF_VARS) $(BUILD)/OVMF_VARS.fd
@@ -91,6 +102,20 @@ run: image
 		-drive if=none,id=blk0,format=raw,file=$(BUILD)/disk.img \
 		-device virtio-blk-pci,drive=blk0,disable-modern=on \
 		-serial stdio -display none -no-reboot
+
+# 纯内核验收（docs/pure-kernel.md 验收标准 1/2/7）：没有任何用户态镜像时，
+# 内核照样启动，跑完文件系统/驱动/调度/IPC 自测，然后进入可诊断的空闲状态。
+test-kernel-only: image-kernel
+	$(PYTHON) tests/test_boot.py \
+		--disk $(BUILD)/disk-kernel.img \
+		--serial-log $(BUILD)/serial-kernel-only.log \
+		--expect "Kernel started!" \
+		--expect "fs: mount point=/ fs=ramfs" \
+		--expect "fs: disk selftest PASS" \
+		--expect "sched: round-robin wrap PASS" \
+		--expect "pipe: selftest PASS" \
+		--expect "user: no userland images embedded; entering diagnostic idle loop" \
+		--expect "user: kernel-only boot PASS"
 
 test: image
 	$(PYTHON) tests/test_boot.py
@@ -136,7 +161,9 @@ test-pagefault: image-pagefault
 		--expect "CR2=0x500000000000" \
 		--expect "KERNEL PANIC: unhandled exception"
 
-test-all: test test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn test-scheduler test-ipc test-fs test-user test-driver test-fat test-network
+# 全量回归：先跑主机侧边界门禁（内核不得依赖用户态），再跑全部 QEMU 场景 ——
+# 包含 test-kernel-only（没有用户态镜像时内核照样启动 + 进入可诊断状态）。
+test-all: check-boundary test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn test-scheduler test-ipc test-fs test-user test-driver test-fat test-network
 
 # v0.5 验收：≥3 个内核任务在 PIT 时间片驱动下轮转（Round Robin）
 test-scheduler: image
@@ -572,39 +599,24 @@ test-dyn: image
 		--expect "user: exit code=42" \
 		--expect "user: dynamic link PASS"
 
-# v0.9 动态链接的**独立复核**（不是自己验自己）：用宿主机的 glibc ld.so
-# 跑同一份 `user/dynhello/*.s` —— 如果两个完全不同的装载器（内核 vs glibc）
-# 都能把它跑出相同输出与退出码，说明 ELF 结构 / 机器码 / 重定位语义都是对的。
-# 需要 binutils 与 Linux/glibc；环境不满足时**跳过**（不把“没工具”当失败）。
+# v0.9 动态链接的**独立复核**（不是自己验自己）已随夹具搬到用户态 workspace：
+# 同一份 `userland/user/dynhello/*.s` 交给宿主机 glibc 的 ld.so 重新链接并执行。
+# 目标名保留（旧文档/习惯仍然有效）；内核仓库本身不再需要 binutils。
 dyn-hostcheck:
-	@command -v as >/dev/null 2>&1 && command -v ld >/dev/null 2>&1 || { echo "dyn-hostcheck SKIP (binutils not found)"; exit 0; }
-	@LD_SO=$$(ls /lib64/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2 2>/dev/null | head -1); \
-	test -n "$$LD_SO" || { echo "dyn-hostcheck SKIP (no glibc ld.so)"; exit 0; }; \
-	echo "dyn-hostcheck: host ld.so = $$LD_SO"; \
-	mkdir -p $(BUILD)/dynhost && \
-	as -o $(BUILD)/dynhost/libgreet.o user/dynhello/libgreet.s && \
-	ld -shared -soname libgreet.so -o $(BUILD)/dynhost/libgreet.so $(BUILD)/dynhost/libgreet.o && \
-	as -o $(BUILD)/dynhost/dynhello.o user/dynhello/dynhello.s && \
-	ld -pie --dynamic-linker=$$LD_SO -L$(BUILD)/dynhost -lgreet -o $(BUILD)/dynhost/dynhello $(BUILD)/dynhost/dynhello.o && \
-	LD_LIBRARY_PATH=$(BUILD)/dynhost $(BUILD)/dynhost/dynhello > $(BUILD)/dynhost/out.txt; \
-	status=$$?; cat $(BUILD)/dynhost/out.txt; \
-	grep -q "main: dynamic link ok" $(BUILD)/dynhost/out.txt && \
-	grep -q "greet: hello from libgreet.so" $(BUILD)/dynhost/out.txt && \
-	test $$status -eq 42 && echo "dyn-hostcheck PASS (glibc ld.so, exit=42)" || { echo "dyn-hostcheck FAIL (status=$$status)"; exit 1; }
+	$(MAKE) -C $(USERLAND) dyn-hostcheck
 
-# v0.7 用户态脚手架：单独构建 libc + user/*（内核构建时会自动重建同一批程序，
-# 这个目标用于在不启动 QEMU 的情况下验证脚手架可编译、可链接、**段布局合法**）。
-user:
-	RUSTFLAGS="$(USER_RUSTFLAGS)" $(CARGO) build -p user-hello -p user-shell -p user-hello-bin \
-		-p user-ls -p user-cat -p user-echo -p user-ps \
-		--target x86_64-unknown-none --profile $(USER_PROFILE) --target-dir $(BUILD)/user
-	@$(PYTHON) tools/check_user_elf.py $(USER_ELF)
-	@$(PYTHON) tools/check_user_elf.py $(USER_SHELL_ELF)
-	@$(PYTHON) tools/check_user_elf.py $(USER_HELLO_BIN_ELF)
-	@$(PYTHON) tools/check_user_elf.py $(USER_LS_ELF)
-	@$(PYTHON) tools/check_user_elf.py $(USER_CAT_ELF)
-	@$(PYTHON) tools/check_user_elf.py $(USER_ECHO_ELF)
-	@$(PYTHON) tools/check_user_elf.py $(USER_PS_ELF)
+# 用户态（独立 workspace，见 userland/）：构建程序 + 动态链接夹具，产出
+# $(USERLAND_IMAGES)/manifest.txt。**不需要内核源码**，也不启动 QEMU；
+# 段布局校验（tools/check_user_elf.py）在那边对每个程序跑。
+userland-images:
+	@if [ -d $(USERLAND) ]; then \
+		$(MAKE) -C $(USERLAND) images; \
+	else \
+		echo "userland-images: 没有 $(USERLAND)/ 目录（纯内核 checkout）—— 跳过（镜像将不含用户态）"; \
+	fi
+
+# 兼容 v0.9 的旧名字（当时 `make user` 在内核 workspace 里构建用户程序）。
+user: userland-images
 
 # H-06 P0a 验收：CKC 包容器（后缀 `.ckc`）。**主机侧、不启 QEMU、纯标准库**：
 #
@@ -617,6 +629,14 @@ user:
 #   - 独立复核：系统 `tar` 读同一段 payload，条目与内容必须与 ckc.py 一致（不是自己验自己）。
 test-pkg:
 	$(PYTHON) tests/test_ckc.py
+
+# 边界门禁（docs/pure-kernel.md 阶段二）：内核不得依赖用户态 ——
+# 不得嵌套调用 cargo/as/ld、不得内嵌用户态字节、不得依赖用户态包。
+check-boundary:
+	$(PYTHON) tools/check-boundary.py
+	$(PYTHON) tools/check-boundary.py --selftest
+
+check: check-boundary go-test
 
 # v0.4 H-04/H-05 主机侧：Go 单元测试（串口分析 + 并行编排器）
 go-test:

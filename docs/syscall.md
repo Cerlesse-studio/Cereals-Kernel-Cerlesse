@@ -241,7 +241,7 @@ v0.7 又加了「段页对齐」与「映像窗口」，见 3.1）：
 高于 `RUSTFLAGS`，所以 `kernel/build.rs` 调用嵌套 cargo 时必须显式移除它，
 否则会用内核的 rustflags 去编用户程序（直接报 `R_X86_64_32S out of range`）。
 
-用法（新程序的完整约定见 [libc/README.md](../libc/README.md)）：
+用法（新程序的完整约定见 [libc/README.md](../userland/libc/README.md)）：
 
 ```rust
 #![no_std]

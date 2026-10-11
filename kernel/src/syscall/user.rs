@@ -1,14 +1,14 @@
-//! 内嵌用户程序与用户态运行驱动（v0.6 建立，v0.7 改为「从 VFS 读 ELF 装载」，
-//! v0.9 第三步改为「每个程序是一个进程对象」）
+//! 用户态运行驱动（v0.6 建立，v0.7 改为「从 VFS 读 ELF 装载」，
+//! v0.9 第三步改为「每个程序是一个进程对象」，纯内核化后镜像来源改为**构建期清单**）
 //!
-//! 加载链（v0.7 起从未改变，v0.9 只在上面挂进程对象）：
+//! 加载链（v0.7 起从未改变，只是镜像的来源变了）：
 //!
 //! ```text
-//! include_bytes!(user_*.elf)              内核映像里内嵌的用户程序 ELF
-//!        │  fs::init（main.rs 调用）
+//! userland/ 构建产物 → manifest.txt → kernel/build.rs 生成 PROGRAM_IMAGES/LIBRARY_IMAGES
+//!        │  fs::init（main.rs 调用）       ← 空清单也合法（纯内核启动）
 //!        ▼
-//! RAMFS /init、/bin/sh、/bin/hello        ← VFS 上的文件
-//!        │  vfs::read_all(path)            ← 走挂载表路由 + 文件读
+//! RAMFS /init、/bin/sh、/lib/*              ← VFS 上的普通文件
+//!        │  vfs::read_all(path)           ← 走挂载表路由 + 文件读
 //!        ▼
 //! elf::load → UserSpace（按段权限逐页映射）
 //!        │  process::create → 进程表登记（独立地址空间 + 独立内核栈 + 用户帧）
@@ -19,19 +19,22 @@
 //!        └─ v0.9：fork / execve / wait4（`/bin/hello` 是被它跑起来的外部程序）
 //! ```
 //!
-//! 四个被运行的程序覆盖四条验收路径：
+//! [`selftest`] 覆盖的验收路径（路径常量在本模块，**程序实现属于 `userland/`**）：
 //!
-//! - `/init`（`user/hello`，Rust + `libc`）：写串口、读 `/etc/motd`、写
-//!   `/tmp/hello.txt`（内核随后读回并打印）、用户堆自测、`exit(42)`；
+//! - [`INIT_PATH`]：写串口、读 `/etc/motd`、写 `/tmp/hello.txt`（内核随后读回并打印）、
+//!   用户堆自测、`exit(42)`；
 //! - `probe`：**隔离探针** —— 位置无关的手写机器码（`global_asm!`），
-//!   直接读内核映像地址（0x200_0000），必须被 ring3 #PF 拦下；
-//! - `/bin/sh`（`user/shell`）：**交互式 Shell** —— 命令从键盘行缓冲（`read(0)`）来，
+//!   直接读内核映像地址（0x200_0000），必须被 ring3 #PF 拦下（不经 RAMFS，不依赖用户态）；
+//! - [`SHELL_PATH`]：**交互式 Shell** —— 命令从键盘行缓冲（`read(0)`）来，
 //!   内建命令 + **外部程序**（走 `fork`/`execve`/`wait4`）；
-//! - `/bin/hello`（`user/hello-bin`）：**外部程序** —— 由 Shell `fork` +
-//!   `execve` 起来，打印自己的 PID 与 `argv`，证明「新进程 + 参数传递」真的发生了；
-//! - `/bin/{ls,cat,echo,ps}`（`user/*`）：v0.9 第五步的**基础用户程序** —— 它们各自
-//!   只需要一条内核能力（`ls` → `getdents`，`ps` → `getprocs`，`cat` → 文件 syscall，
-//!   `echo` → `write`），因此同时是「用户态能不能真的用上 VFS/进程表」的验收。
+//! - [`HELLO_BIN_PATH`]：**外部程序** —— 由 Shell `fork` + `execve` 起来，
+//!   打印自己的 PID 与 `argv`，证明「新进程 + 参数传递」真的发生了；
+//! - [`LS_PATH`] / [`CAT_PATH`] / [`ECHO_PATH`] / [`PS_PATH`]：**基础用户程序** —— 各自
+//!   只需要一条内核能力（`getdents` / 文件 syscall / `write` / `getprocs`），
+//!   因此同时是「用户态能不能真的用上 VFS/进程表」的验收。
+//!
+//! 这些常量是**内核与用户态之间的契约**：非空清单必须提供这些路径（否则 selftest
+//! 报 `ENOENT`）；空清单则走「纯内核诊断」分支，内核不依赖用户态存在。
 
 use core::arch::global_asm;
 use core::ptr::addr_of;
@@ -45,33 +48,18 @@ use crate::process::process::{self, NO_PROCESS};
 use crate::syscall::address_space::{UserSpace, USER_STACK_TOP};
 use crate::syscall::trampoline::{self, RunCtx, UserFrame, NO_PROCESS as NO_PROCESS_U64};
 
-/// 内嵌的 `/init`：`user/hello` 的 ELF，由 `kernel/build.rs` 构建并写入
-/// `$OUT_DIR/user_hello.elf`（**不再摊平** —— 解析与映射是 `UserSpace::load_elf` 的事）。
-static USER_INIT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_hello.elf"));
-
-/// 内嵌的 `/bin/sh`：`user/shell` 的 ELF（v0.9 交互式 Shell）。
-static USER_SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_shell.elf"));
-
-/// 内嵌的 `/bin/hello`：`user/hello-bin` 的 ELF（v0.9 第三步的**外部程序**）。
-static USER_HELLO_BIN_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_hello_bin.elf"));
-
-/// 内嵌的 `/bin/ls`：`user/ls` 的 ELF（v0.9 第五步的基础用户程序，下同）。
-static USER_LS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_ls.elf"));
-/// 内嵌的 `/bin/cat`：`user/cat` 的 ELF。
-static USER_CAT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_cat.elf"));
-/// 内嵌的 `/bin/echo`：`user/echo` 的 ELF。
-static USER_ECHO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_echo.elf"));
-/// 内嵌的 `/bin/ps`：`user/ps` 的 ELF。
-static USER_PS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_ps.elf"));
-
-// ---- v0.9 动态链接夹具（由 `kernel/build.rs` 用 as/ld 产出，见 user/dynhello/） ----
-
-/// `/bin/dynhello`：ET_DYN PIE，`PT_INTERP=/lib/ld.so` + `DT_NEEDED=libgreet.so`。
-static USER_DYNHELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn/dynhello"));
-/// `/lib/libgreet.so`：共享库，导出 `greet`（`DT_NEEDED` 的落点）。
-static USER_LIBGREET_SO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn/libgreet.so"));
-/// `/lib/ld.so`：`PT_INTERP` 指向的解释器占位对象。
-static USER_LDSO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn/ld.so"));
+// ---- 用户态镜像清单（内核与用户态的**唯一**接触面）----
+//
+// `kernel/build.rs` 按 `build/userland/images/manifest.txt`（由 `make userland-images`
+// 在 `userland/` 里产出）把镜像字节复制进 `$OUT_DIR/userland/`，并生成下面两个静态切片：
+//
+//     PROGRAM_IMAGES: &[(&str, &[u8])]   写进 RAMFS 的可运行程序（`/init`、`/bin/*`）
+//     LIBRARY_IMAGES: &[(&str, &[u8])]   被装载的对象（`/lib/ld.so`、`/lib/libgreet.so`）
+//
+// **空清单是合法的**：没有用户态时内核照样构建、启动，然后进入串口诊断模式
+// （见 [`selftest`]）—— 这是 docs/pure-kernel.md 的验收标准 1/2/7。
+// 内核源码里没有任何一条具体程序名或字节：全部来自清单。
+include!(concat!(env!("OUT_DIR"), "/userland_images.rs"));
 
 /// 用户程序在 RAMFS 上的路径。
 pub const INIT_PATH: &str = "/init";
@@ -100,28 +88,6 @@ pub const LDSO_PATH: &str = "/lib/ld.so";
 /// 共享库路径（`DT_NEEDED=libgreet.so` → `/lib/libgreet.so`）。
 pub const LIBGREET_PATH: &str = "/lib/libgreet.so";
 
-/// `fs::init` 写进 RAMFS 的用户程序清单（路径 → ELF 字节）。
-static PROGRAM_IMAGES: [(&str, &[u8]); 8] = [
-    (INIT_PATH, USER_INIT_ELF),
-    (SHELL_PATH, USER_SHELL_ELF),
-    (HELLO_BIN_PATH, USER_HELLO_BIN_ELF),
-    (LS_PATH, USER_LS_ELF),
-    (CAT_PATH, USER_CAT_ELF),
-    (ECHO_PATH, USER_ECHO_ELF),
-    (PS_PATH, USER_PS_ELF),
-    (DYNHELLO_PATH, USER_DYNHELLO_ELF),
-];
-
-/// `fs::init` 写进 RAMFS 的 `/lib` 清单（解释器 + 共享库）。
-///
-/// 与 [`PROGRAM_IMAGES`] 分开：它们不是「被直接运行的程序」，而是**被装载的对象**
-/// —— 内核按 `PT_INTERP`/`DT_NEEDED` 里的路径名去 VFS 找它们，与真实系统
-/// 「解释器与 .so 就是文件系统里的普通文件」一致。
-static LIBRARY_IMAGES: [(&str, &[u8]); 2] = [
-    (LDSO_PATH, USER_LDSO_ELF),
-    (LIBGREET_PATH, USER_LIBGREET_SO),
-];
-
 global_asm!(
     ".align 16",
     // ---- probe：越权读取内核映像（0x200_0000）→ 应被 #PF 拦截 ----
@@ -147,16 +113,44 @@ extern "C" {
 ///
 /// 这是**验收用的镜像变量**：进程自己的退出码在进程表里（`Process::exit_code`），
 /// 这里只是把「刚刚结束的那个进程」的结果留给 `selftest` 的断言读。
+/// 非空清单必须提供的路径（内核 ↔ 用户态的**契约**，见模块文档）。
+///
+/// 缺任何一条都说明用户态构建侧与内核期望不一致 —— 在这里一次性报出来，
+/// 而不是等到某条 `run_from_vfs` 给出一个难懂的 ENOENT。
+const REQUIRED_PROGRAM_PATHS: [&str; 8] = [
+    INIT_PATH, SHELL_PATH, HELLO_BIN_PATH, LS_PATH, CAT_PATH, ECHO_PATH, PS_PATH, DYNHELLO_PATH,
+];
+const REQUIRED_LIBRARY_PATHS: [&str; 2] = [LDSO_PATH, LIBGREET_PATH];
+
 static mut EXIT_CODE: i64 = -1;
 
-/// 要写进 RAMFS 的用户程序清单（见 [`PROGRAM_IMAGES`]）。
+/// 校验清单覆盖了契约里的每条路径（[`selftest`] 的前置条件）。
+fn check_manifest_contract() -> Result<(), &'static str> {
+    for want in REQUIRED_PROGRAM_PATHS {
+        if !program_images().iter().any(|(path, _)| *path == want) {
+            serial::print("user: manifest missing program ");
+            serial::println(want);
+            return Err("userland manifest is missing a required program path");
+        }
+    }
+    for want in REQUIRED_LIBRARY_PATHS {
+        if !library_images().iter().any(|(path, _)| *path == want) {
+            serial::print("user: manifest missing library ");
+            serial::println(want);
+            return Err("userland manifest is missing a required library path");
+        }
+    }
+    Ok(())
+}
+
+/// 要写进 RAMFS 的用户程序清单（由构建期清单生成，见 [`PROGRAM_IMAGES`]）。
 pub fn program_images() -> &'static [(&'static str, &'static [u8])] {
-    &PROGRAM_IMAGES
+    PROGRAM_IMAGES
 }
 
 /// 要写进 RAMFS `/lib` 的解释器与共享库清单（见 [`LIBRARY_IMAGES`]）。
 pub fn library_images() -> &'static [(&'static str, &'static [u8])] {
-    &LIBRARY_IMAGES
+    LIBRARY_IMAGES
 }
 
 /// 记录退出码（由 `syscall::process::sys_exit` / 异常终止路径调用）。
@@ -314,6 +308,16 @@ fn verify_user_file() -> Result<(), &'static str> {
 /// 在 `wait4` 里回收 —— 帧分配器的 `free_frames` 必须回到运行前的值，否则说明
 /// 「某个进程的地址空间没有被归还」。
 pub fn selftest() -> Result<(), &'static str> {
+    // 纯内核路径：本次构建没有内嵌用户态镜像（清单为空）——
+    // 内核**从不**依赖用户态才能启动。这里给出可断言的诊断行后正常返回，
+    // 由 `kernel_main` 进入 `hlt` 空闲循环（`make test-kernel-only` 断言这条轨迹）。
+    if program_images().is_empty() {
+        serial::println("user: no userland images embedded; entering diagnostic idle loop");
+        serial::println("user: kernel-only boot PASS (build images with `make userland-images`)");
+        return Ok(());
+    }
+    // 有用户态：清单必须与内核期望的路径一致（缺一条就明确报错，见契约常量）。
+    check_manifest_contract()?;
     crate::syscall::init();
     // 0 号保留给 `kernel_main`（启动上下文），用户程序从 1 开始编号 ——
     // `fork` 继续往下取号，因此 PID 不会与顶层程序撞车。

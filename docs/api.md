@@ -211,7 +211,7 @@ isize wait4(i64 pid)   // libc: wait4(pid: i64) -> isize
 ## 4. 用户态 `libc` API
 
 `libc/` 是最小用户态运行时（`no_std`）。普通用户程序**只用这一节**；内核细节见第 5 节。
-完整用法与新程序模板见 [../libc/README.md](../libc/README.md)。
+完整用法与新程序模板见 [../libc/README.md](../userland/libc/README.md)。
 
 ### 4.1 系统调用封装（`libc::syscall`，全部 re-export 到 crate 根）
 
@@ -381,8 +381,10 @@ make build / make run            # 构建镜像 / QEMU + OVMF 启动
 make test ... test-network       # 各集成测试（断言串口日志）
 make test-all                    # test + exception + memory + pagefault + keyboard + shell + proc
                                  #   + programs + dyn + scheduler + ipc + fs + user + driver + fat + network
-make dyn-hostcheck               # 动态链接夹具的宿主 glibc 独立复核（需 binutils，缺则跳过）
-make user                        # 单独构建并校验全部用户程序（不启 QEMU）
+make dyn-hostcheck               # 转发到 `make -C userland dyn-hostcheck`：动态链接夹具的宿主 glibc 独立复核（缺工具则跳过）
+make userland-images / make user # 在 userland/ 里构建 + 校验全部用户程序（不启 QEMU、不需要内核源码）
+make image-kernel / test-kernel-only # 纯内核：不内嵌用户态的镜像 / 断言内核单独启动到诊断空闲
+make check-boundary / make check # 内核不得依赖用户态（6 项门禁 + 反向自检）/ 门禁 + go-test
 make test-pkg                    # CKC 包容器测试（主机侧，不启 QEMU）
 make go-test / make test-orch    # Go 单元测试 / 编排器并行跑全部场景
 make fat-image                   # 生成 FAT32 测试盘

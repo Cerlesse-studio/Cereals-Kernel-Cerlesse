@@ -5,12 +5,32 @@
 | 工具 | 用途 | 计划版本 | 状态 |
 | ---- | ---- | ---- | ---- |
 | `image-builder/` | 组装 boot + kernel + 文件系统磁盘镜像（64 MiB FAT，mtools） | v0.1 | ✅ |
-| `check_user_elf.py` | 用户程序 ELF 段布局检查（基址/页对齐/`W^X`/映像窗口/无重定位） | v0.7 | ✅ |
+| `check-boundary.py` | **内核/用户态边界门禁**（内核不得调用外部命令/内嵌用户态字节/依赖用户态包），含 `--selftest` 反向自检 | 纯内核化阶段二 | ✅ |
+| `check_user_elf.py` | 用户程序 ELF 段布局检查（基址/页对齐/`W^X`/映像窗口/无重定位）——**由 `userland/Makefile` 调用**（它检查的是用户态产物） | v0.7 | ✅ |
 | `mkfs/` | 文件系统镜像生成（FAT12/16/32 空盘或预置目录树，供磁盘 FS 测试） | v0.8 | ✅ |
 | `pkgmgr/ckc.py` | **CKC 包容器（后缀 `.ckc`）**：`pack` / `verify` / `info`（确定性 ustar + 64 字节头） | H-06 P0a | ✅ |
 | （tests/ 驱动） | QEMU 启动与串口日志断言 | v0.1 | ✅ |
 
 状态：均已实现（`pkgmgr/` 只实现了 P0a；事务/catalog 见 `docs/package-manager.md` 11.1）。
+
+边界门禁（`make check-boundary`）的六项检查与它们在纯内核化前后的实测结果：
+
+```bash
+python3 tools/check-boundary.py            # 内核一侧：违规即退出码 1
+python3 tools/check-boundary.py --selftest # 注入 6 类违规样本，必须全部被抓到
+```
+
+| 编号 | 断言 | 改造前 | 改造后 |
+| ---- | ---- | ---- | ---- |
+| K1 | `kernel/build.rs` 不调用外部命令（嵌套 cargo / as / ld） | ❌ 2 处 | ✅ |
+| K2 | `kernel/src/**.rs` 不直接 `include_bytes!` 用户态字节 | ❌ 10 处 | ✅（清单生成，空清单也合法） |
+| K3 | 内核**代码**里不出现 `user/`、`libc/` 路径（注释引用允许） | ❌ 大量 | ✅ |
+| K4 | `kernel/Cargo.toml` 依赖只有 `shared` / `abi` | ✅ | ✅ |
+| K5 | 根 workspace 不含 `libc`、`user/*`，且 `exclude` 声明 `userland` | ❌ 9 项 | ✅ |
+| K6 | 内核代码不出现用户态包名 / profile | ❌ | ✅ |
+
+`--selftest` 保证门禁不是「永远 PASS」的空壳：它把 6 类违规写成临时仓库样本，
+要求 6 项检查全部报错才算通过（`make check-boundary` 会同时跑两者）。
 
 `mkfs/mkfs.py`（H-03）自己生成 FAT 镜像，**不调用 `mformat`**；正确性由 mtools 独立复核：
 

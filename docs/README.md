@@ -2,7 +2,8 @@
 
 - 阶段：第一阶段 / 文档中心
 - 最后更新：2026-10-11
-- 状态：🟡 持续更新（2026-10-11 同步 v0.9 第六步（**内核侧最小动态链接**：`PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`）实现记录；同日已同步第五步基础用户程序、第四步简化网络栈、第三步进程对象、第二步交互式 Shell、第一步用户堆、v0.8 收官与 H-06 包管理器 `.ckc` 提案 P0a；同日新增 **desktop.md**（v1.0 之后的桌面环境兼容路线，规划）；同日新增 **pure-kernel.md**（纯内核化改造规划：现状审计 + 逐文件迁移清单 + 六阶段 Cargo/构建/验收规格））
+- 状态：🟡 持续更新（2026-10-11 同步 v0.9 第六步（**内核侧最小动态链接**：`PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`）实现记录；同日已同步第五步基础用户程序、第四步简化网络栈、第三步进程对象、第二步交互式 Shell、第一步用户堆、v0.8 收官与 H-06 包管理器 `.ckc` 提案 P0a；同日新增 **desktop.md**（v1.0 之后的桌面环境兼容路线，规划）；同日新增 **pure-kernel.md**（纯内核化改造规划：现状审计 + 逐文件迁移清单 + 六阶段 Cargo/构建/验收规格）；
+同日**执行其中阶段二/四/五（部分）**：`libc/`+`user/` 移入 `userland/` 独立 workspace、内核构建按 `manifest.txt` 内嵌（无用户态也能构建与启动）、新增 `tools/check-boundary.py` 边界门禁）
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
 
@@ -55,12 +56,22 @@
   **完整**动态链接（用户态 `ld.so`）与 `mprotect` 等仍归后续（见 architecture.md 第 5 节）。
 - **第九阶段（v1.0 之后）**📋：**桌面环境兼容**（内核侧地基与接口对齐，D0 地基 → D1 输入 →
   D2 显示 → D3 音频 → D4 会话/电源 → D5 收尾）—— 规划见 [desktop.md](./desktop.md)，未开工。
-- **第十阶段（v0.9 之后，规划；执行上排在第九阶段之前）**📋：**纯内核化边界收敛** ——
-  内核只提供底层机制，Shell / init / libc / coreutils / 包管理器迁往独立的 **Cerlesse Userland** 项目；
-  六阶段（冻结基线 → 边界门禁 → ABI 单一来源 → 用户空间迁移 → 构建/测试拆分 → 接口稳定），
-  规划见 [pure-kernel.md](./pure-kernel.md)，未开工。
+- **第十阶段（v0.9 之后；执行上排在第九阶段之前）**🟡：**纯内核化边界收敛** —— 内核只提供底层机制，
+  Shell / init / libc / coreutils 已拆到独立 workspace [`userland/`](../userland/README.md)；
+  六阶段中 **阶段二（边界门禁）✅、阶段四（用户空间迁移）✅、阶段五（构建/测试拆分）🟡**，
+  阶段一/三/六 未做（`abi/` 单一事实源、编排拆分、基线 tag）。实测：无 `userland/` 的 checkout 里
+  `cargo build -p kernel` 退出码 0（改造前 101）、`make test-kernel-only` 7/7 PASS。
+  规划与执行记录见 [pure-kernel.md](./pure-kernel.md)。
 - **后续**：每进入一个新阶段就编写/修订对应的主题文档；阶段内已落地部分也要及时补记当前状态（例如 v0.4 中断控制器）。
 - 本套文档**会在开发过程中被反复修改**——修改前请在对应文档顶部记录修订日期与变更点。
+-  本次（2026-10-11，第十四轮）修订重点：**纯内核化执行阶段二/四/五（部分）** —— 新增
+  `tools/check-boundary.py`（6 项边界门禁 + `--selftest`，并入 `make test-all`）；`libc/`+`user/` 移入
+  `userland/` 独立 workspace（自带 `Cargo.toml`/`.cargo/config.toml`/`Makefile`/`README.md`，产出
+  `build/userland/images/manifest.txt`）；`kernel/build.rs` 改为按清单内嵌（内核不再需要 binutils），
+  `syscall/user.rs` 收敛为一次 `include!` + 契约校验 + 空清单诊断分支，`fs::selftest` 根目录条目数改为推导；
+  新增 `userland-images`/`image-kernel`/`kernel-nouserland`/`test-kernel-only`；纯内核 checkout 实测
+  `cargo build -p kernel` 退出码 **0**（改造前 101）、`make test-kernel-only` 7/7 PASS；同步
+  pure-kernel.md（第 8 节执行记录）、project-structure（目录树）、DEVELOPMENT（5.11）、roadmap 与 README。
 -  本次（2026-10-11，第十三轮）修订重点：**新增纯内核化改造规划** —— 新建 `pure-kernel.md`
   （现状审计 C1–C9：内核构建期嵌套 cargo 构建用户程序、10 处 `include_bytes!` 把 203,280 字节（≈199 KiB）用户态内嵌进内核映像、
   `fs::init` 硬编码 `/bin`/`/lib`、启动末尾跑用户态自测；**逐文件迁移清单**（`kernel/` 83 个文件里只有 9 个要改，

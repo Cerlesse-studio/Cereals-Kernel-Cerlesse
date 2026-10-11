@@ -1,23 +1,17 @@
 [workspace]
 resolver = "2"
-# v0.6 起用户态脚手架并入 workspace：`libc`（最小运行时）与 `user/*`（用户程序）。
-# 它们只对目标 x86_64-unknown-none 构建（链接脚本固定在 0x0000_0080_0000_0000，
-# 见 user/hello/user.ld），因此 `default-members` 保持 v0.1–v0.5 的三个包，
-# `cargo build`（不带 --target）不会连带构建它们。
-members = [
-    "shared",
-    "boot",
-    "kernel",
-    "libc",
-    "user/hello",
-    "user/shell",
-    "user/hello-bin",
-    "user/ls",
-    "user/cat",
-    "user/echo",
-    "user/ps",
-]
-default-members = ["shared", "boot", "kernel"]
+# 内核仓库的 workspace：**只有内核侧**。
+#
+# 用户态（libc + user/*）自纯内核化起是**独立 workspace**，见 `userland/Cargo.toml`
+# 与 docs/pure-kernel.md：内核提供机制、用户态提供功能。
+#
+# 两边的唯一接触面是编译产物 `build/userland/images/`（`make userland-images` 产出，
+# 内核构建脚本按 manifest.txt 内嵌）。因此：
+#   - 删掉整个 `userland/` 目录后 `cargo build -p kernel` 仍然成功（进入串口诊断模式）；
+#   - 本文件不再定义 `user-release` profile（它随用户程序搬到 userland/Cargo.toml）；
+#   - 边界由 `python3 tools/check-boundary.py`（`make check-boundary`）强制。
+members = ["shared", "boot", "kernel"]
+exclude = ["userland"]
 
 [profile.dev]
 panic = "abort"
@@ -26,21 +20,3 @@ panic = "abort"
 panic = "abort"
 opt-level = 2
 lto = true
-
-# 用户程序（user/*）专用 profile：构建命令见 Makefile 的 `user` 目标与
-# kernel/build.rs。相对 release 有两点必须调整：
-#   - `lto = false`：large 代码模型（用户程序链接在 2^39）与 LTO 不兼容
-#     （实测 rust-lld 报 "failed to load bitcode of module core-*.o"）；
-#   - 继承 dev 而不是 release：release 的 `lto = true` 无法在成员包里覆盖，
-#     而 profile 只能从 workspace 根定义（这也是这里存在的唯一原因）。
-# `debug-assertions`/`overflow-checks` 关掉：用户程序越小越好，
-# 映像要装进有限的用户代码页（v0.6 上限 8 页 = 32 KiB，见 address_space.rs）。
-[profile.user-release]
-inherits = "dev"
-opt-level = 2
-lto = false
-debug = false
-debug-assertions = false
-overflow-checks = false
-strip = true
-panic = "abort"

@@ -17,58 +17,5 @@ dependencies = [
 ]
 
 [[package]]
-name = "libc"
-version = "0.1.0"
-
-[[package]]
 name = "shared"
 version = "0.1.0"
-
-[[package]]
-name = "user-cat"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "user-echo"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "user-hello"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "user-hello-bin"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "user-ls"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "user-ps"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "user-shell"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
