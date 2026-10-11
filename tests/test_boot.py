@@ -27,6 +27,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Cerlesse QEMU serial-log test")
     parser.add_argument("--disk", default=str(BUILD / "disk.img"), help="磁盘镜像路径")
     parser.add_argument(
+        "--disk2",
+        default=None,
+        help="第二块 virtio-blk 盘（v0.8 test-fat：mkfs 生成的 FAT 测试盘，内核挂到 /mnt/fat）",
+    )
+    parser.add_argument(
         "--expect",
         action="append",
         default=None,
@@ -50,6 +55,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     disk = Path(args.disk)
+    disk2 = Path(args.disk2) if args.disk2 else None
     expects = [s.encode() for s in (args.expect or ["Kernel started!"])]
     serial_log = Path(args.serial_log) if args.serial_log else BUILD / "serial.log"
     timeout = args.timeout
@@ -59,6 +65,9 @@ def main() -> int:
         return 2
     if not disk.is_file():
         print(f"FAIL: disk image not found: {disk} (run `make image` first)")
+        return 2
+    if disk2 is not None and not disk2.is_file():
+        print(f"FAIL: second disk image not found: {disk2} (run `make fat-image` first)")
         return 2
 
     BUILD.mkdir(parents=True, exist_ok=True)
@@ -85,6 +94,14 @@ def main() -> int:
         "-display", "none",
         "-no-reboot",
     ]
+
+    if disk2 is not None:
+        # 第二块盘：排在 blk0 之后 → PCI 上就是下一个 function，块设备号 = 1。
+        # 内核按「探测顺序」注册设备，因此 blk0 仍是 `/disk`（启动盘）、blk1 是 `/mnt/fat`。
+        cmd[cmd.index("-serial"):cmd.index("-serial")] = [
+            "-drive", f"if=none,id=blk1,format=raw,file={disk2},snapshot=on",
+            "-device", "virtio-blk-pci,drive=blk1,disable-modern=on",
+        ]
 
     print(f"running: {' '.join(cmd)}")
     timed_out = False

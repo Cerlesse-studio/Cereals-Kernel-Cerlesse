@@ -15,8 +15,11 @@ use alloc::vec::Vec;
 
 use crate::fs::vfs::{self, FileSystem};
 
-/// 挂载点数量上限（远超 v0.7 的需要，留出 `/dev`、`/proc` 的位置）。
-pub const MAX_MOUNTS: usize = 4;
+/// 挂载点数量上限。
+///
+/// v0.8 用到 4 个（`/` RAMFS、`/mnt` 自测用 RAMFS、`/disk` 启动盘 FAT、`/mnt/fat` 测试盘 FAT32），
+/// 留出 `/dev`、`/proc` 的位置。
+pub const MAX_MOUNTS: usize = 8;
 
 /// 一个挂载点：路径 + 后端文件系统。
 ///
@@ -55,6 +58,16 @@ impl MountTable {
         }
         self.mounts.push(MountPoint { point, fs });
         Ok(())
+    }
+
+    /// 某个（已规范化的）路径是否是**挂载点本身**。
+    ///
+    /// 注意它与 `resolve()` 的区别：`resolve()` 回答「谁会处理这个路径」
+    /// （`/mnt/fat/x` 会被挂在 `/mnt` 的后端处理），而这里回答「这个路径上是否真的
+    /// 有东西被挂上来」。自测需要后者：没有第二块盘时 `/mnt/fat` 依然**能被解析**
+    /// （最长前缀落到 `/mnt`），但不该被当成「FAT 卷已挂载」。
+    pub fn is_mount_point(&self, path: &str) -> bool {
+        matches!(vfs::normalize(path), Ok(point) if self.mounts.iter().any(|m| m.point == point))
     }
 
     /// 最长前缀匹配：返回（后端, 挂载点内的相对路径）。

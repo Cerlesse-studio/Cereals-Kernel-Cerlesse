@@ -23,20 +23,23 @@
 //! └── tmp/     用户程序写文件的落点
 //! ```
 //!
-//! 磁盘文件系统（FAT32 on virtio-blk）是 v0.8 的工作：届时 [`vfs::FileSystem`]
-//! 已经稳定，加一个后端即可，syscall 层不需要改动。
+//! v0.8 在同一个 trait 下加了第二个后端：[`fat`]（块设备上的 FAT12/16/32，**只读**），
+//! 由 [`mount_disks`] 挂到 `/disk`（启动盘）与 `/mnt/fat`（`mkfs` 生成的测试盘）。
+//! syscall 层一行都不用改 —— 这正是「VFS 收口」想要的结果。
 
+pub mod fat;
 pub mod file;
 pub mod inode;
 pub mod mount;
 pub mod ramfs;
 pub mod vfs;
 
-
 use alloc::boxed::Box;
 
+use crate::driver::block::BlockDevice;
 use crate::driver::serial;
 use crate::fs::inode::NodeKind;
+use crate::fs::vfs::FileSystem;
 
 /// `/etc/motd` 的内容。
 ///
@@ -75,6 +78,55 @@ pub fn init(init_elf: &'static [u8]) -> Result<(), i64> {
     serial::print_dec(files as u64);
     serial::print(" bytes=");
     serial::print_dec(bytes as u64);
+    serial::println("");
+    Ok(())
+}
+
+/// 把块设备上的 FAT 卷挂进 VFS（v0.8）。
+///
+/// 与 [`init`] 分开的原因：RAMFS 在 `memory::init` 之后就绪，而块设备要等 PCI 枚举 +
+/// 驱动挂接（v0.8 启动链的后半段）。因此调用顺序是 `fs::init` → … → `fs::mount_disks`。
+///
+/// 挂载点约定：
+/// - `blk0`（启动盘，固件写的 ESP FAT）→ `/disk`；
+/// - `blk1`（`mkfs` 生成的测试盘，只有测试时才挂第二块盘）→ `/mnt/fat`。
+///   `/mnt/fat` 挂在 `/mnt`（自测用的 RAMFS）下面，因此顺带验证了挂载表的**最长前缀路由**。
+///
+/// 返回挂载成功的卷数。
+pub fn mount_disks() -> Result<usize, &'static str> {
+    if crate::driver::block::count() == 0 {
+        return Err("fs: no block device to mount");
+    }
+    let mut mounted = 0;
+    if let Some(dev) = crate::driver::block::get(0) {
+        mount_fat(dev, "/disk")?;
+        mounted += 1;
+    }
+    if let Some(dev) = crate::driver::block::get(1) {
+        mount_fat(dev, "/mnt/fat")?;
+        mounted += 1;
+    }
+    Ok(mounted)
+}
+
+/// 打开一个块设备上的 FAT 卷并挂到 `point`。
+fn mount_fat(dev: &'static mut dyn BlockDevice, point: &str) -> Result<(), &'static str> {
+    let fs = fat::FatFs::open(dev)?;
+    let backend = fs.name();
+    let geometry = fs.geometry();
+    mount::table()
+        .mount(point, Box::new(fs))
+        .map_err(|_| "fs: FAT mount failed (duplicate mount point or table full)")?;
+    serial::print("fs: mount point=");
+    serial::print(point);
+    serial::print(" fs=");
+    serial::print(backend);
+    serial::print(" sectors=");
+    serial::print_dec(geometry.total_sectors as u64);
+    serial::print(" cluster_bytes=");
+    serial::print_dec(geometry.sectors_per_cluster as u64 * geometry.bytes_per_sector as u64);
+    serial::print(" clusters=");
+    serial::print_dec(geometry.cluster_count as u64);
     serial::println("");
     Ok(())
 }
@@ -186,5 +238,223 @@ pub fn selftest() -> Result<(), &'static str> {
     serial::println("fs: negative cases PASS (ENOENT/ENOTDIR/EISDIR/EEXIST/EINVAL)");
 
     serial::println("fs: selftest PASS");
+    Ok(())
+}
+
+// ---- v0.8：磁盘（FAT）后端验收 ----
+
+/// 按**大端**读 4 字节（打印文件头魔数用：小端读回会把 `\x7fELF` 变成 `0x464c457f`）。
+fn be32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+/// 按大端读 2 字节（`MZ` / `0xAA55` 这类头部标记用）。
+fn be16(bytes: &[u8]) -> u16 {
+    u16::from_be_bytes([bytes[0], bytes[1]])
+}
+
+/// `dir/nested.bin` 的期望字节（公式与 tests/fatroot/README.md 一致）。
+fn nested_pattern(index: usize) -> u8 {
+    ((index * 7 + 3) & 0xFF) as u8
+}
+
+/// 磁盘文件系统自测（`make test-fat` 的断言来源，v0.8）。
+///
+/// 断言的都是「磁盘上的事实」：
+///
+/// 1. 启动盘（**固件写的** FAT）能被解析，且能读到内核**自己的映像** `/disk/KERNEL.ELF`
+///    （前 4 字节是 ELF 魔数）与引导程序 `/disk/EFI/BOOT/BOOTX64.EFI`（前 2 字节是 `MZ`）——
+///    这条链路是「VFS → FAT → 块设备 → virtio」的一次完整往返，而且文件不是我们放进 RAMFS 的；
+/// 2. `mkfs` 生成的测试盘（FAT32）按名字/大小/内容逐项对上：跨簇文件的**内容公式逐字节校验**
+///    （3000 字节 = 6 个簇，不是只比长度）、任意偏移读、空文件、长文件名（LFN）、二级子目录；
+/// 3. 挂载路由：`/mnt/note.txt` 走 RAMFS 而 `/mnt/fat/*` 走 FAT（最长前缀路由）；
+/// 4. 负例：`ENOENT` / `ENOTDIR` / `EISDIR` / `EROFS` 各自具体，不笼统失败。
+pub fn disk_selftest() -> Result<(), &'static str> {
+    serial::println("fs: disk selftest begin");
+
+    // ---- 1. 启动盘（FAT16/固件写的 ESP）----
+    let boot_backend = vfs::backend_name("/disk").ok_or("fs: /disk is not mounted")?;
+    if !boot_backend.starts_with("fat") {
+        return Err("fs: /disk did not route to a FAT backend");
+    }
+    let entries = vfs::list("/disk").map_err(|_| "fs: list /disk failed")?;
+    serial::print("fs: ls /disk entries=");
+    serial::print_dec(entries.len() as u64);
+    serial::println("");
+    for entry in &entries {
+        serial::print("fs: ls /disk name=");
+        serial::print(&entry.name);
+        serial::print(" kind=");
+        serial::print(entry.meta.kind.name());
+        serial::print(" size=");
+        serial::print_dec(entry.meta.size);
+        serial::print(" perms=");
+        serial::println(entry.meta.perms());
+    }
+    let kernel_entry = entries
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case("KERNEL.ELF"))
+        .ok_or("fs: KERNEL.ELF not found on the boot volume")?;
+    if kernel_entry.meta.kind.is_dir() || kernel_entry.meta.size < 4096 {
+        return Err("fs: KERNEL.ELF metadata looks wrong");
+    }
+    let mut magic = [0u8; 4];
+    let read = vfs::read("/disk/KERNEL.ELF", 0, &mut magic).map_err(|_| "fs: read /disk/KERNEL.ELF failed")?;
+    if read != 4 || be32(&magic) != 0x7F45_4C46 {
+        return Err("fs: /disk/KERNEL.ELF does not start with the ELF magic");
+    }
+    serial::print("fs: read /disk/KERNEL.ELF magic=");
+    serial::print_hex(be32(&magic) as u64);
+    serial::print(" size=");
+    serial::print_dec(kernel_entry.meta.size);
+    serial::print(" (our own kernel image, read from the boot volume)");
+    serial::println("");
+
+    let mut pe = [0u8; 2];
+    vfs::read("/disk/EFI/BOOT/BOOTX64.EFI", 0, &mut pe)
+        .map_err(|_| "fs: read /disk/EFI/BOOT/BOOTX64.EFI failed")?;
+    if be16(&pe) != 0x4D5A {
+        return Err("fs: BOOTX64.EFI does not start with MZ (not a PE image)");
+    }
+    serial::print("fs: read /disk/EFI/BOOT/BOOTX64.EFI magic=");
+    serial::print_hex(be16(&pe) as u64);
+    serial::print(" route=");
+    serial::println(vfs::backend_name("/disk/EFI/BOOT/BOOTX64.EFI").unwrap_or("?"));
+
+    // ---- 2. mkfs 生成的测试盘（只有挂了第二块盘才检查）----
+    //
+    // 判断条件是「`/mnt/fat` 是挂载点」，**不能**用 `backend_name("/mnt/fat").is_some()`：
+    // 没有第二块盘时它依然返回 `ramfs-scratch`（最长前缀落到挂在 `/mnt` 的后端），
+    // 于是单盘启动会在“检查测试卷”上失败并 halt。
+    let second_volume = vfs::is_mount_point("/mnt/fat");
+    if second_volume {
+        serial::print("fs: second volume at /mnt/fat fs=");
+        serial::println(vfs::backend_name("/mnt/fat").unwrap_or("?"));
+        check_fixture_volume()?;
+    } else {
+        serial::println("fs: no second volume (single-disk boot; run `make test-fat` for the full check)");
+    }
+
+    // ---- 3. 挂载路由（最长前缀）----
+    let note_route = vfs::backend_name("/mnt/note.txt").ok_or("fs: /mnt/note.txt is not routed")?;
+    let fat_route = if second_volume {
+        vfs::backend_name("/mnt/fat/hello.txt").ok_or("fs: /mnt/fat/hello.txt is not routed")?
+    } else {
+        "-"
+    };
+    serial::print("fs: route /mnt/note.txt fs=");
+    serial::print(note_route);
+    serial::print(" /mnt/fat/hello.txt fs=");
+    serial::println(fat_route);
+
+    // ---- 4. 负例：只读后端 + 路径错误各自具体 ----
+    if vfs::stat("/disk/nope") != Err(vfs::ENOENT) {
+        return Err("fs: expected ENOENT for /disk/nope");
+    }
+    if vfs::read_all("/disk/KERNEL.ELF/deeper") != Err(vfs::ENOTDIR) {
+        return Err("fs: expected ENOTDIR for a path under a file");
+    }
+    if vfs::read_all("/disk/EFI") != Err(vfs::EISDIR) {
+        return Err("fs: expected EISDIR for /disk/EFI");
+    }
+    if vfs::create("/disk/new.txt") != Err(vfs::EROFS) {
+        return Err("fs: expected EROFS when creating a file on the FAT backend");
+    }
+    if vfs::write("/disk/KERNEL.ELF", 0, b"x") != Err(vfs::EROFS) {
+        return Err("fs: expected EROFS when writing to the FAT backend");
+    }
+    serial::println("fs: disk negative cases PASS (ENOENT/ENOTDIR/EISDIR/EROFS)");
+
+    serial::println("fs: disk selftest PASS");
+    Ok(())
+}
+
+/// 检查 `mkfs` 生成的测试卷（挂在 `/mnt/fat`）：文件名、大小、内容公式、偏移读。
+fn check_fixture_volume() -> Result<(), &'static str> {
+    let entries = vfs::list("/mnt/fat").map_err(|_| "fs: list /mnt/fat failed")?;
+    serial::print("fs: ls /mnt/fat entries=");
+    serial::print_dec(entries.len() as u64);
+    serial::println("");
+    for entry in &entries {
+        serial::print("fs: ls /mnt/fat name=");
+        serial::print(&entry.name);
+        serial::print(" kind=");
+        serial::print(entry.meta.kind.name());
+        serial::print(" size=");
+        serial::print_dec(entry.meta.size);
+        serial::println("");
+    }
+
+    let hello = vfs::read_all("/mnt/fat/hello.txt").map_err(|_| "fs: read /mnt/fat/hello.txt failed")?;
+    if hello != b"hello from FAT32\n" {
+        return Err("fs: /mnt/fat/hello.txt content mismatch");
+    }
+    serial::print("fs: read /mnt/fat/hello.txt len=");
+    serial::print_dec(hello.len() as u64);
+    serial::print(" data=");
+    serial::put_bytes(&hello, hello.len());
+    serial::println("");
+
+    // 跨簇文件：逐字节对公式（3000 字节 / 512 = 6 个簇）
+    let nested = vfs::read_all("/mnt/fat/dir/nested.bin").map_err(|_| "fs: read nested.bin failed")?;
+    if nested.len() != 3000 {
+        return Err("fs: /mnt/fat/dir/nested.bin length mismatch");
+    }
+    let mut mismatch = None;
+    for (index, byte) in nested.iter().enumerate() {
+        if *byte != nested_pattern(index) {
+            mismatch = Some(index);
+            break;
+        }
+    }
+    if let Some(index) = mismatch {
+        serial::print("fs: nested.bin mismatch at offset ");
+        serial::print_dec(index as u64);
+        serial::println("");
+        return Err("fs: /mnt/fat/dir/nested.bin content mismatch (cluster chain)");
+    }
+    serial::print("fs: content check PASS /mnt/fat/dir/nested.bin len=");
+    serial::print_dec(nested.len() as u64);
+    serial::println(" (formula verified byte by byte across 6 clusters)");
+
+    // 任意偏移读（fd 的 read 路径就是这种调用形态）
+    let mut window = [0u8; 8];
+    let got = vfs::read("/mnt/fat/dir/nested.bin", 1024, &mut window)
+        .map_err(|_| "fs: offset read failed")?;
+    if got != 8 {
+        return Err("fs: offset read returned the wrong length");
+    }
+    for (i, byte) in window.iter().enumerate() {
+        if *byte != nested_pattern(1024 + i) {
+            return Err("fs: offset read content mismatch");
+        }
+    }
+    serial::print("fs: offset read PASS /mnt/fat/dir/nested.bin offset=1024 len=8 data=");
+    serial::print_hex(window[0] as u64);
+    serial::print(" ");
+    serial::println(if window[7] == nested_pattern(1031) { "(matches the formula)" } else { "(MISMATCH)" });
+
+    // 空文件：首簇 0，读它必须返回 0 字节（而不是去看簇 0）
+    let empty = vfs::read_all("/mnt/fat/empty.txt").map_err(|_| "fs: read empty.txt failed")?;
+    if !empty.is_empty() {
+        return Err("fs: /mnt/fat/empty.txt is not empty");
+    }
+    serial::println("fs: empty file PASS /mnt/fat/empty.txt len=0");
+
+    // 长文件名（LFN）+ 二级子目录
+    let long = vfs::read_all("/mnt/fat/a long file name.txt")
+        .map_err(|_| "fs: read the long-named file failed (LFN)")?;
+    if long != b"long name ok\n" {
+        return Err("fs: long-named file content mismatch");
+    }
+    serial::println("fs: long file name PASS /mnt/fat/a long file name.txt (LFN entry)");
+
+    let deep = vfs::read_all("/mnt/fat/dir/deep/marker.txt")
+        .map_err(|_| "fs: read /mnt/fat/dir/deep/marker.txt failed")?;
+    if deep != b"deep\n" {
+        return Err("fs: /mnt/fat/dir/deep/marker.txt content mismatch");
+    }
+    serial::println("fs: nested directory PASS /mnt/fat/dir/deep/marker.txt");
+
     Ok(())
 }

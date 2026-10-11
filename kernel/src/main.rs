@@ -244,6 +244,19 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
         }
     }
 
+    // v0.8：把块设备上的 FAT 卷挂进 VFS（`/disk` = 启动盘、`/mnt/fat` = mkfs 生成的测试盘），
+    // 然后在**文件系统层**做一次验收 —— syscall 层不需要任何改动就能 open/read 磁盘上的文件。
+    if let Err(err) = fs::mount_disks() {
+        driver::serial::print("fs: disk mount FAIL: ");
+        driver::serial::println(err);
+        halt();
+    }
+    if let Err(err) = fs::disk_selftest() {
+        driver::serial::print("fs: disk FAIL: ");
+        driver::serial::println(err);
+        halt();
+    }
+
     // v0.2 验收：异常注入测试（feature 门控，默认构建不触发）
     #[cfg(feature = "exception-test")]
     {

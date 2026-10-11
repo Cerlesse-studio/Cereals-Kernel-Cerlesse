@@ -159,12 +159,12 @@ impl FileSystem for RamFs {
         RamFs::usage(self)
     }
 
-    fn stat(&self, path: &str) -> Result<Metadata, i64> {
+    fn stat(&mut self, path: &str) -> Result<Metadata, i64> {
         let path = vfs::normalize(path)?;
         Ok(self.root.walk(&vfs::components(&path))?.meta())
     }
 
-    fn read<'a>(&'a self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    fn read(&mut self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64> {
         let path = vfs::normalize(path)?;
         let node = self.root.walk(&vfs::components(&path))?;
         if node.kind.is_dir() {
@@ -180,13 +180,15 @@ impl FileSystem for RamFs {
         Ok(n)
     }
 
-    fn read_all<'a>(&'a self, path: &str) -> Result<&'a [u8], i64> {
+    fn read_all(&mut self, path: &str) -> Result<Vec<u8>, i64> {
         let path = vfs::normalize(path)?;
         let node = self.root.walk(&vfs::components(&path))?;
         if node.kind.is_dir() {
             return Err(vfs::EISDIR);
         }
-        Ok(&node.data)
+        // 内存后端本来就有完整内容，这里复制一份交给调用方（v0.8 的 trait 约定，
+        // 见 `vfs::FileSystem::read_all` 的注释：磁盘后端无法零拷贝借用）。
+        Ok(node.data.clone())
     }
 
     fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<usize, i64> {
@@ -253,7 +255,7 @@ impl FileSystem for RamFs {
         Ok(())
     }
 
-    fn list(&self, path: &str) -> Result<Vec<DirEntry>, i64> {
+    fn list(&mut self, path: &str) -> Result<Vec<DirEntry>, i64> {
         let path = vfs::normalize(path)?;
         let node = self.root.walk(&vfs::components(&path))?;
         if !node.kind.is_dir() {

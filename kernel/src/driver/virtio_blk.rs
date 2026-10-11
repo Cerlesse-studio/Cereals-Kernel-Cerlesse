@@ -113,7 +113,10 @@ static mut REQ: BlkReq = BlkReq {
 /// 状态字节：设备在请求完成后写入（0 = OK）。
 static mut REQ_STATUS: u8 = 0xFF;
 
-/// 驱动状态（`probe` 期间填好，之后经 `block` 注册表访问）。
+/// 驱动状态（`attach` 期间填好，之后经 `block` 注册表访问）。
+///
+/// 每个实例对应一块盘；`Copy` 只是为了能用 `[VirtioBlk::EMPTY; N]` 初始化静态数组。
+#[derive(Clone, Copy)]
 struct VirtioBlk {
     name: &'static str,
     /// BAR0 I/O 窗口基址
@@ -139,8 +142,15 @@ impl VirtioBlk {
     };
 }
 
-/// 驱动实例（单块盘；多盘在 v0.9 引入 `Vec`/每设备状态）。
-static mut DEV: VirtioBlk = VirtioBlk::EMPTY;
+/// 同一时刻能驱动的盘数上限（= [`crate::driver::block::MAX_BLOCK_DEVICES`]）。
+///
+/// v0.8 需要两块：启动盘（ESP，固件写的 FAT）与 `mkfs` 生成的测试盘。
+pub const MAX_DEVICES: usize = crate::driver::block::MAX_BLOCK_DEVICES;
+
+/// 驱动实例数组：`attach` 按顺序占用，槽位号就是块设备号。
+static mut DEVICES: [VirtioBlk; MAX_DEVICES] = [VirtioBlk::EMPTY; MAX_DEVICES];
+/// 已被 `attach` 占用的实例数。
+static mut ATTACHED: usize = 0;
 
 /// bounce buffer 的起始地址（4 KiB 对齐；`.bss` 恒等映射 → 虚拟地址即物理地址）。
 ///
@@ -152,7 +162,7 @@ fn bounce_ptr() -> *mut u8 {
     unsafe { core::ptr::addr_of_mut!(BOUNCE.0) as *mut u8 }
 }
 
-/// 驱动对象：由 `driver::DRIVERS` 引用（零大小，状态在 [`DEV`] 里）。
+/// 驱动对象：由 [`crate::driver::driver`] 的注册表引用（零大小，状态在 [`DEVICES`] 里）。
 pub struct VirtioBlkDriver;
 
 /// `driver` 注册表里的一项。
@@ -271,19 +281,32 @@ fn attach(dev: &PciDevice) -> Result<(), &'static str> {
     // ISR 读一次清掉 legacy 中断位（我们用轮询，不处理中断）
     let _ = unsafe { port::inb(base + REG_ISR) };
 
-    // 7. 存状态并注册到块设备表
-    unsafe {
-        let dev_state = (&raw mut DEV).as_mut().expect("DEV 是静态量");
-        dev_state.base = base;
-        dev_state.queue = queue;
-        dev_state.num = num;
-        dev_state.last_used = 0;
-        dev_state.capacity = capacity;
-    }
-    let index = block::register(unsafe { &mut *(&raw mut DEV) })?;
+    // 7. 占用一个实例槽位（槽位号 = 块设备号）并填状态
+    //
+    // 多块盘的关键就在这里：每块盘的队列/容量/used 游标都在**各自的实例**里，
+    // 静止的请求缓冲（REQ/BOUNCE/REQ_STATUS）则共用 —— 单核内核里一次只有一个请求在飞
+    //（`transfer` 收 `&mut self`，`block::get()` 也只给一个 `&mut`）。
+    let slot = unsafe {
+        let used = *(&raw const ATTACHED);
+        if used >= MAX_DEVICES {
+            return Err("virtio-blk: no free device slot");
+        }
+        let table = &mut *(&raw mut DEVICES);
+        let state = &mut table[used];
+        state.name = if used == 0 { "virtio-blk0" } else { "virtio-blk1" };
+        state.base = base;
+        state.queue = queue;
+        state.num = num;
+        state.last_used = 0;
+        state.capacity = capacity;
+        *(&raw mut ATTACHED) = used + 1;
+        used
+    };
+    let index = block::register(unsafe { &mut *(&raw mut DEVICES[slot]) })?;
     serial::print("virtio-blk: registered as block device ");
     serial::print_dec(index as u64);
-    serial::println("");
+    serial::print(" name=");
+    serial::println(if index == 0 { "virtio-blk0" } else { "virtio-blk1" });
     Ok(())
 }
 
