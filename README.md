@@ -141,10 +141,23 @@ tests/     QEMU 集成测试与编排    docs/      开发文档（每个子系�
 | [docs/syscall.md](docs/syscall.md) · [docs/process.md](docs/process.md) | 系统调用与用户态 / 进程、调度、IPC |
 | [docs/filesystem.md](docs/filesystem.md) · [docs/drivers.md](docs/drivers.md) | VFS、RAMFS、FAT / 驱动框架、PCI、virtio、网络栈 |
 | [docs/roadmap.md](docs/roadmap.md) · [docs/desktop.md](docs/desktop.md) | 路线图 / v1.0 之后的桌面环境兼容路线 |
+| [docs/ckm.md](docs/ckm.md) · [docs/package-manager.md](docs/package-manager.md) | CKM（内核级权限控制与扩展管理）规划：权限模型、内核接口、扩展生命周期 / `.ckc` 包格式与事务 |
 
 ## 当前状态
 
-v0.1 – v0.9 已全部实现并通过自动化验收：UEFI 引导 → 异常诊断 → 内存与内核堆 → 中断、时钟与键盘 → 进程与 Round Robin 调度 → `syscall` 与 ring3 隔离 → VFS/RAMFS/ELF 装载 → PCI、virtio-blk 与 FAT → 用户堆、交互式 Shell、`fork`/`execve`/`wait4`、简化网络栈、基础用户程序、内核侧最小动态链接。下一步是 v1.0（权限与凭证、完整启动链、发布）。
+v0.1 – v0.9 已全部实现并通过自动化验收：UEFI 引导 → 异常诊断 → 内存与内核堆 → 中断、时钟与键盘 → 进程与 Round Robin 调度 → `syscall` 与 ring3 隔离 → VFS/RAMFS/ELF 装载 → PCI、virtio-blk 与 FAT → 用户堆、交互式 Shell、`fork`/`execve`/`wait4`、简化网络栈、基础用户程序、内核侧最小动态链接。
+
+v1.0 正在进行（第一步：运行期内存保护 `mprotect`，2026-10-11 落地，`make test-user` 91 项 PASS；其余为权限与凭证、完整启动链、发布）。
+
+**v1.0 之后的目标定位**（[CKM 设计提案](docs/ckm.md)）：
+
+```text
+Cerlesse Kernel + CKM 内核控制核心 + CKM 用户态管理服务 + 可插拔扩展系统 + 独立恢复环境
+```
+
+内核只提供强制权限与组件状态机制（CKM Core），扩展安装/事务/修复由持权的用户态服务完成，
+系统文件通过可撤销的覆盖层修改 —— 分层思路参考 KernelSU，但不照搬 Android 的 root 机制；
+第一版**不做**动态内核模块装载与图形界面。
 
 逐版本的实现记录、验收证据与踩坑见 [DEVELOPMENT.md](DEVELOPMENT.md) 第 5 节，路线图见 [docs/roadmap.md](docs/roadmap.md)。
 
@@ -154,4 +167,10 @@ v0.1 – v0.9 已全部实现并通过自动化验收：UEFI 引导 → 异常�
 
 ## 许可证
 
-本仓库目前**没有 `LICENSE` 文件** —— 授权方式待作者确认（若需要一个默认值，建议 MIT）。在补齐许可声明之前，请不要假定本仓库内容可再分发。
+本仓库以 **MIT** 许可发布，完整条款见 [`LICENSE`](LICENSE)：可自由使用、修改、分发（含商业用途），保留版权声明与许可声明即可。
+
+```text
+MIT License · Copyright (c) 2026 Dustintherain
+```
+
+若需更换许可（例如 Apache-2.0 或双许可），改 `LICENSE` 与本节的表述即可 —— 目前仓库里没有第三方 vendored 代码，替换许可不涉及兼容性排查。

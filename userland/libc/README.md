@@ -109,14 +109,15 @@ pub extern "C" fn main() -> i32 {
    **孤儿段**被 lld 塞在 `.data` 之后，RW 段不再页对齐（实测落在 `0x8000003040`）；
 4. **内存窗口是固定布局**：映像（`.text`/`.rodata`/`.data`/`.bss`）上限 64 KiB、栈 16 KiB，
    v0.9 第一步又加了 **brk 堆窗口 256 KiB** 与 **匿名 mmap 窗口 256 KiB**（见第 5 节）；
-   超出窗口的 `brk`/`mmap` 会失败（`brk` 返回原值、`mmap` 返回 `-ENOMEM`），
-   而且**没有 `mprotect`**（`PROT_NONE` 与「先写后换只执行」仍不支持）。
+   超出窗口的 `brk`/`mmap` 会失败（`brk` 返回原值、`mmap` 返回 `-ENOMEM`）；
+   窗口内的保护属性可以用 `mprotect` 在运行期改写（v1.0 第一步，见第 5.1 节），
+   但**用户栈的保护属性固定**（`RW` + `NX`）且不能改。
 
 `make user` 会跑 `tools/check_user_elf.py`，逐项检查上述 1/2（以及映像窗口、无重定位），
 不用启动 QEMU 就能在改坏链接脚本时立刻发现。
 
-尚未实现的调用：**只剩 `mprotect`**（W^X 转换用），它在内核侧落在公共 ENOSYS 桩上；
-环境变量（`envp`）、用户态抢占与动态链接属后续版本。
+尚未实现的调用：**号已定义的调用已全部落地**（`mprotect` 是最后一个，见 5.1）；
+环境变量（`envp`）、文件映射（`mmap` 加 offset）、用户态抢占与**完整**动态链接属后续版本。
 
 ## 5. 用户堆（v0.9 第一步）
 
@@ -142,12 +143,36 @@ v.push(1);
 | 调用 | 语义 | 失败 |
 | ---- | ---- | ---- |
 | `brk(addr)` | `addr = 0` 查询堆顶；否则页对齐增长/收缩（256 KiB 窗口） | **不返回错误**：返回原值（用 `ret < addr` 判断） |
-| `mmap(len, prot, flags)` | 只收 `MAP_PRIVATE\|MAP_ANONYMOUS`，`fd` 固定 -1，**无 offset 参数**；first-fit；新页全零 | `-EINVAL`（位非法/文件映射/`PROT_WRITE\|PROT_EXEC`/`PROT_NONE`）、`-ENOMEM`（超窗口） |
+| `mmap(len, prot, flags)` | 只收 `MAP_PRIVATE\|MAP_ANONYMOUS`，`fd` 固定 -1，**无 offset 参数**；first-fit；新页全零 | `-EINVAL`（位非法/文件映射/`PROT_WRITE\|PROT_EXEC`）、`-ENOMEM`（超窗口） |
+| `mprotect(addr, len, prot)` | 改**已映射**页的保护属性（v1.0）：页对齐、同一窗口、全段已映射；`PROT_NONE` 关页但留住页帧 | `-EINVAL`（对齐/长度/位/跨窗口/有页未映射/目标为栈） |
 | `munmap(addr, len)` | 整段归还（要求页对齐且全段已映射） | `-EINVAL` |
 
 分配器的**限制**（写在代码注释里，也写在这里）：`libc::heap` 是只前进的 bump 分配器，
 `dealloc` 是空操作 —— 目前靠「一次运行结束由内核 `UserSpace::Drop` 整棵释放」兜底，
-长驻程序的内存占用会单调上升；回收式分配器与 `mprotect` 属后续版本。
+长驻程序的内存占用会单调上升；回收式分配器属后续版本（`mprotect` 已在 5.1 落地）。
+
+### 5.1 `mprotect`：运行期改保护属性（v1.0 第一步）
+
+```rust
+use libc::{mmap, mprotect, munmap, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_NONE, PROT_READ, PROT_WRITE};
+
+// W^X 只允许「先写、再换只执行」：匿名页先拿 RW，写完改成 RX 再调用
+let p = mmap(4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS) as usize;
+let code = [0xb8, 42, 0, 0, 0, 0xc3]; // mov eax, 42; ret
+unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), p as *mut u8, code.len()) };
+
+let _ = mprotect(p as u64, 4096, PROT_NONE);   // 0 返回：页帧还在，但本进程访问会 #PF
+let _ = mprotect(p as u64, 4096, PROT_READ | PROT_EXEC); // 换成只读可执行
+let f: extern "C" fn() -> u32 = unsafe { core::mem::transmute(p) };
+println!("ret={}", f());            // 42
+let _ = munmap(p as u64, 4096);     // mprotect 过的页照常归还
+```
+
+- 成功返回 `0`（内核串口留 `user: mprotect addr=… -> pages=N`）；失败返回 `-22`（`EINVAL`），
+  且每类原因在串口上可区分（未页对齐 / `len=0` / 未知保护位 / `W^X` / 跨窗口 / 有页未映射）；
+- `PROT_NONE` **不归还页帧**：它只是把这一段的 `USER` 位清掉，内容原样保留，`mprotect` 回来又能用。
+  注意此时**内核也不再把它当合法用户缓冲** —— 拿它去 `write`/`read` 会得到 `-EFAULT`；
+- `PROT_WRITE | PROT_EXEC` 依旧被拒（W^X 不能被 `mprotect` 绕开）。
 
 ## 6. 交互式输入（v0.9 第二步）
 

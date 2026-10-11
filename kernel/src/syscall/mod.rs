@@ -49,9 +49,11 @@ pub unsafe extern "C" fn syscall_dispatch(
 ) -> u64 {
     let args_ref: &[u64; 5] = unsafe { &*(args as *const [u64; 5]) };
     // 已命名但未实现的号：留下「谁在依赖它」的记录。
-    // 这是一条**依赖关系证据**，不是诊断噪声：`mprotect`（v0.9 起唯一剩下的号）
-    // 被调用时串口上会出现 `syscall: ENOSYS nr=10 name=mprotect`，
-    // 而不是只靠一句「还没实现」的说明（见 docs/syscall.md 3.4）。
+    // 这是一条**依赖关系证据**，不是诊断噪声：调用未实现的号时串口上会出现
+    // `syscall: ENOSYS nr=57 name=fork`（v0.9 第三步之前），而不是只靠一句
+    // 「还没实现」的说明（见 docs/syscall.md 3.4）。
+    // v1.0 第一步实现 `mprotect` 之后 `UNIMPLEMENTED` 是空表：这条分支暂时不会
+    // 命中，但机制保留给下一个「号先定义、实现后补」的调用。
     if let Some(name) = syscall_table::unimplemented_name(nid) {
         serial::print("syscall: ENOSYS nr=");
         serial::print_dec(nid);

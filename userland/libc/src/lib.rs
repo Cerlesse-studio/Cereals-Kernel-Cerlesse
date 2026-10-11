@@ -5,6 +5,8 @@
 //!
 //! - [`syscall`]：`syscall` 指令封装 + 调用（`write` / `read` / `open` / `close` /
 //!   `getpid` / `nanosleep` / `exit` / `brk` / `mmap` / `munmap`）；
+//!   v1.0 第一步补上 `mprotect`（改写已映射页的保护属性，支持 `PROT_NONE`）——
+//!   W^X 的「先 `mmap(RW)` 写、再 `mprotect(RX)` 执行」因此成立；
 //!   v0.9 第三步起 `fork` / `execve` / `wait4` 也不再是桩：它们有真实的进程对象
 //!   （独立地址空间 + 独立内核栈 + 完整用户帧）作为后端，`user/shell` 用它跑外部程序；
 //!   v0.9 第五步补上用户态读内核表的两个调用：`getdents`（目录项，`user/ls`）与
@@ -41,7 +43,7 @@
 //!    程序里的绝对地址因此不需要重定位（内核不做加载时重定位，只接受 `ET_EXEC`）；
 //! 3. **程序有可写数据段**（`.data`/`.bss` 映射为 ring3 可写、不可执行）
 //!    与**用户堆**（`brk` 窗口 256 KiB + 匿名 `mmap` 窗口 256 KiB，见 [`heap`]）；
-//!    `mmap` 只支持私有匿名页、拒绝 `PROT_WRITE|PROT_EXEC`（W^X）、且没有 `offset` 参数。
+//!    `mmap`/`mprotect` 都拒绝 `PROT_WRITE|PROT_EXEC`（W^X），且 `mmap` 没有 `offset` 参数。
 //!
 //! 系统调用号与错误约定见 `kernel/src/syscall/syscall_table.rs`（Linux x86_64 语义）。
 
@@ -56,11 +58,11 @@ pub use crate::args::{arg, arg_str, argc, Args};
 pub use crate::console::Writer;
 pub use crate::syscall::{
     brk, close, dirent_is_dir, dirent_name, dirent_size, execve, exit, fork, getdents, getpid,
-    getprocs, mmap, munmap, nanosleep, open, procinfo_name, procinfo_pid, procinfo_ppid,
+    getprocs, mmap, mprotect, munmap, nanosleep, open, procinfo_name, procinfo_pid, procinfo_ppid,
     procinfo_state, read, wait4, write, ARG_MAX, DIRENT_NAME_MAX, DIRENT_SIZE, EAGAIN, EBADF,
     ECHILD, EFAULT, EISDIR, EINVAL, ENOENT, ENOMEM, ENOSPC, ENOSYS, MAP_ANONYMOUS, MAP_PRIVATE,
-    O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, PROCINFO_NAME_MAX, PROCINFO_SIZE, PROT_EXEC, PROT_READ,
-    PROT_WRITE, STDERR, STDIN, STDOUT,
+    O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, PROCINFO_NAME_MAX, PROCINFO_SIZE, PROT_EXEC, PROT_NONE,
+    PROT_READ, PROT_WRITE, STDERR, STDIN, STDOUT,
 };
 
 use core::arch::global_asm;

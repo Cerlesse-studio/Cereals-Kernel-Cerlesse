@@ -7,7 +7,8 @@
   本文档同时是**逐文件迁移清单**与**六阶段验收规格**
 
 > 本文档顶部保留 阶段 / 最后更新 / 状态 字段，与项目文档维护约定对齐（见 [README.md](README.md)）。
-> 关联：[architecture.md](architecture.md)（第 5 节非目标）、[project-structure.md](project-structure.md)（目录与职责）、
+> 关联：[architecture.md](architecture.md)（第 5 节非目标）、[ckm.md](ckm.md)（CKM 规划：`ckmd`/`ckm` 属用户态，
+> 必须落在 `userland/`，内核只保留 CKM Core 机制）、[project-structure.md](project-structure.md)（目录与职责）、
 > [roadmap.md](roadmap.md)（阶段划分）、[syscall.md](syscall.md)（ABI 规格）、[package-manager.md](package-manager.md)（`.ckc`）、
 > [../DEVELOPMENT.md](../DEVELOPMENT.md)（第 3 节 Cargo 规划、第 5 节任务清单）。
 
@@ -363,7 +364,7 @@ Cerlesse-Userland/                 # 新仓库（用户态 + 用户态测试）
 | 2 | 内核能单独生成可启动镜像 | ✅ **成立** | 四 | 同上 checkout：`make image`（提示不内嵌用户态）或显式 `make image-kernel`（实测 EXIT=0） |
 | 3 | QEMU 可验证启动、异常、内存、调度 | ✅ 已有（`test`/`test-exception`/`test-memory`/`test-scheduler`） | 一（冻结） | `make test test-exception test-memory test-scheduler` |
 | 4 | syscall ABI 有文档，用户态不依赖内核私有实现 | 🟡 文档有（`docs/syscall.md`），但常量两处镜像（C6） | 三·六 | `make abi-check` + `make abi-doc` |
-| 5 | ELF 加载、进程创建、文件访问由独立测试程序验证 | 🟡→✅（程序现在由 `userland/` 自己构建，内核只按清单内嵌） | 四·五 | `make -C userland images` + `make test-user`(61) / `test-proc`(8+4 正则) / `test-programs`(17+5) / `test-dyn`(10)，均实测 PASS |
+| 5 | ELF 加载、进程创建、文件访问由独立测试程序验证 | 🟡→✅（程序现在由 `userland/` 自己构建，内核只按清单内嵌） | 四·五 | `make -C userland images` + `make test-user`(91) / `test-proc`(8+4 正则) / `test-programs`(17+5) / `test-dyn`(10)，均实测 PASS |
 | 6 | 内核与用户态分别构建、分别测试、独立演进 | 🟡 独立 workspace ✅；独立 **Git 仓库** ⬜ | 五 | 内核侧 `make image` / `make test-*`；用户态侧 `make -C userland images` 与 `dyn-hostcheck`（**不需要内核源码**）；`git subtree split -P userland` 待执行 |
 | 7 | 用户态缺失时内核仍能启动并进入可诊断状态 | ✅ **成立** | 四 | `make test-kernel-only`（7 项断言，实测 PASS；在无 `userland/` 的 checkout 里同一条命令也 PASS） |
 
@@ -404,7 +405,7 @@ Cerlesse-Userland/                 # 新仓库（用户态 + 用户态测试）
 | 5 | 用户态独立构建：`make -C userland images` | ✅ 7 个程序（每个过 `check_user_elf.py` 段布局校验）+ 3 个动态链接对象（`check_dyn_fixture.py`：ET_DYN + `PT_INTERP` + `DT_NEEDED`）+ `manifest.txt` |
 | 6 | `make -C userland dyn-hostcheck`（宿主 glibc） | ✅ `dyn-hostcheck PASS (glibc ld.so, exit=42)` |
 | 7 | 边界门禁：`make check-boundary` | ✅ 6/6 通过（改造前 5/6 违规）；`--selftest` 6/6 违规样本全部被抓到 |
-| 8 | 全量回归：15 个编排场景 + `test-user`(61) / `test-shell`(11) / `test-proc`(8+4) / `test-programs`(17+5) / `test-dyn`(10) / `test-fs`(21) / `test`/`test-memory`/`test-scheduler`/`test-network` | ✅ 全部 PASS（编排日志 13 个场景逐条核对 + `scheduler`/`network` 单跑） |
+| 8 | 全量回归：15 个编排场景 + `test-user`(91) / `test-shell`(11) / `test-proc`(8+4) / `test-programs`(17+5) / `test-dyn`(10) / `test-fs`(21) / `test`/`test-memory`/`test-scheduler`/`test-network` | ✅ 全部 PASS（编排日志 13 个场景逐条核对 + `scheduler`/`network` 单跑） |
 
 **改动面**：内核侧 3 个文件（`kernel/build.rs` 重写、`kernel/src/syscall/user.rs`、`kernel/src/fs/mod.rs`）
 + 根 `Cargo.toml`/`Makefile`；`libc/`(7 文件) 与 `user/`(33 文件) 整体移入 `userland/`（git 记录为 rename，

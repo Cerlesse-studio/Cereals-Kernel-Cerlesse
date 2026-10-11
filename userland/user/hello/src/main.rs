@@ -14,6 +14,7 @@
 //! | 非法指针 `write` | syscall 参数校验 | `user: EFAULT write ...` / `hello: bad write ret=-14` |
 //! | `brk` / `mmap` / `munmap` | **用户堆**（v0.9 第一步） | `user: brk base=0x8000020000`、`user: mmap len=8192 ... -> 0x8000060000`、`hello: heap PASS` |
 //! | `Vec` / `format!` | `#[global_allocator]` 真的落到内核 | `hello: vec len=200 sum=20100` |
+//! | `mprotect` | **运行时改保护属性**（v1.0 第一步）：`PROT_NONE` 关页 → 内核拒收该缓冲 → 恢复后内容原样 → 换 `RX` 并真的执行 | `user: mprotect addr=0x8000060000 len=4096 prot=0x0 -> pages=1`、`hello: mprotect none write ret=-14`、`hello: mprotect exec ret=42`、`hello: mprotect PASS=1` |
 //! | `nanosleep` | tick 真实推进 | `user: sleep done ticks=2` |
 //! | `exit(42)` | 退出码回收 | `user: exit code=42` |
 //!
@@ -29,8 +30,8 @@ use alloc::vec::Vec;
 
 use libc::syscall::{raw, SYS_WRITE};
 use libc::{
-    brk, close, getpid, mmap, munmap, nanosleep, open, println, read, write, MAP_ANONYMOUS,
-    MAP_PRIVATE, O_CREAT, O_RDONLY, O_WRONLY, PROT_READ, PROT_WRITE,
+    brk, close, getpid, mmap, mprotect, munmap, nanosleep, open, println, read, write, MAP_ANONYMOUS,
+    MAP_PRIVATE, O_CREAT, O_RDONLY, O_WRONLY, PROT_EXEC, PROT_NONE, PROT_READ, PROT_WRITE,
 };
 
 /// 可写的静态变量：v0.7 的 ELF Loader 把 `RW` 段映射成 ring3 可写，
@@ -48,6 +49,11 @@ const HEAP_STEP: u64 = 2 * 4096;
 const MMAP_LEN: usize = 2 * 4096;
 /// 内核 mmap 窗口上限（256 KiB，见 `address_space::USER_MMAP_MAX`）。
 const MMAP_MAX: usize = 64 * 4096;
+/// `mprotect` 自测里要从 ring3 **执行**的机器码：`mov eax, 42; ret`。
+///
+/// 先以 `mmap(PROT_READ|PROT_WRITE)` 写进页里，再 `mprotect(RX)` 改成只读可执行 ——
+/// 这就是 W^X 要求的「先写、再换只执行」，也是这份自测存在的理由。
+static WX_CODE: [u8; 6] = [0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3];
 
 /// 内核通过 `_start` 调用该入口；返回值即退出码。
 #[no_mangle]
@@ -100,13 +106,20 @@ pub extern "C" fn main() -> i32 {
     // ---- 5. 用户堆：brk / mmap / munmap（v0.9 运行时前置条件） ----
     let heap_ok = heap_selftest();
 
-    // ---- 6. nanosleep：2 个 tick = 20ms，内核在等待期间 `sti; hlt` ----
+    // ---- 6. mprotect：PROT_NONE 关页 + RX 转换（v1.0 第一步） ----
+    let prot_ok = mprotect_selftest();
+
+    // ---- 7. nanosleep：2 个 tick = 20ms，内核在等待期间 `sti; hlt` ----
     let slept = nanosleep(2);
     println!("hello: slept={}", slept);
 
     if !heap_ok {
         println!("hello: heap FAIL");
         return 43;
+    }
+    if !prot_ok {
+        println!("hello: mprotect FAIL");
+        return 44;
     }
     42
 }
@@ -225,5 +238,99 @@ fn heap_selftest() -> bool {
     ok &= s.len() == 21;
 
     println!("hello: heap PASS={}", ok as u8);
+    ok
+}
+
+/// `mprotect` 自测（v1.0 第一步）：`PROT_NONE` 关页 → 内核拒收该缓冲 → 恢复后内容原样
+/// → 换成 `RX` 并**真的执行**页里的机器码（W^X 的「先写后换只执行」）。
+///
+/// 每一类拒绝都给**具体**退出码（与 `mmap`/`munmap` 的负例同一风格）：
+/// 未页对齐 / `len=0` / 未知保护位 / `W^X` / 未映射的页 / 用户栈（保护属性由内核定死）。
+fn mprotect_selftest() -> bool {
+    let mut ok = true;
+
+    // 一页 RW：写下机器码 —— 此刻这页还不能执行
+    let m = mmap(4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS);
+    println!("hello: mprotect mmap ret={}", m);
+    if m <= 0 {
+        return false;
+    }
+    let page = m as usize;
+    let ptr = page as *mut u8;
+    unsafe { core::ptr::copy_nonoverlapping(WX_CODE.as_ptr(), ptr, WX_CODE.len()) };
+
+    // 1) PROT_NONE：页帧与内容都还在，但本进程不可访问；内核也不再把这段当合法用户缓冲
+    //    （用 `raw` 直接发 syscall，避免在不可读的页上构造 Rust 切片）
+    let none = mprotect(page as u64, 4096, PROT_NONE);
+    println!("hello: mprotect none ret={}", none);
+    ok &= none == 0;
+    let refused = unsafe { raw(SYS_WRITE, 1, page as u64, 1, 0, 0) };
+    println!("hello: mprotect none write ret={}", refused);
+    ok &= refused == -14; // EFAULT：按页校验认定为「不是用户缓冲」
+
+    // 2) 改回 RW：内容必须原样（mprotect 不搬家、不清零）
+    let back = mprotect(page as u64, 4096, PROT_READ | PROT_WRITE);
+    println!("hello: mprotect rw ret={}", back);
+    ok &= back == 0;
+    let kept = unsafe { core::ptr::read_volatile(ptr) } == WX_CODE[0];
+    println!("hello: mprotect data kept={}", kept as u8);
+    ok &= kept;
+
+    // 3) 换成 RX 并真的调用：JIT 走的就是这条路
+    let rx = mprotect(page as u64, 4096, PROT_READ | PROT_EXEC);
+    println!("hello: mprotect rx ret={}", rx);
+    ok &= rx == 0;
+    let entry: extern "C" fn() -> u32 = unsafe { core::mem::transmute(page) };
+    let ret = entry();
+    println!("hello: mprotect exec ret={}", ret);
+    ok &= ret == 42;
+
+    // 4) 负例：每一类拒绝都要具体
+    let misaligned = mprotect(page as u64 + 8, 4096, PROT_READ);
+    println!("hello: mprotect misaligned ret={}", misaligned);
+    ok &= misaligned == -22;
+    let len0 = mprotect(page as u64, 0, PROT_READ);
+    println!("hello: mprotect len0 ret={}", len0);
+    ok &= len0 == -22;
+    let unknown = mprotect(page as u64, 4096, 0x8);
+    println!("hello: mprotect unknown prot ret={}", unknown);
+    ok &= unknown == -22;
+    let wx = mprotect(page as u64, 4096, PROT_WRITE | PROT_EXEC);
+    println!("hello: mprotect wx ret={}", wx);
+    ok &= wx == -22;
+    // 邻页没有映射（本程序只映射了这一页）→ 不做事，而不是「部分成功」
+    let unmapped = mprotect(page as u64 + 4096, 4096, PROT_READ);
+    println!("hello: mprotect unmapped ret={}", unmapped);
+    ok &= unmapped == -22;
+    // 用户栈：保护属性（RW + NX）由内核在建立地址空间时定死，不在支持范围
+    let local = 0u8;
+    let stack_page = (&local as *const u8 as u64) & !0xfff;
+    let stack = mprotect(stack_page, 4096, PROT_READ);
+    println!("hello: mprotect stack ret={}", stack);
+    ok &= stack == -22;
+
+    // 5) brk 堆窗口也在支持范围内（逐页标志位 `heap_flags` 的意义）——
+    //    heap_selftest 增长了两页，所以当前 break 减 HEAP_STEP 就是堆的第一页
+    let heap_page = brk(0) - HEAP_STEP;
+    let heap_none = mprotect(heap_page, 4096, PROT_NONE);
+    println!("hello: mprotect heap none ret={}", heap_none);
+    ok &= heap_none == 0;
+    let heap_refused = unsafe { raw(SYS_WRITE, 1, heap_page, 1, 0, 0) };
+    println!("hello: mprotect heap none write ret={}", heap_refused);
+    ok &= heap_refused == -14;
+    let heap_back = mprotect(heap_page, 4096, PROT_READ | PROT_WRITE);
+    println!("hello: mprotect heap back ret={}", heap_back);
+    ok &= heap_back == 0;
+    // 堆里第一页的第一个字节是 heap_selftest 写的 `0 & 0xff`
+    let heap_kept = unsafe { core::ptr::read_volatile(heap_page as *const u8) } == 0;
+    println!("hello: mprotect heap data kept={}", heap_kept as u8);
+    ok &= heap_kept;
+
+    // 归还：`mprotect` 过（含 PROT_NONE）的页帧仍在，munmap 必须成功
+    let un = munmap(page as u64, 4096);
+    println!("hello: mprotect munmap ret={}", un);
+    ok &= un == 0;
+
+    println!("hello: mprotect PASS={}", ok as u8);
     ok
 }

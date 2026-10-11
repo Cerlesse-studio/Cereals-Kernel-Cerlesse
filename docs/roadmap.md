@@ -8,10 +8,14 @@
   第五步（**基础用户程序 `ls`/`cat`/`echo`/`ps`** + `getdents`/`getprocs`）、
   第六步（**内核侧最小动态链接**：`PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`）；
   v0.9 范围内的目标已全部完成；剩余项（`mprotect`、完整动态链接（用户态 `ld.so`）、
-  TCP/ICMP 与 socket、更多用户程序）归 v1.0；**v1.0 之后新增「桌面环境兼容路线」（规划）**：
+  TCP/ICMP 与 socket、更多用户程序）归 v1.0，其中 **`mprotect` 已于 2026-10-11（v1.0 第一步）落地**：
+  已映射页的保护属性可在运行期改写（`PROT_NONE` 与 W^X 的「先写后换只执行」，见 syscall.md 3.10）；
+  **v1.0 之后新增「桌面环境兼容路线」（规划）**：
   D0 地基 → D1 输入 → D2 显示 → D3 音频 → D4 会话/电源 → D5 收尾，见 [desktop.md](desktop.md)；
   同日再加 **「纯内核化改造规划」（v0.9 之后，规划；执行上在桌面路线之前）**：边界收敛 ——
-  `libc/`+`user/*` 迁往独立 Cerlesse Userland，内核提供机制/用户态提供功能，见 [pure-kernel.md](pure-kernel.md)）
+  `libc/`+`user/*` 迁往独立 Cerlesse Userland，内核提供机制/用户态提供功能，见 [pure-kernel.md](pure-kernel.md)；
+  同日再加 **「CKM 设计提案」（v1.0 之后，规划）**：内核级强制权限控制 + 特权用户态服务 + 可插拔扩展系统
+  + 独立恢复环境（分层借鉴 KernelSU，但不照搬 Android root 机制），见 [ckm.md](ckm.md)）
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
 
@@ -67,8 +71,13 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 | **v0.7 🟡** | VFS + RAMFS + ELF（2026-10-11 核心已验收：`FileSystem` trait + 挂载表最长前缀路由 + RAMFS 后端 + fd 表 + `open/read/write/close` + **ELF Loader**（RAMFS `/init` 按段权限逐页装载，`RW` 段对 ring3 可写）；`make test-fs` 19 项 / `make test-user` 32 项 PASS）。Shell 里 `ls/cat/cd` 属 v0.9、磁盘 FS（FAT32）与 `mkfs` 属 v0.8 | filesystem.md / syscall.md |
 | **v0.8 ✅** | Driver + PCI + Disk（2026-10-11 验收：驱动注册框架 + PCI 枚举 + 块设备 + **legacy virtio-blk**（`make test-driver` 22 项）；**FAT12/16/32 只读后端挂到 VFS** + H-03 `mkfs`（`make test-fat` 21 项），双盘启动读 `/disk`（启动盘）与 `/mnt/fat`（测试盘）） | drivers.md / filesystem.md |
 | **v0.9 ✅** | Shell + User Programs + Network（**六步全部落地**：第一步 **用户堆**（`brk`/`mmap`/`munmap` + `libc` 全局分配器）；第二步 **`stdin` + 交互式 Shell**（键盘行缓冲 → `read(0)` 整行 → `/bin/sh`）；第三步 **进程对象 + `fork`/`execve`/`wait4` + `argc`/`argv`** —— Shell 的外部程序 `/bin/hello` 真的能跑起来（`make test-shell` 11 项 / `make test-proc` 8 项 + 4 正则 / `make test-user` 61 项）；第四步 **简化网络栈**（virtio-net + Ethernet/ARP/IPv4/UDP，`make test-network` 13 项）；第五步 **基础用户程序**（`ls`/`cat`/`echo`/`ps` → `/bin/*`，含新增的目录枚举 `getdents` 与进程表 `getprocs`，`make test-programs` 17 项 + 5 正则）；第六步 **内核侧最小动态链接**（`PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`，`/bin/dynhello` + `/lib/{ld.so,libgreet.so}`，`make test-dyn` 10 项 + `make dyn-hostcheck` glibc 独立复核）。**仍不做（归 v1.0）：`mprotect`、完整动态链接（用户态 `ld.so`）、TCP/ICMP 与 socket、更多用户程序**） | syscall.md / process.md / drivers.md / filesystem.md |
-| **v1.0** | 完整可启动的类 Linux 小型 OS | — |
+| **v1.0** | 完整可启动的类 Linux 小型 OS（第一步 ✅ 2026-10-11：**`mprotect`**） | syscall.md |
 
+> **v1.0 之后（规划，执行上排在桌面路线之前）**：CKM（内核级权限与扩展管理）——
+> CKM Core（`kernel/src/ckm/`：强制权限、组件状态、审计）→ CKM Service（`ckmd`：事务/包操作/修复）
+> → CKM Manager（`ckm` CLI）→ 覆盖层 → 恢复环境；分 CKM-1…CKM-7 七期，第一版不做动态内核模块装载与 GUI，
+> 依赖关系：CKM-1 依赖 v1.0 的凭证/权限，CKM-2 依赖可写持久化；与桌面路线互不阻塞，见 [ckm.md](ckm.md)。
+>
 > **v1.0 之后（规划）**：桌面环境兼容路线（内核侧地基与接口对齐）——
 > D0 地基（设备模型 + `ioctl` + `poll`）→ D1 输入（evdev/uinput）→ D2 显示（fbdev → DRM/KMS）
 > → D3 音频（ALSA 子集）→ D4 会话/电源（ACPI 子集 + cgroup）→ D5 收尾；
@@ -91,11 +100,16 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
    （见 syscall.md 3.5/3.6/3.7/3.8 与 process.md 1.4）；**简化网络栈**（virtio-net + Ethernet → ARP → IPv4 → UDP，
    见 drivers.md 1.8）亦已落地；最后一块**动态链接**（内核侧最小闭环：`PT_INTERP` + `DT_NEEDED` +
    `RELATIVE`/`JUMP_SLOT`，见 syscall.md 3.9）于 2026-10-11 落地 —— v0.9 至此收官。
-8. **第八阶段（v1.0）**：整合、安全机制、发布。
+8. **第八阶段（v1.0，进行中）**：整合、安全机制、发布 —— 第一步 **`mprotect`**（内存保护属性运行期改写）
+   已于 2026-10-11 落地并验收（`make test-user` 91 项，见 syscall.md 3.10 与 DEVELOPMENT.md 5.7）；
+   用户/组/权限、完整启动链、发布准备仍待做。
 9. **第九阶段（v1.0 之后，规划）**：桌面环境兼容 —— 内核侧地基与接口对齐（D0–D5），见 [desktop.md](desktop.md)。
 10. **第十阶段（v0.9 之后，进行中；执行上排在第九阶段之前）**：纯内核化边界收敛 —— 内核只提供机制，
     用户态已拆到独立 workspace `userland/`（阶段二/四 ✅、阶段五 🟡；阶段一/三/六 未做），
     见 [pure-kernel.md](pure-kernel.md)（含第 8 节执行记录）。
+11. **第十一阶段（v1.0 之后，规划）**：CKM 内核级权限控制与扩展管理 —— CKM Core（内核）/
+    CKM Service（`ckmd`）/ CKM Manager（`ckm`）/ 覆盖层 / 恢复环境，分 CKM-1…CKM-7；
+    第一版不做动态内核模块装载与 GUI，见 [ckm.md](ckm.md)。
 
 ## 5. 修订记录
 
@@ -120,6 +134,8 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 | 2026-10-11 | **v0.8 收官**（FAT 磁盘后端 + H-03 `mkfs`）：`fs/fat.rs`（FAT12/16/32 只读：BPB 按簇数定类型、固定根目录区/簇链目录、8.3 + NT 标志 + LFN 校验和、任意偏移读、`EROFS`/`EUCLEAN`）挂到 VFS（`fs::mount_disks` → `/disk` 启动盘、`/mnt/fat` 测试盘，验证最长前缀路由）；`FileSystem` trait 改为 `&mut self` + `read_all -> Vec<u8>`；`tools/mkfs/mkfs.py` 自己生成 FAT12/16/32 镜像并由 mtools 独立复核；新增 `make fat-image` / `make test-fat`（21 项，双盘）与编排第 10 个场景；v0.8 里程碑标记 ✅ |
 | 2026-10-11 | **v0.9 第五步：基础用户程序（`ls`/`cat`/`echo`/`ps`）与目录/进程枚举** —— 新增 `syscall/dir.rs`（`getdents`：VFS `list()` → 定长 88 字节记录；号 78 沿用 Linux 但格式不同）与 `syscall/process.rs::sys_getprocs`（定长 40 字节记录；号 **256**，`syscall_table.rs` 确立「`0..=255` Linux 语义 / `>= 256` Cerlesse 扩展」并把 `SYS_MAX` 改为 257）；`process/process.rs` 新增定长 `comm`（`create` 填充、`execve` 改写为程序名）；`libc` 新增 `getdents`/`getprocs` + `dirent_*`/`procinfo_*` 解析器；新增 `user/{ls,cat,echo,ps}`（`kernel/build.rs`、workspace、`fs::init` 清单 3 → 7），Shell 帮助文本同步；新增 `make test-programs`（17 项 + 5 正则）与编排场景 `programs`（13 → **14 场景**）；`make test-proc` 的负例由 `ls` 改 `foo` |
 | 2026-10-11 | **v0.9 第六步（收官）：内核侧最小动态链接** —— 新增 `syscall/dynamic.rs`（`ET_DYN` 分流：`PT_INTERP` + `DT_NEEDED` → `/lib/<name>` 递归装载，应用 `R_X86_64_RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`64`；`DT_PLTREL=REL` 明确拒绝）；`address_space.rs` 新增共享库窗口（基址 + 1 MiB、32 页）与 `map_dyn_page`/`phys_of`；新增夹具 `user/dynhello/`（`as`+`ld` 现编）与 RAMFS `/lib`（清单 7 → 8）；新增 `make test-dyn`（10 项）与 `make dyn-hostcheck`（宿主机 glibc 独立复核）；`test-fs` 20 → 21、`test-programs` 条目数 5/7；v0.9 里程碑标记 ✅（见 syscall.md 3.9） |
+| 2026-10-11 | **v1.0 第一步：`mprotect` 落地** —— `syscall/memory.rs::sys_mprotect`（页对齐/`len>0`/未知位/W^X 四类拒绝各留串口原因）+ `address_space.rs::mprotect`（范围限同一窗口、每页已映射；`PROT_NONE` = 清 `USER` 留 `PRESENT`；改权限即 `invlpg`）+ 堆窗口逐页 `heap_flags`；`mmap(PROT_NONE)` 由拒绝改为合法，`syscall_table::UNIMPLEMENTED` 因此**清空**；`libc` 新增 `mprotect`/`PROT_NONE`，`user/hello` 新增 `mprotect_selftest`（`RX` 后真的执行机器码 + brk 堆窗口的 `PROT_NONE` 往返）；`make test-user` 61 → **91 项** PASS；同时补齐仓库缺失的 **`LICENSE`（MIT）**；`kernel/build.rs` 在无清单分支登记默认 `manifest.txt` 为构建输入（修掉「先编内核后出镜像 → 一直无用户态」的缓存陷阱）；里程碑表 v1.0 行标记第一步 ✅ |
+| 2026-10-11 | **新增「CKM 设计提案」（v1.0 之后，规划）** —— 新建 docs/ckm.md：定稿权限模型（单管理员 + 4 能力位 + 7 判定点，凭证只由组件表在 `execve` 时改变）、内核接口（`kernel/src/ckm/` 五模块 + `CKM_ABI_VERSION=1` + 扩展号段 257–259、`SYS_MAX` → 260 + 审计 48 字节/组件状态 64 字节定长记录 + 串口证据格式）、扩展生命周期（四类扩展、八态状态机 + 合法转换表、确定性枚举/加载顺序）；写清与 H-06 的分工（`.ckc` 不重做、P0b = CKM-3、`cpm` → `ckm pkg`）、覆盖层与 KernelSU 元模块的对应、安全模式/恢复环境、CKM-1…CKM-7 分期、8 条故障场景落成断言、非目标与 7 个开放问题；里程碑表新增第十一阶段 |
 | 2026-10-11 | **纯内核化执行（阶段二/四/五部分）**：`libc/`+`user/` 迁入 `userland/` 独立 workspace，内核构建改为「按 `manifest.txt` 内嵌」（无用户态也能构建 + 启动到串口诊断模式），新增 `tools/check-boundary.py` 边界门禁与 `image-kernel`/`test-kernel-only`/`userland-images` 目标；第十阶段由「规划」改为「进行中」，详见 pure-kernel.md 第 8 节 |
 | 2026-10-11 | **新增「纯内核化改造规划」（v0.9 之后，规划）**：新建 docs/pure-kernel.md —— 现状审计 C1–C9（内核构建期嵌套 cargo 构建用户程序、10 处 `include_bytes!` 把 203,280 字节（≈199 KiB）用户态内嵌进内核映像、`fs::init` 硬编码 `/bin`/`/lib`、启动末尾跑用户态自测、ABI 两处镜像、workspace 与测试责任混杂），实测删掉 `libc/`+`user/` 后 `cargo build -p kernel` 退出码 **101**；逐文件迁移清单（内核 83 文件仅 9 个要改；`user/` 33 + `libc/` 7 + `tools`/`tools-go`/`tests` 逐项去向）；六阶段与七条验收标准对照；同步 docs/README、DEVELOPMENT（5.11）、project-structure（第 4 节）与 README |
 | 2026-10-11 | **新增「桌面环境兼容路线」（v1.0 之后，规划）**：新建 docs/desktop.md —— 现状审计（显示/输入/ioctl/设备模型/`/proc`/futex/音频/ACPI 等逐项有据）、用户态与内核侧归属纠正（logind/D-Bus/PipeWire 是用户态，KVM 与桌面前置无关）、被遗漏的地基清单、D0–D5 分层与 QEMU 可断言验收（monitor `sendkey`/`screendump` 实测可用）、里程碑 v1.1–v1.6；同步 roadmap（第九阶段 + 「禁止提前做」项修正）、DEVELOPMENT（5.10）、architecture 第 5 节、project-structure（规划新增目录）与 README |

@@ -72,6 +72,12 @@
   用户态 `ld.so`、版本符号、TLS、`rpath` 仍不做 —— 见 docs/syscall.md 3.9）
 - 完整 TCP/IP 栈（第一版只做基础网络或留到 v0.9 简化实现）
 - 多架构支持（只做 x86_64）
+- **动态内核模块装载**（第一版不做：内核代码出错会直接破坏内存，无法像用户态那样沙箱；
+  CKM 的 `kind=4` 扩展在阶段 7 之前只登记状态、拒不装载，见 [ckm.md](ckm.md) 第 11 节）
+- **Android root 兼容层**（`su`/SELinux/Magisk 模块二进制兼容；CKM 只借鉴 KernelSU 的分层与
+  「系统无损」思想，见 [ckm.md](ckm.md) 第 0/11 节）
+- **把包管理器做成内核子系统**（内核只提供强制权限与组件状态机制；`.ckc` 解析、事务、界面
+  与修复都在用户态服务里，见 [ckm.md](ckm.md) 第 0 节与 [package-manager.md](package-manager.md)）
 
 ## 6. 关键设计决策记录（ADR）
 

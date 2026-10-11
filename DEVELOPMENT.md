@@ -59,7 +59,8 @@
 | H-03 | `mkfs` 工具（FAT12/16/32 镜像生成） | Python | ✅ v0.8（`tools/mkfs/mkfs.py`，mtools 复核） |
 | H-04 | 测试编排服务（并行多场景跑 QEMU 测试） | Go | ✅ v0.4（`tools-go/cmd/testorch`） |
 | H-05 | 串口日志实时收集与分析 | Go | ✅ v0.4（`tools-go/cmd/serialmon`） |
-| H-06 | 包管理器设计与主机侧原型（高效/安全/轻量、Windows 式灵活性参考） | Python（纯标准库） | 🟡 提案 v1 ✅ + **P0a 已落地**（`.ckc` 容器 `tools/pkgmgr/ckc.py`，`make test-pkg` 37 项）；事务/catalog 属 P0b |
+| H-06 | 包管理器设计与主机侧原型（高效/安全/轻量、Windows 式灵活性参考） | Python（纯标准库） | 🟡 提案 v1 ✅ + **P0a 已落地**（`.ckc` 容器 `tools/pkgmgr/ckc.py`，`make test-pkg` 37 项）；事务/catalog 属 P0b（= CKM 阶段 3） |
+| H-07 | **CKM（Cerlesse Kernel Manager）：内核级权限控制与扩展管理**（强制权限模型、受控系统接口、扩展状态与覆盖层、事务/回滚、安全模式与恢复环境） | Rust 内核 + 用户态（`ckmd`/`ckm`）+ Python（主机侧工具） | 📋 **提案 v1（规划）**：三项规格已定稿（权限模型/内核接口/扩展生命周期），实现按 CKM-1…CKM-7，**尚未写代码** —— 见 [docs/ckm.md](docs/ckm.md) |
 
 ### 1.3 非目标（见 architecture.md 第 5 节）
 
@@ -68,6 +69,10 @@ SMP、USB、Wi-Fi、GPU（**3D 加速**）、完整 POSIX、完整动态链接 E
 > v1.0 之后另设**桌面环境兼容路线**（内核侧地基与接口对齐：设备模型/`ioctl`/`poll`/evdev/
 > fbdev→KMS/ALSA 子集/ACPI 子集等），规划与里程碑见 [docs/desktop.md](docs/desktop.md)；
 > 它不改变本文档 v1.0 的范围。
+>
+> v1.0 之后还设 **CKM（内核级权限控制与扩展管理）**：内核提供强制权限与组件状态机制，
+> 事务/包操作/修复由特权用户态服务完成，**不把包管理器放进内核**；第一版不做动态内核模块装载与 GUI。
+> 需求行 H-07，规格见 [docs/ckm.md](docs/ckm.md)（执行上排在桌面路线之前，与它互不阻塞）。
 
 ---
 
@@ -203,7 +208,7 @@ panic = "abort"
 - [x] 用户态脚手架：`libc/`（syscall 封装 + `_start` + `print!/println!` + `#[panic_handler]`）
       + `user/hello` 真实 Rust 用户程序；`kernel/build.rs` 构建期构建/校验/内嵌其 ELF；
       `UserSpace::load_program` 支持多代码页（1..=8）
-- [x] 验收：`make test-user`（19 项 → v0.7 增至 32 → v0.9 增至 61）；`make user` 单独验证脚手架
+- [x] 验收：`make test-user`（19 项 → v0.7 增至 32 → v0.9 增至 61 → v1.0 第一步增至 91）；`make user` 单独验证脚手架
 
 ### 5.4 v0.7 — VFS + RAMFS + ELF ✅（2026-10-11）
 
@@ -228,7 +233,8 @@ panic = "abort"
       **外部程序**在 v0.9 第三步打通（`fork`/`execve`/`wait4`）—— 见下方 v0.9 小节
 - [x] 磁盘文件系统后端（FAT）+ Python mkfs（H-03）→ **v0.8 已落地**（见 v0.8 小节的最后两条）
 - [x] 用户堆 / `brk` / `mmap`（v0.9 第一步）、`argc/argv` 与 `fork`/`execve`/`wait4`（v0.9 第三步）；
-      **剩余**：动态链接、`mprotect`（见 docs/syscall.md 3.4）
+      **剩余**：动态链接、`mprotect` —— 两者均已在后续版本补齐（v0.9 第六步 / v1.0 第一步，
+      见 docs/syscall.md 3.9 / 3.10）
 
 ### v0.8 — Driver + PCI + Disk（已实现并通过验收，2026-10-11）
 - [x] Driver Manager 与驱动注册框架（`kernel/src/driver/driver.rs`）：`Driver` trait（`name`/`matches`/`attach`）、
@@ -288,6 +294,7 @@ panic = "abort"
     - [x] 参考用户程序加入堆自测（零页、模式读回、堆缓冲 `write`、6 个负例、`Vec`/`format!`）
     - [x] 验收：`make test-user` 由 32 项增至 **59 项**（含 `user: heap frame reclamation PASS`）；
           `orchestrate.json` 的 `user` 场景同步；`mprotect` 列入「号已定义但未实现」
+          （已于 v1.0 第一步实现，见 5.7）
 - [x] **运行时前置条件第二步：`stdin` + 交互式 Shell**（2026-10-11 落地）
     - [x] 键盘行缓冲（`driver/keyboard.rs`）：128 字节单行缓冲、行编辑（退格/回显）、`Enter` 交付整行 + `kbd: line ready len=N`
     - [x] `read(0)` 行缓冲语义（`syscall/file.rs::read_stdin`）：整行交付（行尾 `\n`）、3 秒无整行 → `-EAGAIN`(-11)（无进程模型时的权宜之计）
@@ -350,7 +357,8 @@ panic = "abort"
           `make dyn-hostcheck`（**宿主机 glibc `ld.so` 独立复核**同一批 `.s`，两套装载器必须一致）；
           `make test-user` 的帧回收检查覆盖共享库窗口；`test-fs` 20 → **21 项**（新增 `/lib`）、
           `test-programs` 条目数断言 `/`=5、`/bin`=7；`make test-all` 加入 `test-dyn`
-- [ ] `mprotect`（W^X 转换）与文件映射（`mmap` 加 offset）
+- [x] `mprotect`（W^X 转换）→ **2026-10-11 落地（v1.0 第一步，见 5.7）**；
+      `mmap` 加 offset（文件映射）与固定地址放置仍未做
       （动态链接的**完整**形态 —— 用户态 `ld.so`、版本符号、TLS —— 仍不做，见 architecture.md 第 5 节）
 - [ ] 其余用户程序（cp/mv/rm/mkdir/kill）与 Shell 增强（`cd`、管道、重定向）
       （`ls`/`ps`/`cat`/`echo` 已于 2026-10-11 落地，见上）
@@ -361,6 +369,25 @@ panic = "abort"
 
 ### 5.7 v1.0 — 完整可启动类 Linux 小型 OS
 
+- [x] **内存保护属性可在运行期改写：`mprotect`**（2026-10-11 落地，第一步）
+    - [x] ABI 层（`syscall/memory.rs::sys_mprotect`）：页对齐、`len > 0`、未知保护位、
+          `PROT_WRITE|PROT_EXEC`（W^X）—— 每类拒绝都留 `user: mprotect rejected (<reason>)`
+    - [x] 地址空间层（`address_space.rs::mprotect` + `prot_to_flags`/`accessible`）：范围必须落在
+          **同一个**窗口（映像 / brk 堆 / 匿名 mmap / 共享库）且每页已映射；
+          `PROT_NONE` = 清 `USER` 留 `PRESENT`（ring3 #PF、帧与内容保留、内核也不当它用户缓冲）；
+          每次改权限都 `invlpg`；`mmap(PROT_NONE)` 随之变为合法
+    - [x] 堆窗口新增逐页标志位 `heap_flags`（`brk` 增长/收缩与 `fork` 同步维护），
+          `page_flags` 改为「`PRESENT` + `USER` 齐备才算可访问」
+    - [x] 用户态：`libc::mprotect` + `PROT_NONE`；`user/hello` 新增 `mprotect_selftest` ——
+          `PROT_NONE` 关页 → 内核拒收该缓冲（`-EFAULT`）→ 改回 `RW` 内容原样 →
+          换 `RX` 并**真的执行** `mov eax,42; ret`（W^X 的「先写后换只执行」）
+    - [x] 验收：`make test-user` 61 → **91 项** PASS（新增 30 项：4 条 `user: mprotect addr=… -> pages=N`（mmap 窗口
+          `PROT_NONE`/`RW`/`RX` + brk 堆窗口 `PROT_NONE`/`RW`）、两处 `PROT_NONE` 的内核拒收双向证据（`-EFAULT`）、
+          `data kept=1`、`exec ret=42`、6 类拒绝的 errno 与串口原因、`munmap` 照常归还）
+    - [x] 副作用：`syscall_table::UNIMPLEMENTED` 变**空表**（v0.9 起唯一剩下的号是 `mprotect`），
+          `syscall: ENOSYS nr=… name=…` 机制与「号越界」仍保留可区分
+    - [x] 构建侧顺带修复：`kernel/build.rs` 在「清单不存在」分支也把默认 `manifest.txt` 登记为
+          构建输入，避免「先编内核、后出用户态镜像」时内核被永久钉在「无用户态」的旧产物上
 - [ ] 用户/组/权限（`-rwxr-xr-x`、UID/GID）
 - [ ] 进程隔离与 syscall 参数校验强化
 - [ ] 启动链：Kernel → init → Shell → User Programs
@@ -424,7 +451,7 @@ v0.9 记录的两条踩坑（设计记录，非编号缺陷）：debug 构建下
 阶段五 🟡（Makefile 已按责任分层；`orchestrate.json` 拆分、`.ckc` 测试迁出、`git subtree split` 未做）、
 阶段一/三/六 ⬜。实测：无 `userland/` 的 checkout 里 `cargo build -p kernel` 退出码 **0**（改造前 **101**）、
 `make image` 能单独出镜像、`make test-kernel-only` **7/7** PASS；有用户态时 `make image` 内嵌
-**8 程序 + 2 库**，15 个集成场景与 `test-user`(61)/`test-shell`(11)/`test-proc`(8+4)/`test-programs`(17+5)/
+**8 程序 + 2 库**，15 个集成场景与 `test-user`(91)/`test-shell`(11)/`test-proc`(8+4)/`test-programs`(17+5)/
 `test-dyn`(10)/`test-fs`(21) 全部 PASS。
 
 | 阶段 | 目标 | Cargo 配置 / 构建目标 | 验收抓手 |
@@ -442,6 +469,30 @@ v0.9 记录的两条踩坑（设计记录，非编号缺陷）：debug 构建下
 > 阶段四（动用户态源码）**，避免迁移期 ABI 双写漂移。
 
 ---
+
+### 5.12 CKM —— 内核级权限控制与扩展管理（H-07，v1.0 之后，规划）
+
+**来源**：希望 Cerlesse 有「内核级强制权限 + 可插拔扩展 + 故障恢复」的管理体系（分层思想参考 KernelSU，
+但不照搬 Android 的 `su`/SELinux/root 隐藏机制）。**本文档不复制规格**，只记需求、依赖与口径：
+
+见 [docs/ckm.md](docs/ckm.md)（权限模型 / 内核接口 / 扩展生命周期三项已定稿 + CKM-1…CKM-7 分期 + 8 条故障验收）。
+
+- [ ] **CKM-1 内核接口**：`kernel/src/ckm/`（`cred`/`policy`/`state`/`audit`/`api`）+ 判定点
+      （写受保护前缀 / 写状态树 / 读审计 / 策略查询）+ `ckm_policy_query`(257)/`ckm_audit_read`(258)/
+      `ckm_component_state`(259) + 串口证据；**前置：v1.0 的 `security/`（uid/gid + mode）先落地**
+- [ ] **CKM-2 可写持久化 + 覆盖层机制**：原子写/掉电一致的状态区（开放问题 1 定夺后开工）+
+      `overlay_register/unregister`（最长前缀 + 优先级 + 冲突拒绝）
+- [ ] **CKM-3 事务引擎**（= H-06 P0b）：签名/catalog/回执/`recover`/失败注入，验收沿用 package-manager 12.1
+- [ ] **CKM-4 特权服务与 CLI**：`userland/ckmd`（`CAP_CKM_SERVICE`）+ `userland/ckm`（CLI）+ 内核状态树 `/ckm/**`
+- [ ] **CKM-5 系统修改模块**：`kind=3` 覆盖层全量（优先级/冲突/开机顺序/基线保护；停用即撤销）
+- [ ] **CKM-6 恢复环境**：恢复镜像 + 引导菜单/命令行 + 启动失败计数 + 安全模式四件事
+- [ ] **CKM-7 可加载内核模块**：仅登记状态；装载需独立提案（`docs/ckm-kmod.md`）先评审
+- [ ] 验收（第一版必须过）：`make test-ckm`（权限拒绝/覆盖撤销/组件状态确定性）+ `make test-recovery`
+      （连续 3 次启动失败进安全模式 + 恢复环境修复 `ckmd`）+ H-06 的离线回滚/原子失败条目
+
+边界（必须保持）：内核不认识「包」（不解析 `.ckc`、不解压、不比较版本、不做依赖求解、不做界面）；
+`ckmd`/`ckm` 属于 `userland/`（`tools/check-boundary.py` 继续把内核与用户态分开）；
+`.ckc` 包格式不重做（H-06 P0a 直接复用）。
 
 ## 6. 测试方案
 
@@ -492,7 +543,7 @@ qemu-system-x86_64 -machine q35 -m 512M -serial stdio -display none \
 
 | 标签 | 用途 |
 | ---- | ---- |
-| `boot` / `memory` / `interrupt` / `process` / `syscall` / `fs` / `driver` / `network` / `security` | 模块归属 |
+| `boot` / `memory` / `interrupt` / `process` / `syscall` / `fs` / `driver` / `network` / `security` / `ckm` | 模块归属 |
 | `phase:bug` / `phase:feature` / `phase:refactor` / `phase:doc` | 类型 |
 | `host:python` / `host:go` | 主机侧工具 |
 | `blocked:upstream` | 被依赖项阻塞 |
@@ -548,5 +599,7 @@ qemu-system-x86_64 -machine q35 -m 512M -serial stdio -display none \
 | 2026-10-11 | **新增「纯内核化改造规划」（v0.9 之后，规划）**：新建 docs/pure-kernel.md —— 现状审计 C1–C9（内核构建期嵌套 cargo 构建用户程序、10 处 `include_bytes!` 把 203,280 字节（≈199 KiB）用户态内嵌进内核映像、`fs::init` 硬编码 `/bin`/`/lib`、启动末尾跑用户态自测、ABI 两处镜像、workspace/测试责任混杂、`.cargo/config.toml` 不分家）、实测「删掉 `libc/`+`user/` 后 `cargo build -p kernel` 退出码 **101**」、逐文件迁移清单（内核 83 文件仅 9 个要改；`user/` 33 + `libc/` 7 + `tools`/`tools-go`/`tests` 逐项去向）、目标双仓库结构与 Cargo 配置前后对照、六阶段（冻结基线/边界门禁/ABI 单一来源/用户空间迁移/构建测试拆分/接口稳定）与七条验收标准对照表；本文档新增 5.11 与第 3 节注记，同步 roadmap/project-structure/docs-README/README |
 | 2026-10-11 | **README 重写（对外首页，按 readme-generator 创作规范）**：README.md 从 466 行的开发日志改为 157 行的作品级首页 —— 首屏（H1 + 一句定位 + 封面 + 2 个徽章）、这是什么 / 为什么需要它 / 快速开始 / 安装 / 你会得到什么（真实串口片段）/ 工作方式 / 常用命令 / 项目结构 / 文档入口 / 当前状态 / 关于作者 / 许可证；新增 `assets/banner.svg`（1920×1080 深黑 + 暖金名片图，无外部字体与脚本）；逐版本实现记录不再在本文件复述，改由 DEVELOPMENT.md 第 5 节、docs/roadmap.md 与 git 历史承载；同时去掉各测试的「项数」（Makefile 实际断言数与部分文档记载不一致，见 README「常用命令」改为只列命令与断言内容） |
 | 2026-10-11 | **新增「桌面环境兼容路线」（v1.0 之后，规划）**：新建 docs/desktop.md —— 现状审计（逐项有据：显示无/输入无 evdev/无 ioctl-poll/无设备模型与 `/proc`/无音频/无 ACPI/security 占位/fs 只读）、用户态与内核侧归属纠正（logind/D-Bus/PipeWire 是用户态；KVM 与桌面前置无关）、被遗漏的地基（设备模型/`ioctl`/`poll`/file-backed mmap/futex/信号/AF_UNIX/`/proc`+`/sys`/memfd）、D0–D5 分层与 QEMU 可断言验收（monitor `sendkey`/`screendump` 实测可用）、里程碑 v1.1–v1.6；本文档新增 5.10 与 1.3 注记，同步 roadmap/architecture/project-structure/docs-README/README |
+| 2026-10-11 | **v1.0 第一步：`mprotect`**（同时补齐仓库缺失的 `LICENSE`，MIT）—— `syscall/memory.rs` 新增 `sys_mprotect`（页对齐/`len>0`/未知位/W^X 四类拒绝各留一行串口原因），`address_space.rs` 新增 `mprotect` + `UserWindow` + `prot_to_flags` + `accessible`（`PROT_NONE` = 清 `USER` 留 `PRESENT`，每次改权限 `invlpg`）、堆窗口逐页 `heap_flags`（含 `fork`/`brk` 同步）、`mmap(PROT_NONE)` 由拒绝改为合法；`syscall_table` 注册 10 号并把 `UNIMPLEMENTED` 清空；`libc` 新增 `mprotect`/`PROT_NONE`（含 `lib.rs` re-export），`userland/user/hello` 新增 `mprotect_selftest`（`PROT_NONE` → `-EFAULT` → 内容原样 → `RX` 后真的执行机器码；另覆盖 brk 堆窗口）；`make test-user` 61 → **91 项** PASS；`kernel/build.rs` 在无清单分支登记默认 `manifest.txt` 为构建输入（修掉「先编内核后出镜像 → 一直无用户态」的缓存陷阱）；同步 docs/syscall.md（新增 3.10）、docs/api.md（2.6 + 节号顺移 + `test-user` 84）、docs/README.md、docs/roadmap.md、userland/libc/README.md、Makefile 与本文件 §5.7 |
+| 2026-10-11 | **新增「CKM 设计提案」（H-07，v1.0 之后，规划）** —— 新建 docs/ckm.md：定稿**权限模型**（单管理员模型 + 4 个能力位 + 7 个判定点；凭证只能由 CKM 组件表在 `execve` 时改变，因此没有 `su`/`setuid` 路径）、**内核接口**（`kernel/src/ckm/` 五模块分工、`CKM_ABI_VERSION = 1`、扩展号段 257–259 与 `SYS_MAX` 257 → 260、审计 48 字节 / 组件状态 64 字节定长记录、串口证据行格式与事件枚举）、**扩展生命周期**（四类扩展、八态状态机 + 合法转换表、确定性枚举与开机加载顺序）；另含与 H-06 的分工（`.ckc` 不重做、P0b = CKM-3、`cpm` 合并进 `ckm pkg`）、覆盖层与 KernelSU 元模块的对应关系（第一版内置、可插拔为后续）、事务/回滚与恢复环境（安全模式四件事）、CKM-1…CKM-7 分期、8 条故障场景落成断言、非目标与 7 个开放问题；本文档新增 H-07 需求行与 5.12，同步 docs/README、roadmap（第十一阶段）、architecture 第 5 节、project-structure（规划目录）、README（文档入口） |
 
 

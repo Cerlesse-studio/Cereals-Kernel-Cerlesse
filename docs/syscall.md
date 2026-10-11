@@ -8,9 +8,11 @@
   **进程对象 + `fork`/`execve`/`wait4` + `argc`/`argv`**（3.7，外部程序真的能跑了）、
   简化网络栈（drivers.md 1.8）、基础用户程序与目录/进程枚举（3.8）、
   **内核侧最小动态链接**（3.9：`PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`）；
-  `make test-user` 61 项 / `make test-shell` 11 项 / `make test-proc` 8 项 + 4 条正则 /
+  **v1.0 第一步已落地**：`mprotect`（3.10：已映射页的保护属性可在运行期改写，`PROT_NONE`
+  与 W^X 的「先写后换只执行」因此成立）；
+  `make test-user` 91 项 / `make test-shell` 11 项 / `make test-proc` 8 项 + 4 条正则 /
   `make test-programs` 17 项 + 5 条正则 / `make test-dyn` 10 项 / `make test-fs` 21 项 PASS；
-  仍未做：`mprotect`、环境变量（`envp`）、**完整**动态链接（用户态 `ld.so`，见 3.9）
+  仍未做：环境变量（`envp`）、**完整**动态链接（用户态 `ld.so`，见 3.9）、文件映射（`mmap` 加 offset）
 
 > 本文档顶部保留阶段 / 最后更新 / 状态字段，与项目文档维护约定对齐。
 - 依赖：process.md（进程模型）、memory.md（用户地址空间）
@@ -28,7 +30,9 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
    Shell 现在能真的跑起外部程序（见 3.7 与 `docs/process.md` 1.4）。
 6. **v0.9 第五·六步（已做）**：基础用户程序与目录/进程枚举（见 3.8）、
    **内核侧最小动态链接**（见 3.9：`PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`）。
-7. **仍未做**：`mprotect`（W^X 转换）、环境变量（`envp`）、**完整**动态链接（用户态 `ld.so`）。
+7. **v1.0 第一步（已做）**：`mprotect`（见 3.10）—— 已映射页的保护属性可在运行期改写，
+   `PROT_NONE` 与 W^X 的「先 `mmap(RW)` 写、再 `mprotect(RX)` 执行」因此成立。
+8. **仍未做**：环境变量（`envp`）、**完整**动态链接（用户态 `ld.so`）、文件映射（`mmap` 加 offset）。
 
 ## 2. v0.6 实际实现（2026-10-10 落地）
 
@@ -121,11 +125,11 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
 | `sleep`（nanosleep） | 35 | ✅ v0.6 | 以 PIT tick（10ms）为单位等待；期间 `sti; hlt` 让 PIT 继续推进 |
 | `getpid` | 39 | ✅ v0.6 | 返回当前用户程序 PID（串口打印 `user: getpid -> N`） |
 | `exit` | 60 | ✅ v0.6 | 记录退出码并结束用户态执行（不返回） |
-| `mmap` | 9 | ✅ v0.9 第一步 | 匿名映射：只收 `MAP_PRIVATE\|MAP_ANONYMOUS`、`fd` 必须 -1、**只传 5 个参数（无 offset）**；first-fit 落在 256 KiB 的 mmap 窗口；新页**保证全零**；`PROT_WRITE\|PROT_EXEC` 拒绝（W^X）、`PROT_NONE` 拒绝（没有 `mprotect`） |
+| `mmap` | 9 | ✅ v0.9 第一步 | 匿名映射：只收 `MAP_PRIVATE\|MAP_ANONYMOUS`、`fd` 必须 -1、**只传 5 个参数（无 offset）**；first-fit 落在 256 KiB 的 mmap 窗口；新页**保证全零**；`PROT_WRITE\|PROT_EXEC` 拒绝（W^X）；`PROT_NONE` 自 v1.0 起合法（映射存在、帧已分配，但 ring3 不可访问，可由 `mprotect` 启用，见 3.10） |
 | `munmap` | 11 | ✅ v0.9 第一步 | 整段归还：页对齐 + 全段已映射，否则 `-EINVAL`；执行时清页表项 **并 `invlpg`**（否则 TLB 会留下幽灵映射） |
 | `brk` | 12 | ✅ v0.9 第一步 | 增长/收缩堆顶（窗口 256 KiB）；`addr = 0` 只查询；**Linux 语义：不返回错误**，失败返回原值（`ret < addr` 即失败）；增长全成或全不成 |
 | `fork` / `execve` / `wait4` | 57 / 59 / 61 | ✅ v0.9 第三步 | `fork` 复制地址空间与当前用户帧（子进程 `rax=0`、父进程得 PID）；`execve(path, argv)` 换映像并重建 argv 用户栈（**成功不返回**）；`wait4(pid)` 运行并回收直接子进程、返回退出码（非子进程 `-ECHILD`）；详见 3.7 |
-| `mprotect` | 10 | ⬜ 后续 | 已列入「号已定义但未实现」（`syscall_table::UNIMPLEMENTED`）：`PROT_NONE` 的映射与「先写后换只执行」都依赖它 |
+| `mprotect` | 10 | ✅ v1.0 第一步 | 改写**已映射**页的保护属性（页对齐、`len > 0`、范围不跨窗口、每页已映射，缺一即 `-EINVAL`）；`PROT_WRITE\|PROT_EXEC` 仍拒绝（W^X）；`PROT_NONE` 清 `USER` 位而保留 `PRESENT`（帧与内容都在，可改回来）；用户栈固定 `RW`+`NX`，不在支持范围 —— 详见 3.10 |
 
 分发表按 `SYS_MAX`(=256) 排满：未实现的号落在公共 ENOSYS 桩，
 「号合法但未实现」与「号越界」是两种可区分的失败路径。
@@ -327,7 +331,7 @@ user/hello (Rust + libc)
 
 ### 3.3 验收（v0.7，实测）
 
-`make test-user`（v0.7 时 32 项；v0.9 第一步增至 59 项、第三步起 **61 项**，见 3.5）与 `make test-fs`（**21 项**）
+`make test-user`（v0.7 时 32 项；v0.9 第一步增至 59 项、第三步起 61 项、v1.0 第一步起 **91 项**，见 3.5/3.10）与 `make test-fs`（**21 项**）
 串口断言全部 PASS，关键证据：
 
 - [x] **ELF 从文件装载**：`fs: create /init` → `user: program=/init source=elf bytes=15596 segments=4
@@ -356,8 +360,8 @@ user/hello (Rust + libc)
 
 ### 3.4 仍未做（v0.9 起逐步补齐）
 
-- ~~用户堆~~ → **已做**（3.5：`brk`/`mmap`/`munmap` + libc 全局分配器）；仍缺 `mprotect`
-  （`PROT_NONE`、W^X 转换）与文件映射；
+- ~~用户堆~~ → **已做**（3.5：`brk`/`mmap`/`munmap` + libc 全局分配器）；
+  ~~`mprotect`（`PROT_NONE`、W^X 转换）~~ → **已做**（3.10）；仍缺**文件映射**（`mmap` 加 offset）；
 - ~~`stdin`~~ → **已做**（3.6：键盘行缓冲 → `read(0)` 整行交付）；
 - ~~**`fork`/`execve`/`wait4` 与进程对象**~~ → **已做**（3.7）：每进程地址空间 +
   每进程内核栈 + 停在 syscall 里的完整用户帧，Shell 的外部程序（`/bin/hello`）已能跑；
@@ -400,9 +404,9 @@ v0.9 的运行时前置条件按依赖顺序补：**先有可分配的用户内�
 负例也逐条具体（不是「都失败就行」）：文件映射 / `MAP_SHARED` / `PROT_WRITE|PROT_EXEC` /
 未对齐的 `munmap` / 重复 `munmap` → `-EINVAL`(-22)；超过 256 KiB 窗口 → `-ENOMEM`(-12)。
 
-**仍然没有的**（写下来避免误读）：`mprotect`（因此 `PROT_NONE` 与「先写后换只执行」都不支持）、
-文件映射（`mmap` 无 offset 参数、`fd` 必须 -1）、回收式分配器（`dealloc` 是空操作：
-一次运行结束由内核整棵释放；长驻程序的内存占用会单调上升）。
+**仍然没有的**（写下来避免误读）：文件映射（`mmap` 无 offset 参数、`fd` 必须 -1）、
+回收式分配器（`dealloc` 是空操作：一次运行结束由内核整棵释放；长驻程序的内存占用会单调上升）。
+（`mprotect` 已由 v1.0 第一步补上，见 3.10。）
 
 ### 3.6 交互式 Shell 与 stdin（v0.9 第二步，2026-10-11 落地）
 
@@ -604,9 +608,45 @@ v0.9 之前装载器只接受 `ET_EXEC`：ELF 里的地址就是运行地址，�
       两套完全不同的装载器都要跑出相同的两行输出与 `exit(42)`，才说明 ELF 结构 / 机器码 /
       重定位语义是对的（与 `mkfs` + mtools 同一个思路；环境无 binutils/glibc 时跳过）。
 
+### 3.10 `mprotect`（v1.0 第一步，2026-10-11 落地）
+
+v0.9 收官时「号已定义但未实现」的调用只剩 `mprotect`（`syscall_table::UNIMPLEMENTED` 里
+唯一一项，串口上表现为 `syscall: ENOSYS nr=10 name=mprotect`）。它同时是两件事的前提：
+`mmap(PROT_NONE)` 的映射要能再启用，以及 W^X 下的「先写、再换只执行」。本步把它补上后
+**这张表空了**。
+
+| 项 | 实现位置 | 说明 |
+| ---- | ---- | ---- |
+| ABI 校验 | `syscall/memory.rs::sys_mprotect` | 页对齐、`len > 0`、未知保护位、`PROT_WRITE\|PROT_EXEC`（W^X）——每类拒绝都留一行 `user: mprotect rejected (<reason>)` |
+| 页权限改写 | `syscall/address_space.rs::mprotect` | 范围必须落在**同一个窗口**（映像 / brk 堆 / 匿名 mmap / 共享库）且每页都已映射，否则 `-EINVAL`（与 `munmap` 的「整段已映射」同一约定；Linux 这里用 `ENOMEM`） |
+| `PROT_NONE` 的表示 | `prot_to_flags` + `accessible` | 清 `USER` 而保留 `PRESENT`：ring3 访问 → #PF（`error=P\|U`），页帧与内容保留，内核也别想把它当用户缓冲（`page_flags` 返回 `None` → `-EFAULT`） |
+| TLB | `paging::flush_tlb` | 每次改权限都 `invlpg`：不刷就可能继续用「旧的、更宽的权限」访问同一页（与 `munmap` 的幽灵映射同一个坑） |
+| 用户栈 | 不支持（`-EINVAL`） | 它的保护属性（4 页 `RW` + `NX`）由 `UserSpace::new` 一次性定死；拒绝会留串口记录，不静默忽略 |
+
+验收（`make test-user` 新增 30 项断言，总数 61 → **91**）：
+
+- [x] `user: mprotect addr=0x8000070000 len=4096 prot=0x0 -> pages=1`：内核逐页重写页表项，
+      返回被改写的页数（地址是确定的：堆自测的 mmap 已归还，全局分配器的 64 KiB 块占掉前 16 页）；
+- [x] **双向证据**：`PROT_NONE` 之后既 `user: EFAULT write ptr=0x8000070000 len=1`
+      （内核按页校验不再认它）也 `hello: mprotect none write ret=-14`；
+- [x] `hello: mprotect data kept=1`：改回 `RW` 后内容原样（`mprotect` 不搬家、不清零）；
+- [x] `hello: mprotect exec ret=42`：改成 `RX` 后**从这页真的执行**了 `mov eax,42; ret`
+      ——「先写后换只执行」不再是纸面说法（在此之前 `mprotect` 落在 ENOSYS 桩上，这条路不通）；
+- [x] 六类拒绝各自留痕：未页对齐 / `len=0` / 未知保护位 / `W^X`（都是 `-22`，但日志里能区分
+      是哪一条）、未映射的页 `-22`、用户栈 `-22`；
+- [x] **brk 堆窗口同样在支持范围内**（逐页 `heap_flags` 的意义）：`user: mprotect addr=0x8000020000 len=4096 prot=0x0 -> pages=1`
+      → `hello: mprotect heap none write ret=-14` → 改回 `RW` 后 `hello: mprotect heap data kept=1`
+      （堆里第一页的第一个字节是堆自测写入的模式）；
+- [x] `hello: mprotect munmap ret=0`：`mprotect` 过的页帧仍在，`munmap` 照样能整段归还
+      （页帧泄漏检查照旧通过）。
+
+已知边界（写下来避免误读）：只支持上面四个窗口，**不支持** `MAP_FIXED` 式的固定地址放置
+（仍无 `mmap` 的 offset/固定地址能力）、不支持把一整段匿名映射拆成不同权限的分段操作
+（一次调用只针对一段、不跨窗口）。
+
 ## 4. 调用链示例
 
-实际调用链（v0.7 + v0.9 用户堆 / 动态链接）：
+实际调用链（v0.7 + v0.9 用户堆 / 动态链接 + v1.0 `mprotect`）：
 
 ```text
 用户态 syscall 指令
@@ -616,6 +656,7 @@ v0.9 之前装载器只接受 `ET_EXEC`：ELF 里的地址就是运行地址，�
   → file::sys_read/sys_write/sys_open/sys_close
        └─ fs::file（fd 表）→ fs::vfs（挂载表路由）→ fs::ramfs
   → memory::sys_mmap / sys_munmap / sys_brk（用户堆：地址空间窗口 + 页帧分配）
+  → memory::sys_mprotect（已映射页改权限位 + `invlpg`；`PROT_NONE` = 清 USER）
   → process::sys_exit / sys_getpid / sys_sleep / sys_fork / sys_exec / sys_wait / sys_getprocs
        ├─ wait4 → trampoline::run（切到子进程的 CR3 / 内核栈 / 用户帧）→ 子进程 exit → 回收
        └─ getprocs → 进程表快照 → 用户缓冲（`user/ps`）
@@ -656,3 +697,4 @@ fd ≥ 3 一律经 VFS 抽象路由，syscall 层不认识具体后端。
 | 2026-10-11 | **v0.7 落地**：第 3 节从规划改为实现记录 —— ELF Loader（解析/按段权限逐页映射/入口取 `e_entry`）、用户地址布局（映像窗口 64 KiB + 栈 4 页）、段页对齐与 `.lbss` 孤儿段的实测坑、`make user` 的独立 ELF 检查（`tools/check_user_elf.py`）；2.7 填入 `read/open/write/close`（含 fd 表与两条硬规则）；2.10 标注 v0.7 已做项；4 节更新调用链；3.4 列出仍未做项（用户堆/`argc/argv`/`fork` 系/动态链接） |
 | 2026-10-11 | **v0.9 第五步：基础用户程序（`ls`/`cat`/`echo`/`ps`）与目录/进程枚举** —— 新增 3.8；新增 `syscall/dir.rs`（`getdents = 78`，定长 88 字节记录、VFS `list()` 转发、截断语义与 `-EINVAL` 边界）与 `syscall/process.rs::sys_getprocs`（**扩展号段 256**，定长 40 字节记录）；`syscall_table.rs` 的 `SYS_MAX` 256 → 257，并写明「`0..=255` = Linux 语义、`>= 256` = Cerlesse 扩展」；`process/process.rs` 新增定长 `comm: [u8; 16]`（`create` 填充、`execve` 改写为程序名），顶层程序运行前置为 `RUNNING`；`libc` 新增 `getdents`/`getprocs` 与 `dirent_*`/`procinfo_*` 解析器；新增 `user/{ls,cat,echo,ps}` 四个程序（`kernel/build.rs`/`workspace`/`fs::init` 清单 3 → 7）；Shell 的帮助文本补上四个程序并说明「内建遮蔽同名程序」；新增 `make test-programs`（17 项 + 5 条正则）与编排 `programs` 场景（场景数 **13 → 14**）；`make test-proc` 的负例由 `ls` 改为 `foo`（`/bin/ls` 已存在，不能再当“找不到的程序”） |
 | 2026-10-11 | **v0.9 第六步：内核侧最小动态链接** —— 新增 3.9；`syscall/elf.rs::load` 按 `e_type` 分流（`ET_DYN` → 新增 `syscall/dynamic.rs`，`ET_EXEC` 路径不变）；`address_space.rs` 新增共享库窗口（`USER_DYN_BASE` = 基址 + 1 MiB、32 页）与 `map_dyn_page`/`dyn_page_count`/`phys_of`（内核 CR3 下写重定位），`fork` 复制窗口、`page_flags` 认可该窗口、`Drop` 整树释放；`dynamic.rs` 解析 `PT_INTERP`/`PT_DYNAMIC`/`DT_NEEDED`（`/lib/<name>` 递归装载，上限 8 个对象）并应用 `R_X86_64_RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`R_X86_64_64`（按名字线性扫描 `.dynsym`；`DT_PLTREL=REL` 明确拒绝）；新增夹具 `user/dynhello/`（`as`+`ld` 现编，`kernel/build.rs` 内嵌）与 RAMFS `/lib`（`fs::init` 新增 `libraries` 参数，程序清单 7 → 8）；新增 `make test-dyn`（10 项）与 `make dyn-hostcheck`（宿主 glibc 独立复核），`make test-fs` 20 → 21 项、`test-programs` 的 `/` 与 `/bin` 条目数同步 5/7；3.8 的条目数断言与 3.1 的地址布局/`ET_EXEC` 说明同步更新 |
+| 2026-10-11 | **v1.0 第一步：`mprotect`（运行时改保护属性）** —— 新增 3.10；`syscall/memory.rs` 新增 `sys_mprotect`（页对齐/`len>0`/未知位/`W^X` 四类 ABI 拒绝，每类留一行 `user: mprotect rejected (<reason>)`）+ `mmap(PROT_NONE)` 由拒绝改为合法；`address_space.rs` 新增 `mprotect`（范围须在同一窗口、每页已映射，否则 `-EINVAL`；`PROT_NONE` = 清 `USER` 留 `PRESENT`）、`UserWindow`、`prot_to_flags`、`accessible`（`PRESENT`+`USER` 齐备才算可访问）与 `set_page_flags`（改权限即 `invlpg`），堆窗口新增逐页 `heap_flags`（`brk` 增长/收缩与 `fork` 同步，`page_flags` 据此判断堆页）；`syscall_table` 注册 10 号、`UNIMPLEMENTED` 因此**空表**（`mod.rs` 的打印注释同步）；`libc` 新增 `mprotect`/`PROT_NONE`（`lib.rs` re-export）；`user/hello` 新增 `mprotect_selftest`（`PROT_NONE` → 内核拒收 `-EFAULT` → 内容原样 → `RX` 后真的执行机器码 → 6 个负例 → `munmap` 照常归还）；`make test-user` 61 → **91 项** PASS（含 brk 堆窗口的 `PROT_NONE` 往返）；头部状态与 2.7 表、1、3.4/3.5 的「未做」清单同步 |

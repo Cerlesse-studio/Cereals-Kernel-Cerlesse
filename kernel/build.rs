@@ -66,6 +66,12 @@ fn main() {
     match resolve_userland_dir(&root) {
         Some(userland) => embed(&userland, &out_dir),
         None => {
+            // 把**默认**清单路径也登记成输入。「先编内核、后出用户态镜像」确实会发生
+            // （开发者的手顺 / 增量构建），而 cargo 只按已登记的输入判断要不要重跑本脚本：
+            // 不登记这一条，清单从无到有时内核不会被重新构建，上面那句 warning 就一直是
+            // 旧产物里的状态（表现为 `make test-user` 报 `user: no userland images embedded`）。
+            // 登记一个当时还不存在的路径是允许的，它一旦被创建就会触发重跑。
+            println!("cargo:rerun-if-changed={DEFAULT_USERLAND_DIR}/{MANIFEST}");
             write_generated(&out_dir, &[], &[]);
             println!(
                 "cargo:warning=no userland images ({DEFAULT_USERLAND_DIR}/{MANIFEST} not found): \

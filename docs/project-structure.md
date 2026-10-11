@@ -100,7 +100,7 @@ Cerlesse/
 | `kernel/src/arch/x86_64/port.rs` | 端口 I/O 统一入口：`inb/inw/inl` + `outb/outw/outl`（PCI 配置空间与 legacy virtio 寄存器窗口依赖 32 位读写） | v0.8 ✅ |
 | `kernel/src/ipc/` | 管道、通道、共享内存 | v0.5+ |
 | `kernel/src/network/` | 以太网 → IP → TCP/UDP → Socket | v0.9 |
-| `kernel/src/security/` | 权限、凭证、Capability | v1.0 |
+| `kernel/src/security/` | 权限、凭证（uid/gid）、文件 mode 判定；**能力位与 CKM 判定点见 `kernel/src/ckm/`**（规划） | v1.0 |
 | `userland/` | **用户态独立 workspace**（不属于内核）：`libc/`（运行时）+ `user/*`（程序）+ `Makefile`（构建 + ELF 校验 + `manifest.txt`）+ `.cargo/config.toml`（large 代码模型只对用户态生效）；与内核的唯一接触面是 `build/userland/images/` | 纯内核化 ✅ |
 | `userland/libc/` | 最小用户态运行时：syscall 封装（含 `open/read/close`、`brk/mmap/munmap` 与 `fork/execve/wait4`）、`_start`（入口寄存器 `argc`/`argv`）、`print!/println!`、panic handler、`heap`（`#[global_allocator]`）、`args` | v0.6 ✅ / v0.7 ✅ / v0.9 ✅ |
 | `userland/user/` | 用户程序（`hello` ✅ v0.6/v0.7 → `/init`；`shell` ✅ v0.9 → `/bin/sh`；`hello-bin` ✅ v0.9 第三步 → `/bin/hello`（外部程序）；**`ls` / `cat` / `echo` / `ps` ✅ v0.9 第五步 → `/bin/*`**；**`dynhello/` ✅ v0.9 第六步 —— 不是 Rust crate，而是 `as`+`ld` 现编的动态链接夹具 → `/bin/dynhello` + `/lib/{ld.so,libgreet.so}`**；`init/` 仍为占位） | v0.6–v0.9 |
@@ -122,6 +122,22 @@ Cerlesse/
 | `kernel/src/sound/` | ALSA 用户接口子集 + 驱动 | D3 |
 | `kernel/src/acpi/` | FADT/MADT 解析、S5、热区/电池桩 | D4 |
 | `kernel/src/ipc/{unix,eventfd,memfd}.rs` | AF_UNIX/`SO_PEERCRED`、eventfd/timerfd、memfd | D0/D4 |
+
+### 3.1 CKM 规划新增（第十一阶段，尚未创建）
+
+CKM（内核级权限控制与扩展管理，见 [ckm.md](ckm.md)）预计新开以下目录；**当前都还不存在**，
+按 CKM-1…CKM-7 分期创建并回填：
+
+| 规划目录 | 职责 | 分期 |
+| ---- | ---- | ---- |
+| `kernel/src/ckm/{mod,cred,policy,state,audit,api}.rs` | CKM Core：能力位与凭证、判定点、组件状态表、审计环、给 `syscall/` 的唯一入口 | CKM-1 |
+| `kernel/src/security/{credential,permission}.rs` | 凭证（uid/gid）与文件 mode 判定（v1.0 先落地，CKM 的**下层**，不重复实现） | v1.0 |
+| `userland/ckmd/` | CKM Service：事务、包操作、签名校验、修复回滚（持 `CAP_CKM_SERVICE`） | CKM-4 |
+| `userland/ckm/` | CKM Manager：CLI（`ckm state`/`ckm audit`/`ckm pkg …`/`ckm enter-safe-mode`） | CKM-4 |
+| `tools/recovery/`（或并入 `tools/image-builder`） | 恢复镜像与启动失败计数的构建期支持 | CKM-6 |
+
+> 边界：CKM Core 是内核机制（`tools/check-boundary.py` 的门禁继续生效），
+> `ckmd`/`ckm` 必须进 `userland/`；内核不认识 `.ckc`，也不解析扩展清单。
 
 ## 4. 纯内核化（已执行大部分，见 [pure-kernel.md](pure-kernel.md) 第 8 节）
 

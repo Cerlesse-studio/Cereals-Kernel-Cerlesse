@@ -71,7 +71,7 @@ make -C userland clean
 
 ```bash
 make image            # 先出用户态镜像，再编内核（按清单内嵌），最后组装磁盘镜像
-make test-user        # 61 项：ELF 装载 / ring3 syscall / 用户堆 / 隔离 / Shell
+make test-user        # 91 项：ELF 装载 / ring3 syscall / 用户堆 / mprotect / 隔离 / Shell
 make test-shell test-proc test-programs test-dyn
 ```
 
@@ -79,7 +79,7 @@ make test-shell test-proc test-programs test-dyn
 
 | 目标 | 用户态侧证据 |
 | ---- | ---- |
-| `make test-user`（61 项） | `/init` 从 RAMFS 装载、`exit(42)`、用户堆、页帧回收、隔离探针 |
+| `make test-user`（91 项） | `/init` 从 RAMFS 装载、`exit(42)`、用户堆、`mprotect`（`PROT_NONE`/`RX` 转换 + 真的执行机器码）、页帧回收、隔离探针 |
 | `make test-shell`（11 项） | 键盘 → 行缓冲 → `/bin/sh` → 内建命令 |
 | `make test-proc`（8 项 + 4 正则） | `fork`/`execve`/`wait4` + `argv`（`/bin/hello`、`ENOENT` → 127） |
 | `make test-programs`（17 项 + 5 正则） | `/bin/{ls,cat,echo,ps}` 真的被 exec 起来 |
@@ -91,3 +91,4 @@ make test-shell test-proc test-programs test-dyn
 | 日期 | 变更 |
 | ---- | ---- |
 | 2026-10-11 | 创建本 workspace：`libc/` 与 `user/` 从内核仓库根移入（保留 git 历史），独立 `Cargo.toml`（含 `user-release` profile）与 `.cargo/config.toml`（`code-model=large` 只对用户态生效）；构建入口 `Makefile`（`images`/`check`/`dyn`/`dyn-hostcheck`）产出 `build/userland/images/manifest.txt`；动态链接夹具与 `dyn-hostcheck` 从内核仓库搬来；新增 `tools/check_dyn_fixture.py` |
+| 2026-10-11 | **v1.0 第一步：`mprotect`** —— `libc` 新增 `mprotect`/`PROT_NONE`（`lib.rs` re-export，`syscall.rs` 文档同步）；`user/hello` 新增 `mprotect_selftest`（`PROT_NONE` → 内核拒收该缓冲 `-EFAULT` → 改回 `RW` 内容原样 → 换 `RX` 后真的执行 `mov eax,42; ret`，另覆盖 brk 堆窗口与 6 类拒绝）；`make test-user` 61 → **91 项** |

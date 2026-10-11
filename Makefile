@@ -46,7 +46,7 @@ help:
 	@echo "  test-scheduler - v0.5: assert >=3 kernel tasks rotate under PIT time slices"
 	@echo "  test-ipc - v0.5: assert pipe create/write/read summary logs + selftest"
 	@echo "  test-fs - v0.7: assert VFS mount routing + RAMFS read/write/ls + negative errno cases"
-	@echo "  test-user - v0.7/v0.9: assert ELF loaded from RAMFS + ring3 file syscalls + user heap + isolation + shell"
+	@echo "  test-user - v0.7/v0.9/v1.0: assert ELF loaded from RAMFS + ring3 file syscalls + user heap + mprotect + isolation + shell"
 	@echo "  test-driver - v0.8: assert PCI enumeration + driver probe + virtio-blk sector read/write"
 	@echo "  fat-image - v0.8: build the FAT test volume (tools/mkfs/mkfs.py from tests/fatroot/data)"
 	@echo "  test-fat - v0.8: assert FAT16/32 on disk mounted in VFS: read/ls/LFN/multi-cluster/EROFS"
@@ -236,6 +236,21 @@ test-fs: image
 #   - `hello: static counter=1`：RW 段对 ring3 可写（v0.6 会 #PF）；
 #   - `user: EFAULT write ptr=0xdead00000000` / `bad write ret=-14`：用户指针被校验；
 #   - `FAULT cr2=0x2000000 error=0x5`：越权读内核页被拦下（error 变了说明触发的不是权限违例）。
+#
+# v1.0 第一步追加**`mprotect`**（运行时改保护属性，61 → 91 项）：断言的是「改完之后内核/硬件真的变了」，
+# 而不是「调用返回 0」：
+#   - `user: mprotect addr=0x8000070000 len=4096 prot=0x0 -> pages=1`：内核逐页改页表项
+#     （地址确定：堆自测的 mmap 已归还，全局分配器的 64 KiB 块占掉了前 16 页）；
+#   - `user: EFAULT write ptr=0x8000070000 len=1` + `hello: mprotect none write ret=-14`：
+#     `PROT_NONE` 的页**既**对 ring3 不可访问，**也**不再被当成合法用户缓冲 —— 这是「权限位
+#     真的改了」的双向证据；
+#   - `hello: mprotect data kept=1`：改回 `RW` 后内容原样（`mprotect` 不搬家、不清零）；
+#   - `hello: mprotect exec ret=42`：换成 `RX` 后**从这页真的执行**了 `mov eax,42; ret`
+#     —— W^X 的「先写、再换只执行」（在此之前 `mprotect` 落在 ENOSYS 桩上，这条路不通）；
+#   - 6 类拒绝各自的 errno 与串口原因：未页对齐 / `len=0` / 未知保护位 / `W^X`（都是 -22，
+#     但日志里能区分是哪一条）、未映射的页 -22、用户栈 -22（栈的保护属性由内核定死）；
+#   - `user: mprotect addr=0x8000020000 …` + `hello: mprotect heap data kept=1`：brk 堆窗口同样在支持
+#     范围内（逐页 `heap_flags` 的意义），`munmap` 与页帧泄漏检查照旧通过。
 test-user: image
 	$(PYTHON) tests/test_boot.py \
 		--serial-log $(BUILD)/serial-user.log \
@@ -287,6 +302,36 @@ test-user: image
 		--expect "hello: vec len=200 sum=20100" \
 		--expect "hello: heap string bytes=200" \
 		--expect "hello: heap PASS=1" \
+		--expect "user: mprotect addr=0x8000070000 len=4096 prot=0x0 -> pages=1" \
+		--expect "hello: mprotect none ret=0" \
+		--expect "user: EFAULT write ptr=0x8000070000 len=1" \
+		--expect "hello: mprotect none write ret=-14" \
+		--expect "user: mprotect addr=0x8000070000 len=4096 prot=0x3 -> pages=1" \
+		--expect "hello: mprotect rw ret=0" \
+		--expect "hello: mprotect data kept=1" \
+		--expect "user: mprotect addr=0x8000070000 len=4096 prot=0x5 -> pages=1" \
+		--expect "hello: mprotect rx ret=0" \
+		--expect "hello: mprotect exec ret=42" \
+		--expect "user: mprotect rejected (addr is not page-aligned)" \
+		--expect "hello: mprotect misaligned ret=-22" \
+		--expect "user: mprotect rejected (len=0)" \
+		--expect "hello: mprotect len0 ret=-22" \
+		--expect "user: mprotect rejected (unknown PROT bits)" \
+		--expect "hello: mprotect unknown prot ret=-22" \
+		--expect "user: mprotect rejected (PROT_WRITE|PROT_EXEC is not allowed (W^X))" \
+		--expect "hello: mprotect wx ret=-22" \
+		--expect "user: mprotect errno=22 addr=0x8000071000 len=4096" \
+		--expect "hello: mprotect unmapped ret=-22" \
+		--expect "hello: mprotect stack ret=-22" \
+		--expect "user: mprotect addr=0x8000020000 len=4096 prot=0x0 -> pages=1" \
+		--expect "hello: mprotect heap none ret=0" \
+		--expect "user: EFAULT write ptr=0x8000020000 len=1" \
+		--expect "hello: mprotect heap none write ret=-14" \
+		--expect "user: mprotect addr=0x8000020000 len=4096 prot=0x3 -> pages=1" \
+		--expect "hello: mprotect heap back ret=0" \
+		--expect "hello: mprotect heap data kept=1" \
+		--expect "hello: mprotect munmap ret=0" \
+		--expect "hello: mprotect PASS=1" \
 		--expect "user: sleep ticks=2" \
 		--expect "user: sleep done ticks=2" \
 		--expect "user: exit code=42" \
