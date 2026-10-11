@@ -436,6 +436,166 @@ pub fn procinfo_name(buf: &[u8], index: usize) -> &str {
     }
 }
 
+// ---------------------------------------------------------------- 存储卷表（CSS-1）
+
+/// `storage_volumes` 的系统调用号（CSS-1；号段见 `docs/storage.md` 6.3）。
+pub const SYS_STORAGE_VOLUMES: u64 = 261;
+/// `storage_rescan` 的系统调用号（CSS-1）。
+pub const SYS_STORAGE_RESCAN: u64 = 265;
+/// 单条卷记录的字节数（必须与内核 `storage::volume::VOLUME_RECORD_SIZE` 一致）。
+pub const VOLUME_RECORD_SIZE: usize = 64;
+/// `vol_id` 字段里可读字符的上限（记录占 16 字节：15 字符 + NUL）。
+pub const VOLUME_ID_MAX: usize = 15;
+/// 卷标字段容量（11 字节，FAT 风格）。
+pub const VOLUME_LABEL_MAX: usize = 11;
+/// `free_bytes` 的 unknown 哨兵（内核用 `u64::MAX`：0 会让「盘满」与「没实现」分不开）。
+pub const VOLUME_FREE_UNKNOWN: u64 = u64::MAX;
+/// `storage_rescan` 的「全部设备」下标。
+pub const STORAGE_RESCAN_ALL: u32 = u32::MAX;
+
+/// `storage_volumes(buf, out_count)`：导出卷表快照，返回**实际写入的记录数**。
+///
+/// 记录布局（内核 `storage/volume.rs::write_record` 是权威定义，这里只读）：
+///
+/// ```text
+///  0  id(16, NUL 填充)      16  disk_id(u16 LE)   18  part_index(1)
+/// 19  fs_kind(1)            20  read_only(1)       21  health(1)
+/// 22  flags(u16 LE)         24  letter(1)          25  label(11)
+/// 36  uuid(4)               40  total_bytes(u64 LE)
+/// 48  free_bytes(u64 LE)    56  mounts(u32 LE)     60  reserved(4, = 0)
+/// ```
+///
+/// `flags` 位：0 可移动介质 / 1 有卷自带 UUID / 2 `free_bytes` 未知 / 3 卷标被截断。
+///
+/// `buf` 至少要装下一条记录（否则内核返回 `-EINVAL`）；装不下的部分被**整条**截断，
+/// `out_count` 回填**总卷数**（先问大小、再决定缓冲）。枚举顺序是确定性的：
+/// 磁盘升序 → 分区升序 → `vol_id` 升序。
+pub fn storage_volumes(buf: &mut [u8], out_count: Option<&mut u64>) -> isize {
+    let count_ptr = match out_count {
+        Some(slot) => slot as *mut u64 as u64,
+        None => 0,
+    };
+    unsafe {
+        raw(
+            SYS_STORAGE_VOLUMES,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            count_ptr,
+            0,
+            0,
+        )
+    }
+}
+
+/// `storage_rescan(disk)`：重扫一块盘（`STORAGE_RESCAN_ALL` = 全部），返回重扫后的卷数。
+///
+/// CSS-1 里这是受控动作（CKM 落地后需要 `CAP_STORAGE_ADMIN`，见 `docs/storage.md`）。
+pub fn storage_rescan(disk: u32) -> isize {
+    unsafe { raw(SYS_STORAGE_RESCAN, disk as u64, 0, 0, 0, 0) }
+}
+
+/// 第 `index` 条卷记录的稳定标识（`fs:…` / `pt:…` / `raw:…`）。
+pub fn volume_id(buf: &[u8], index: usize) -> &str {
+    let Some(rec) = record(buf, index, VOLUME_RECORD_SIZE) else {
+        return "";
+    };
+    match rec.get(..VOLUME_ID_MAX + 1) {
+        Some(bytes) => {
+            let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            core::str::from_utf8(&bytes[..len]).unwrap_or("?")
+        }
+        None => "",
+    }
+}
+
+/// 第 `index` 条卷记录所属的块设备号。
+pub fn volume_disk(buf: &[u8], index: usize) -> u16 {
+    record(buf, index, VOLUME_RECORD_SIZE).map_or(0, |rec| u16::from_le_bytes([rec[16], rec[17]]))
+}
+
+/// 第 `index` 条卷记录的分区号（0 = 无分区表的整盘）。
+pub fn volume_part(buf: &[u8], index: usize) -> u8 {
+    record(buf, index, VOLUME_RECORD_SIZE).map_or(0, |rec| rec[18])
+}
+
+/// 第 `index` 条卷记录的文件系统短名（与内核 `FsKind::name()` 同一批字串）。
+pub fn volume_fs(buf: &[u8], index: usize) -> &'static str {
+    match record(buf, index, VOLUME_RECORD_SIZE).map(|rec| rec[19]) {
+        Some(1) => "fat12",
+        Some(2) => "fat16",
+        Some(3) => "fat32",
+        Some(4) => "exfat",
+        Some(5) => "ext2",
+        Some(6) => "ext4",
+        Some(7) => "ntfs",
+        Some(8) => "iso9660",
+        _ => "unsupported",
+    }
+}
+
+/// 第 `index` 条卷记录的只读原因（`rw` / `ro-backend` / `ro-mount` / `ro-device` / `ro-dirty`）。
+pub fn volume_read_only(buf: &[u8], index: usize) -> &'static str {
+    match record(buf, index, VOLUME_RECORD_SIZE).map(|rec| rec[20]) {
+        Some(1) => "ro-backend",
+        Some(2) => "ro-mount",
+        Some(3) => "ro-device",
+        Some(4) => "ro-dirty",
+        _ => "rw",
+    }
+}
+
+/// 第 `index` 条卷记录的健康状态（`ok` / `degraded` / `offline` / `unsupported`）。
+pub fn volume_health(buf: &[u8], index: usize) -> &'static str {
+    match record(buf, index, VOLUME_RECORD_SIZE).map(|rec| rec[21]) {
+        Some(1) => "degraded",
+        Some(2) => "offline",
+        Some(3) => "unsupported",
+        _ => "ok",
+    }
+}
+
+/// 第 `index` 条卷记录的卷标（空卷标返回空串；被截断时 [`volume_label_truncated`] 为真）。
+pub fn volume_label(buf: &[u8], index: usize) -> &str {
+    let Some(rec) = record(buf, index, VOLUME_RECORD_SIZE) else {
+        return "";
+    };
+    let bytes = &rec[25..25 + VOLUME_LABEL_MAX];
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    core::str::from_utf8(&bytes[..len]).unwrap_or("?")
+}
+
+/// 卷标是否被截断（音量太大而 11 字节装不下）。
+pub fn volume_label_truncated(buf: &[u8], index: usize) -> bool {
+    record(buf, index, VOLUME_RECORD_SIZE).map_or(false, |rec| rec[22] & 0b1000 != 0)
+}
+
+/// 容量（字节）。
+pub fn volume_total_bytes(buf: &[u8], index: usize) -> u64 {
+    match record(buf, index, VOLUME_RECORD_SIZE) {
+        Some(rec) => u64::from_le_bytes(rec[40..48].try_into().unwrap_or([0; 8])),
+        None => 0,
+    }
+}
+
+/// 可用容量（字节）；`None` = 未知（内核的 `free_bytes` 哨兵）。
+pub fn volume_free_bytes(buf: &[u8], index: usize) -> Option<u64> {
+    let rec = record(buf, index, VOLUME_RECORD_SIZE)?;
+    let value = u64::from_le_bytes(rec[48..56].try_into().ok()?);
+    if value == VOLUME_FREE_UNKNOWN {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// 当前挂载点数（CSS-1 恒 0：挂载表还没接到卷身份上）。
+pub fn volume_mounts(buf: &[u8], index: usize) -> u32 {
+    match record(buf, index, VOLUME_RECORD_SIZE) {
+        Some(rec) => u32::from_le_bytes(rec[56..60].try_into().unwrap_or([0; 4])),
+        None => 0,
+    }
+}
+
 /// `exit(code)`：结束当前进程并把退出码交回内核。
 ///
 /// 顶层程序（`/init`、`/bin/sh`）结束后控制权回到内核运行驱动；

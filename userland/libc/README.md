@@ -285,3 +285,33 @@ let _ = DIRENT_SIZE;
 2. `getprocs` 枚举的是**进程表槽位顺序**，不承诺按 PID 排序（`user/ps` 因此不做排序）。
    `getprocs` 是 **Cerlesse 扩展号段（编号 256）** 的调用：Linux x86_64 没有它
    （它的 `ps` 读 `/proc`，而本内核的 VFS 还没有虚拟文件）。
+
+## 9. 存储卷枚举（CSS-1）
+
+`storage_volumes` 把内核的**卷表**写成定长记录（64 字节/条），是 `getdents`/`getprocs` 同一套做法：
+调用方给缓冲，返回写入条数；`total` 出参用来先问「总共有多少条」再决定缓冲。
+偏移不要自己算 —— 本层提供解析器，权威定义在内核侧（`storage/volume.rs`）。
+
+| 调用 | 记录 | 解析器 |
+| ---- | ---- | ---- |
+| `storage_volumes(buf, out_count: Option<&mut u64>) -> isize` | 64 字节：`id`(16) + `disk`(u16) + `part`(u8) + `fs`(u8) + `read_only`(u8) + `health`(u8) + `flags`(u16) + `letter`(u8) + `label`(11) + `uuid`(4) + `total_bytes`(u64) + `free_bytes`(u64) + `mounts`(u32) | `volume_id(buf, i)` / `volume_disk` / `volume_part` / `volume_fs` / `volume_read_only` / `volume_health` / `volume_label` / `volume_total_bytes` / `volume_free_bytes` / `volume_mounts` |
+
+参考实现是 [user/volumes](../user/volumes)：
+
+```rust
+use libc::{storage_volumes, println, volume_fs, volume_health, volume_label};
+
+let mut buf = [0u8; 64 * 8];
+let mut total = 0u64;
+let n = storage_volumes(&mut buf, Some(&mut total));
+if n < 0 {
+    println!("volumes: errno {}", n);
+} else {
+    for i in 0..n as usize {
+        println!("{} {} {}", volume_label(&buf, i), volume_fs(&buf, i), volume_health(&buf, i));
+    }
+}
+```
+
+注意：缓冲至少要有**一条记录**（64 字节），否则内核返回 `-EINVAL`；
+枚举顺序是**确定性的**（`disk` 升序 → `part` 升序 → `id` 字节序升序），因此同一镜像两次调用逐字节相同。

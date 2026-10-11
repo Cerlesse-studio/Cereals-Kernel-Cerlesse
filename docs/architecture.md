@@ -78,6 +78,10 @@
   「系统无损」思想，见 [ckm.md](ckm.md) 第 0/11 节）
 - **把包管理器做成内核子系统**（内核只提供强制权限与组件状态机制；`.ckc` 解析、事务、界面
   与修复都在用户态服务里，见 [ckm.md](ckm.md) 第 0 节与 [package-manager.md](package-manager.md)）
+- **写分区表 / 无损调整分区 / RAID / LVM / 加密卷 / 快照**（CSS 第一版只做 GPT/MBR **只读**扫描 +
+  卷管理与挂载；写表与卷管理层之上的功能留到 CSS 之后，见 [storage.md](storage.md) 第 11 节）
+- **把盘符判断写进文件系统驱动**（架构性非目标：`C:`/`D:` 属于**卷管理**层，`fs/*` 只实现
+  `FileSystem`；Windows 式路径由用户态库重写为 POSIX 路径，见 [storage.md](storage.md) 第 0/4 节）
 
 ## 6. 关键设计决策记录（ADR）
 

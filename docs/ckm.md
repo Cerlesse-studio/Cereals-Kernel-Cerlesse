@@ -9,6 +9,7 @@
   [docs/package-manager.md](./package-manager.md)（`.ckc` 包格式与事务，CKM 的包格式层）·
   [docs/architecture.md](./architecture.md)（第 5 节非目标）· [docs/pure-kernel.md](./pure-kernel.md)（内核/用户态边界）·
   [docs/filesystem.md](./filesystem.md)（VFS/RAMFS/FAT 现状）· [docs/syscall.md](./syscall.md)（syscall ABI 与用户程序约束）·
+  [docs/storage.md](./storage.md)（**CSS**：卷/盘符/挂载与存储管理，CKM 的存储子系统）·
   [docs/project-structure.md](./project-structure.md)（目录归属）
 
 > 本文档顶部保留阶段 / 最后更新 / 状态字段，与项目文档维护约定对齐。
@@ -69,10 +70,11 @@ Cerlesse Kernel                  进程、内存、syscall、VFS、驱动、调�
 | ---- | ---- | ---- | ---- |
 | 凭证 / 权限 / 能力 | **全是 2 行占位**：`kernel/src/security/{credential,permission,capability}.rs` 只有 `//!` 与 `// TODO(v1.0)` | 文件本身；`docs/project-structure.md` 标 `security/` = v1.0 | ✅ 阶段 1 的下层（v1.0 先做 uid/gid + 文件 mode） |
 | 文件权限 | VFS 已有 `perms` 展示（`fs: stat … perms=-rw-r--r--`），但**没有 UID/GID 判定**、没有 `EACCES`/`EPERM` 路径 | `docs/filesystem.md`；`make test-fs` 断言里只有展示 | ✅ 判定点 1 |
-| 可写持久化 | RAMFS 在内存里、**FAT12/16/32 后端只读**（写 = `EROFS`） | `docs/filesystem.md` 3.x、`fs/fat.rs` 模块文档 | ✅ 阶段 2 的前置（扩展状态/回执/store 都要落盘） |
+| 可写持久化 | RAMFS 在内存里、**FAT12/16/32 后端只读**（写 = `EROFS`） | `docs/filesystem.md` 3.x、`fs/fat.rs` 模块文档 | ✅ 阶段 2 的前置（扩展状态/回执/store 都要落盘；**同时也是 CSS 字母表/卷标偏好的落点**，见 storage.md 6.6） |
+| 分区 / 卷 / 盘符 | **完全没有**：块设备按**整盘绝对 LBA** 寻址、挂载点写死在 `fs::mount_disks()`（`dev0→/disk`、`dev1→/mnt/fat`，且只挂 FAT）、Shell 提示符里的 `C:` 是常量字符串 | `driver/block.rs`、`fs/mod.rs`、`docs/storage.md` 第 2 节 | ✅ 归 **CSS**（存储管理）；CKM 只提供它的权限判定与状态持久化，不重复实现卷表 |
 | 扩展包格式 | `.ckc` 容器 + 确定性打包 + payload 哈希 + 打包期规则**已落地**（P0a，`make test-pkg` 37 项） | `docs/package-manager.md` 3.2 / 11.1 | ✅ 直接复用，**不重做**（见 2.2） |
 | `.ckc` 的事务/回执/目录 | **未做**（P0b：`cpm.py`、catalog 签名、事务日志、`rollback`/`recover`） | `docs/package-manager.md` 11.1 | ✅ = CKM 阶段 3 的交付物 |
-| syscall 扩展号段 | `0..=255` = Linux 语义，`>= 256` = Cerlesse 扩展；当前只用了 `getprocs = 256`，`SYS_MAX = 257` | `docs/syscall.md` 3.8、`syscall_table.rs` | ✅ CKM 从 257 起编号（4.3） |
+| syscall 扩展号段 | `0..=255` = Linux 语义，`>= 256` = Cerlesse 扩展；已用 `getprocs = 256` 与 CSS-1 的 `storage_volumes = 261`/`storage_rescan = 265`，**当前 `SYS_MAX = 267`**（CSS-1 后） | `docs/syscall.md` 3.8/3.11、`syscall_table.rs` | ✅ CKM 从 257 起编号（4.3） |
 | 内核/用户态边界 | 已有 `tools/check-boundary.py`（内核不得嵌套 cargo/内嵌用户态字节/依赖用户态包）与独立 workspace `userland/` | `docs/pure-kernel.md` 第 8 节、`make check-boundary` | ✅ CKM Core 留在内核，`ckmd`/`ckm` 必须进 `userland/` |
 | 审计 / 事件 | 无（只有串口日志） | `kernel/src/` 无 audit 模块 | ✅ 阶段 1 新增 |
 | 引导菜单 / 恢复镜像 | boot crate 只做「装载内核并移交」；无菜单、无恢复条目、无启动失败计数 | `docs/boot.md`、`boot/` | ✅ 阶段 6（依赖阶段 2 的持久化） |
@@ -113,7 +115,7 @@ struct Cred {
 | ---- | ---- | ---- | ---- |
 | 0 | 内核上下文 / 引导 | 全部 | 内核自己发起的操作不受判定（内核不是「外部主体」） |
 | 0 | `/init`（第一个用户进程） | `CAP_FS_SYSTEM_WRITE` | 建立系统视图；**不给 `CAP_CKM_ADMIN`**（最小权限） |
-| 1000 | 管理员（`admin`） | `CAP_CKM_ADMIN \| CAP_FS_SYSTEM_WRITE \| CAP_AUDIT_READ` | 阶段 1 是**内核常量** `CKM_ADMIN_UID = 1000`；阶段 4 起由签名配置决定 |
+| 1000 | 管理员（`admin`） | `CAP_CKM_ADMIN \| CAP_FS_SYSTEM_WRITE \| CAP_AUDIT_READ \| CAP_STORAGE_ADMIN \| CAP_STORAGE_FORMAT` | 阶段 1 是**内核常量** `CKM_ADMIN_UID = 1000`；阶段 4 起由签名配置决定 |
 | 1001 | 管理服务（`ckmd`） | `CAP_CKM_SERVICE \| CAP_FS_SYSTEM_WRITE \| CAP_AUDIT_READ` | 「服务」而不是「管理员」：能执行事务，但不能改策略（3.4 判定点 4） |
 | ≥ 2000 | 普通用户 / 普通扩展 | 无 | 默认拒绝 |
 
@@ -123,7 +125,7 @@ struct Cred {
 因此第一版**没有** `setuid`/`setgid` 系统调用、**没有** `su`、**没有** 给普通进程提权的路径 ——
 「谁能做什么」由内核的组件表 + 常量决定，而不是由用户态自己声明。
 
-### 3.2 能力位（第一版只有 4 位）
+### 3.2 能力位（第一版 6 位：CKM 4 位 + 存储 2 位）
 
 | 能力 | 位 | 语义 | 谁持有 |
 | ---- | ---- | ---- | ---- |
@@ -131,6 +133,12 @@ struct Cred {
 | `CAP_CKM_SERVICE` | `0x2` | 执行扩展事务：启停组件、写扩展状态、注册覆盖层 | uid 1001（`ckmd`） |
 | `CAP_FS_SYSTEM_WRITE` | `0x4` | 写受保护前缀（`/etc`、`/bin`、`/lib`、`/init`、基线区） | uid 0 的 `/init`、1000、1001 |
 | `CAP_AUDIT_READ` | `0x8` | 读审计环形缓冲（`ckm_audit_read`） | 1000、1001 |
+| `CAP_STORAGE_ADMIN` | `0x10` | 存储管理的受控动作：挂载/卸载卷、分配或取消盘符、重扫设备（**不改数据、不格式化**） | 1000 |
+| `CAP_STORAGE_FORMAT` | `0x20` | 创建/格式化/检查文件系统（**破坏性**，与上面的管理能力分开） | 1000 |
+
+> 存储两位的语义、受控动作清单与 syscall 号段见 [storage.md](./storage.md) 第 6 节（CSS）。
+> 拆成两位的理由：挂载/卸载是**可逆**的日常操作，格式化是**破坏性**操作 —— 合成一位就无法只给其一。
+> `/init`(uid 0) 与 `ckmd`(1001) **不**持有存储能力（最小权限：建立系统视图与包事务都不需要改字母表）。
 
 规则（必须）：
 
@@ -159,6 +167,9 @@ struct Cred {
 | 5 | 读审计缓冲 | `CAP_AUDIT_READ` | `EPERM(-1)` | `syscall/ckm.rs` |
 | 6 | 查自己的凭证/能力与某个 op 的判定结果 | 无（只能查自己） | — | `syscall/ckm.rs` |
 | 7 | `execve` 到受保护前缀的程序 | 程序文件可读（mode）+ 目标路径在 CKM 组件表里才有 uid 变化 | `EACCES(-13)` / 无提权 | `syscall/process.rs` |
+| 8 | 挂载/卸载卷、分配或取消盘符、重扫设备（CSS） | `CAP_STORAGE_ADMIN` | `EPERM(-1)` | `syscall/storage.rs` |
+| 9 | 创建/格式化/检查文件系统（CSS，CSS-4 起） | `CAP_STORAGE_FORMAT` | `EPERM(-1)` | `syscall/storage.rs` |
+| 10 | 写存储状态树（`/storage/**`，reader 只读不受限） | `CAP_STORAGE_ADMIN` | `EPERM(-1)` | `fs/` 路由 |
 
 **每次 deny 必须同时产生三样东西**（缺一即验收不过）：
 
@@ -200,6 +211,9 @@ struct Cred {
 | 260 | `ckm_policy_set` | **阶段 4 才定义** | `CAP_CKM_ADMIN` | 第一版**不实现**（阶段 1 的授予面为零） |
 
 - `SYS_MAX` 由 `257` 改为 **`260`**（即 `0..=259` 可用），`syscall_table.rs` 的号段说明同步；
+  其中 **261–266 已被 CSS（存储管理）占用**（`storage_volumes`/`storage_mount`/`storage_unmount`/
+  `storage_assign_letter`/`storage_rescan`/`storage_format`，见 [storage.md](./storage.md) 6.3），
+  因此 `SYS_MAX` 的**最终值**是 **267**：CKM 自身号段仍是 257–260，两套接口共享同一个扩展段；
 - 260 在阶段 1–3 落在公共 ENOSYS 桩上（保持「号已定义但未实现」可区分，机制已在 v1.0 保留）；
 - 号一旦发布不再回收利用（与 Linux 的号段纪律一致）。
 
@@ -250,7 +264,8 @@ ckm: selftest PASS (checks=N)
 
 - 判定行**必须**在每次 `check` 后打印（allow 与 deny 都打），因此「内核真的判断过」是可断言的串口事实；
 - `op` 用**短名**而不是数字（数字在 4.6，改动时不会让日志变成天书）：`fs_write`、`state_write`、
-  `policy_set`、`audit_read`、`policy_query`、`exec_component`、`overlay_register`、`overlay_conflict`；
+  `policy_set`、`audit_read`、`policy_query`、`exec_component`、`overlay_register`、`overlay_conflict`、
+  `storage_mount`、`storage_unmount`、`storage_letter`、`storage_format`、`storage_rescan`；
 - 组件状态行只在**状态转换**时打印（不是每次查询），因此 `make test-ckm` 可以断言「谁在什么时候动了什么」。
 
 ### 4.6 事件/操作枚举（内核常量，用户态镜像）
@@ -259,6 +274,8 @@ ckm: selftest PASS (checks=N)
 1 fs_write         2 state_write      3 policy_set       4 audit_read
 5 policy_query     6 exec_component   7 overlay_register 8 overlay_conflict
 9 safe_mode_enter  10 txn_commit      11 txn_rollback
+12 storage_mount   13 storage_unmount 14 storage_letter   15 storage_format
+16 storage_rescan
 ```
 
 ## 5. 扩展模型（定稿）
@@ -451,10 +468,12 @@ KernelSU 把「挂载/覆盖」做成可插拔的**元模块**（官方文档：
 | **CKM-6 恢复环境** | 恢复镜像 + 引导菜单/命令行 + 启动失败计数 + 安全模式四件事 | CKM-5 | `make test-recovery`：连续 3 次失败进安全模式；从恢复环境重装 `ckmd` |
 | **CKM-7 可加载内核模块** | 签名 + ABI + 依赖 + 卸载安全检查（**本文档不展开**） | CKM-6 | 需要单独提案（`docs/ckm-kmod.md`），先于实现评审 |
 
-顺序上的两条硬约束（必须）：
+顺序上的三条硬约束（必须）：
 
 1. **CKM-1 之前先做 v1.0 的 `security/`**（uid/gid + mode + `EACCES`）：否则能力判定没有主体可挂靠；
-2. **CKM-3 之前必须有 CKM-2**：没有可写持久化就没有回执与可恢复事务，事务引擎只能是玩具。
+2. **CKM-3 之前必须有 CKM-2**：没有可写持久化就没有回执与可恢复事务，事务引擎只能是玩具；
+3. **CKM-2 的可写区同时是 CSS 的字母表/卷标偏好落点**（[storage.md](./storage.md) 6.6）：
+   选介质时要把「存储侧也要用」算进去，否则 CSS-3 只能退回确定规则（字母不保留用户自定义）。
 
 ## 10. 第一版验收标准（把 8 条故障场景落成断言）
 
@@ -497,6 +516,9 @@ KernelSU 把「挂载/覆盖」做成可插拔的**元模块**（官方文档：
    还是 (b) 新增一个极小的日志式区（双槽 A/B + CRC）专供 CKM 状态/回执/store。
    倾向 (b)：事务需要原子性与掉电一致性，FAT 的写语义（FAT 表 + 目录项 + 簇链三处更新）
    不天然提供；但 (a) 对用户价值更大。**定夺前不开工 CKM-2。**
+   注意与 CSS 的区别（不要混为一谈）：本条要的是「**原子状态区**」（双槽 + CRC + 掉电一致），
+   CSS-4 要的是「**文件语义写入**」（簇分配、目录项、可写卷）—— 两者可能落在同一个 FAT 卷上，
+   但验收标准不同：一个断回执可恢复，一个断写-重启-读回逐字节一致（[storage.md](./storage.md) 第 8 节）。
 2. **覆盖表的内容来源**：第一版由内核内置（6.2）；元模块化（KernelSU 式可插拔注入）作为 CKM-5 之后的演进，
    接口先按 6.1 固定，避免以后改 ABI。
 3. **首个管理员身份**：CKM-1 用内核常量 `CKM_ADMIN_UID = 1000`；CKM-4 起改为签名配置。
@@ -514,4 +536,5 @@ KernelSU 把「挂载/覆盖」做成可插拔的**元模块**（官方文档：
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-11 | 追加**存储侧接口**（配合新建的 [storage.md](./storage.md)，CSS 提案）：能力位由 4 位扩到 **6 位**（`CAP_STORAGE_ADMIN 0x10` / `CAP_STORAGE_FORMAT 0x20`，uid 1000 持有，`/init` 与 `ckmd` 不持有）、判定点表追加 **8–10**（挂载/卸载/字母/重扫、格式化、写 `/storage/**`）、事件枚举追加 **12–16**（`storage_mount`/`storage_unmount`/`storage_letter`/`storage_format`/`storage_rescan`，串口短名同步）、号段说明注明 **CSS 占 261–266 故 `SYS_MAX` 最终值为 267**（CKM 自身号段仍为 257–260）、现状审计补「分区/卷/盘符」一行（归属 CSS）、CKM-2 硬约束补第 3 条（可写区同时是字母表落点）与开放问题 1 的边界澄清（原子状态区 vs 文件语义写入） |
 | 2026-10-11 | 创建本文档：定稿权限模型（单管理员 + 4 个能力位 + 7 个判定点，凭证只由 CKM 组件表在 `execve` 时改变）、内核接口（`kernel/src/ckm/` 五模块 + `CKM_ABI_VERSION=1` + 扩展号段 257–259 + 两份定长记录 + 串口证据格式）、扩展生命周期（四类扩展、状态机与合法转换表、确定性枚举/加载顺序）；覆盖层与 KernelSU 元模块的对应关系、事务与 H-06 P0b 的接口、安全模式与恢复环境、CKM-1…CKM-7 分期、8 条故障验收落成断言、非目标与 7 个开放问题；同步 docs/README.md 索引、DEVELOPMENT.md（H-07 行 + 5.12 + 修订记录）、roadmap（第十一阶段）、architecture 第 5 节、project-structure（规划目录）、README（文档入口） |

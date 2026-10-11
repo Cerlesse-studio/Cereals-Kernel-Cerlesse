@@ -159,6 +159,13 @@ impl FileSystem for RamFs {
         RamFs::usage(self)
     }
 
+    /// CSS-2：RAMFS 是可写后端（唯一一个），因此它的 `caps` 也是「可写」这条
+    /// 断言的数据来源 —— 挂载行里的 `ro=` 来自后端，不是写字面量。
+    /// 卷标为空：卷标是**卷**的属性，RAMFS 挂载不是卷（没有 `vol_id`）。
+    fn caps(&self) -> vfs::FsCaps {
+        vfs::FsCaps::writable()
+    }
+
     fn stat(&mut self, path: &str) -> Result<Metadata, i64> {
         let path = vfs::normalize(path)?;
         Ok(self.root.walk(&vfs::components(&path))?.meta())

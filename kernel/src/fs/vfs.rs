@@ -49,6 +49,92 @@ pub const EROFS: i64 = -30;
 pub const EIO: i64 = -5;
 /// `-EUCLEAN`：磁盘上的结构损坏（簇链断/越界、目录项非法）。
 pub const EUCLEAN: i64 = -117;
+/// `-ENODEV`：设备不存在 / 已消失（CSS 追加；让「拔盘」与「坏盘」可区分）。
+pub const ENODEV: i64 = -19;
+/// `-ENOTSUP`：识别到文件系统但内核没有对应后端（CSS 追加；与「路径不存在」区分开：
+/// 盘在、格式不支持）。
+pub const ENOTSUP: i64 = -95;
+
+/// 后端能力位（CSS-2，见 `docs/storage.md` 5.1）。
+///
+/// 路径解析层与卷表**查询**它，而不是各自再实现一遍「大小写怎么办」「能不能写」：
+/// 「FAT 读 NT 大小写标志」这类规则因此只写在后端里一次。
+#[derive(Clone, Copy)]
+pub struct FsCaps {
+    /// 后端当前只实现了只读（写接口返回 [`EROFS`]）。
+    pub read_only: bool,
+    /// 路径匹配不区分大小写（NTFS/FAT 保留原名但匹配时不区分；ext2/4 区分）。
+    pub case_insensitive: bool,
+    /// 后端支持的最大文件名长度（字节）。
+    pub max_name_len: usize,
+    /// 卷是否自带卷标（FAT/exFAT/ext 在超级块里有；RAMFS 没有）。
+    pub has_label: bool,
+}
+
+impl FsCaps {
+    /// 保守缺省：只读、区分大小写、没有卷标 —— 后端不声明能力时按最弱的算。
+    pub const fn read_only_unknown() -> Self {
+        Self { read_only: true, case_insensitive: false, max_name_len: 255, has_label: false }
+    }
+
+    /// 可写后端的能力位（RAMFS；CSS-4 之后的 FAT/exFAT/ext2 亦同）。
+    pub const fn writable() -> Self {
+        Self { read_only: false, case_insensitive: false, max_name_len: 255, has_label: false }
+    }
+
+    /// 只读原因的短名（记录与证据行共用；可写时为 `rw`）。
+    pub fn read_only_reason(self) -> &'static str {
+        if self.read_only {
+            "ro-backend"
+        } else {
+            "rw"
+        }
+    }
+}
+
+/// 卷自带信息（探测的产物；取不到的字段留空而不是编造）。
+#[derive(Clone, Copy)]
+pub struct VolumeInfo {
+    /// 文件系统自带序列号/UUID 前缀（无则 `None`）。
+    pub serial: Option<u32>,
+    /// 卷标原始字节（**未规范化**；记录里放的是 `storage::volume` 的规范形式）。
+    pub label: [u8; 11],
+    /// 卷标有效长度（已去尾部空格/NUL）。
+    pub label_len: usize,
+    /// 卷容量（字节）。
+    pub total_bytes: u64,
+}
+
+impl VolumeInfo {
+    /// 一无所知（后端不提供时）。
+    pub const fn unknown() -> Self {
+        Self { serial: None, label: [0u8; 11], label_len: 0, total_bytes: 0 }
+    }
+
+    /// 去尾部空格/NUL 后的长度（`label_len` 的计算口径，与 `storage::volume` 一致）。
+    pub fn trimmed_len(raw: &[u8; 11]) -> usize {
+        let mut end = raw.len();
+        while end > 0 && (raw[end - 1] == b' ' || raw[end - 1] == 0) {
+            end -= 1;
+        }
+        end
+    }
+
+}
+
+/// 挂载选项（CSS-2，见 `docs/storage.md` 5.2）。
+#[derive(Clone, Copy)]
+pub struct MountOptions {
+    /// 以只读挂载（用户或 CKM 指定）→ 只读原因 `ro-mount`。
+    pub read_only: bool,
+}
+
+impl MountOptions {
+    /// 默认（可写）。
+    pub const RW: Self = Self { read_only: false };
+    /// 只读挂载。
+    pub const RO: Self = Self { read_only: true };
+}
 
 /// 后端文件系统必须实现的操作。
 ///
@@ -94,6 +180,19 @@ pub trait FileSystem {
     /// 文件与字节进了内存。
     fn usage(&self) -> (usize, usize) {
         (0, 0)
+    }
+
+    /// 后端能力位（CSS-2 新增；缺省按最弱的能力算，见 [`FsCaps::read_only_unknown`]）。
+    ///
+    /// 默认实现是**保守**的：没声明的后端一律当「只读、区分大小写、没有卷标」，
+    /// 而不是当「什么都可以」—— 猜错的代价是数据被写坏。
+    fn caps(&self) -> FsCaps {
+        FsCaps::read_only_unknown()
+    }
+
+    /// 卷自带信息（CSS-2 新增；探测阶段得到，缺省为空）。
+    fn volume_info(&self) -> VolumeInfo {
+        VolumeInfo::unknown()
     }
 }
 
@@ -201,4 +300,26 @@ pub fn is_mount_point(path: &str) -> bool {
 pub fn backend_name(path: &str) -> Option<&'static str> {
     let (fs, _) = crate::fs::mount::table().resolve(path).ok()?;
     Some(fs.name())
+}
+
+// ---- CSS-2：卷身份与能力位的查询面 ----
+
+/// 路径解析到的挂载点信息（挂载点 + 后端 + 卷身份 + 选项）。
+///
+/// 「路径 → 卷」在串口上可断言（`docs/storage.md` 5.2）：同一条路径解析到的
+/// `vol_id` 必须与 `storage_volumes` 记录里的相等，这就是「两个入口同一份数据」的证据。
+pub fn route(path: &str) -> Option<crate::fs::mount::Route> {
+    crate::fs::mount::table().route(path)
+}
+
+/// 某条路径所在后端的能力位。
+pub fn backend_caps(path: &str) -> Option<FsCaps> {
+    let (fs, _) = crate::fs::mount::table().resolve(path).ok()?;
+    Some(fs.caps())
+}
+
+/// 某条路径所在后端的卷自带信息。
+pub fn backend_volume_info(path: &str) -> Option<VolumeInfo> {
+    let (fs, _) = crate::fs::mount::table().resolve(path).ok()?;
+    Some(fs.volume_info())
 }

@@ -19,8 +19,9 @@
 use crate::driver::serial;
 
 /// 扇区大小（字节）：MBR / FAT 引导扇区的经典粒度。
-pub const SECTOR_SIZE: u32 = 512;/// 块设备数量上限（v0.8 只有整块启动盘；留一个位置给 v0.9 的第二块盘）。
-pub const MAX_BLOCK_DEVICES: usize = 2;
+pub const SECTOR_SIZE: u32 = 512;/// 块设备数量上限（CSS-1 从 2 扩到 8：启动盘 + 测试盘 + 分区/卷夹具，
+/// 见 `docs/storage.md` 2 —— 「固定容量 + 满了明确拒绝」的风格保持不变）。
+pub const MAX_BLOCK_DEVICES: usize = 8;
 
 /// 块设备：按扇区读写。
 pub trait BlockDevice {
@@ -56,7 +57,8 @@ pub fn is_sector_aligned(len: usize) -> bool {
 }
 
 // 注册表：`register` 只写一次（驱动 probe 期间），之后只读。
-static mut DEVICES: [Option<&'static mut dyn BlockDevice>; MAX_BLOCK_DEVICES] = [None, None];
+static mut DEVICES: [Option<&'static mut dyn BlockDevice>; MAX_BLOCK_DEVICES] =
+    [const { None }; MAX_BLOCK_DEVICES];
 
 /// 注册一个块设备，返回它的下标（供 `block::get` 取回）。
 ///

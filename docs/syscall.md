@@ -44,7 +44,7 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
 | ---- | ---- | ---- |
 | 入口指令 | `syscall` → `IA32_LSTAR` = `syscall_entry` | 保存 RIP→`rcx`、RFLAGS→`r11`，**不切栈** |
 | 返回指令 | `sysretq` | CS=`STAR[63:48]+16`、SS=`STAR[63:48]+8` |
-| syscall 号 | `rax` | 越界（≥ `SYS_MAX`=256）返回 `-ENOSYS` |
+| syscall 号 | `rax` | 越界（≥ `SYS_MAX`=267）返回 `-ENOSYS` |
 | 参数 | `rdi, rsi, rdx, r10, r8` | 与 Linux x86_64 一致，便于以后直接跑现成用户态程序 |
 | 返回值 | `rax` | 负数 = `-errno`（如 `-ENOSYS` = -38、`-EFAULT` = -14） |
 | 进入内核时的 RFLAGS 掩码 | `IA32_FMASK` = IF\|DF\|TF = `0x700` | 内核在关中断下运行 syscall handler |
@@ -131,8 +131,11 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
 | `fork` / `execve` / `wait4` | 57 / 59 / 61 | ✅ v0.9 第三步 | `fork` 复制地址空间与当前用户帧（子进程 `rax=0`、父进程得 PID）；`execve(path, argv)` 换映像并重建 argv 用户栈（**成功不返回**）；`wait4(pid)` 运行并回收直接子进程、返回退出码（非子进程 `-ECHILD`）；详见 3.7 |
 | `mprotect` | 10 | ✅ v1.0 第一步 | 改写**已映射**页的保护属性（页对齐、`len > 0`、范围不跨窗口、每页已映射，缺一即 `-EINVAL`）；`PROT_WRITE\|PROT_EXEC` 仍拒绝（W^X）；`PROT_NONE` 清 `USER` 位而保留 `PRESENT`（帧与内容都在，可改回来）；用户栈固定 `RW`+`NX`，不在支持范围 —— 详见 3.10 |
 
-分发表按 `SYS_MAX`(=256) 排满：未实现的号落在公共 ENOSYS 桩，
+分发表按 `SYS_MAX`(=267) 排满：未实现的号落在公共 ENOSYS 桩，
 「号合法但未实现」与「号越界」是两种可区分的失败路径。
+号段划分：`0..=255` 沿用 Linux 语义，`>= 256` 是 Cerlesse 扩展 —— `256` = `getprocs`、
+`257..=260` 由 CKM 提案预留、`261..=266` 由 CSS 使用（CSS-1 已实现 **261 `storage_volumes`** 与
+**265 `storage_rescan`**，其余落 ENOSYS 桩，见 3.11）。
 
 文件 syscall 的两条硬规则（v0.7 新增）：
 
@@ -537,8 +540,8 @@ Linux `task_struct.comm` 的形状）—— `create` 用调试名填充，`execv
 - [x] `user: getdents path=/ entries=5 returned=5` + `ls: / entries=5`：`ls` 读的是 **VFS 的目录项**
       （v0.7 起 `list()` 只有内核自测用过）；`ls: entry name=bin kind=dir size=0` 证明元数据也被读出来了；
       （`/` 在第五步时是 4 条，3.9 又加了 `/lib` → 5 条）
-- [x] `ls: /bin entries=7`：`/bin` 里恰好是这次构建写进去的 7 个程序
-      （`sh`/`hello`/`ls`/`cat`/`echo`/`ps`/`dynhello`，最后一个见 3.9）—— 同时证明 `fs::init` 的程序清单是完整的；
+- [x] `ls: /bin entries=8`：`/bin` 里恰好是这次构建写进去的 8 个程序
+      （`sh`/`hello`/`ls`/`cat`/`echo`/`ps`/`dynhello`/`volumes`，后两个见 3.9 与 3.11）—— 同时证明 `fs::init` 的程序清单是完整的；
 - [x] `user: getprocs count=2` + `ps: pid=3 ppid=0 state=RUNNING comm=sh` + `ps: pid=N ppid=3 … comm=ps`：
       `ps` 读的是**内核进程表**：表里恰好是 Shell 与 `ps` 自己，`ppid` 指回 Shell（`fork` 建出的父子关系）；
 - [x] `user: exec pid=N path=/bin/{ls,ps,echo,cat} segments=4 image_pages=5 entry=0x8000000000`：
@@ -613,7 +616,7 @@ v0.9 之前装载器只接受 `ET_EXEC`：ELF 里的地址就是运行地址，�
 v0.9 收官时「号已定义但未实现」的调用只剩 `mprotect`（`syscall_table::UNIMPLEMENTED` 里
 唯一一项，串口上表现为 `syscall: ENOSYS nr=10 name=mprotect`）。它同时是两件事的前提：
 `mmap(PROT_NONE)` 的映射要能再启用，以及 W^X 下的「先写、再换只执行」。本步把它补上后
-**这张表空了**。
+**这张表一度空了** —— 随后 CSS-1（3.11）在扩展号段重新放入 262/263/264/266（CSS-3/CSS-4 待实现）。
 
 | 项 | 实现位置 | 说明 |
 | ---- | ---- | ---- |
@@ -643,6 +646,39 @@ v0.9 收官时「号已定义但未实现」的调用只剩 `mprotect`（`syscal
 已知边界（写下来避免误读）：只支持上面四个窗口，**不支持** `MAP_FIXED` 式的固定地址放置
 （仍无 `mmap` 的 offset/固定地址能力）、不支持把一整段匿名映射拆成不同权限的分段操作
 （一次调用只针对一段、不跨窗口）。
+
+### 3.11 存储枚举（CSS-1，2026-10-11 落地）
+
+CSS-1（见 [storage.md](./storage.md)）在内核里立起「设备 → 分区 → 卷」的只读识别层，
+用户态通过两个新号读它 —— 与 `getprocs`/`getdents` 同一套做法：**定长记录 + 一次调用写满**，
+记录布局的权威定义在内核侧模块（`storage/volume.rs`），`libc` 只提供解析器。
+
+| syscall | 号 | 实现位置 | 用户态使用者 | 说明 |
+| ---- | ---- | ---- | ---- | ---- |
+| `storage_volumes(buf_ptr, buf_len, out_count_ptr)` | **261** | `syscall/storage.rs::sys_storage_volumes` | `user/volumes` → `/bin/volumes` | 把卷表快照写成**定长 64 字节记录**到用户缓冲，返回**实际写入条数**；`out_count_ptr != 0` 时同刻写回**总卷数**（LE `u64`，先问大小再开缓冲）；`buf_len < 64` → `-EINVAL`；**只读查询，无需能力位** |
+| `storage_rescan(disk_index)` | **265** | `syscall/storage.rs::sys_storage_rescan` | （CSS-5 管理程序） | 重扫某设备的（`0xFFFF_FFFF` = 全部）分区与文件系统，更新卷表并打印证据行；设备不存在 → `-ENODEV`；受控动作，CKM 落地后需 `CAP_STORAGE_ADMIN`（判定点 8） |
+
+两条要点：
+
+- **确定性顺序**（storage.md 6.5）：`disk_id` 升序 → `part_index` 升序 → `id` 字节序升序；
+  因此两次 `storage_volumes` 调用逐字节相同（验收项 3）。
+- **只读面无需能力位**：`storage_volumes` 像 `ckm_component_state` 的只读面一样不查能力位；
+  受控的重扫才走 CKM（CSS-1 还没有 CKM，先只提供机制，权限在 CSS-3 接上）。
+
+记录布局（64 字节，`storage/volume.rs`）：`id`（稳定标识，如 `fs:<sha>`/`pt:<disk>-<part>-<lba>`/
+`raw:<disk>`）/ `disk` / `part` / `fs`（文件系统种类）/ `label` / `ro`（只读原因）/
+`health`（0=ok/`degraded`/`unsupported`）/ `mounts`；`libc` 的 `volume_id()`/`volume_fs()`/`volume_health()`/`volume_mounts()` 等解析器
+按固定偏移取值，让 `/bin/volumes` 不必自己算偏移（与 `dirent_*`/`procinfo_*` 同理）。
+
+验收（`make test-storage` 26 项 + `make test-storage-mbr` 13 项 + `make test-programs`
+的 `/bin/volumes` 断言 23 项 + 6 正则 + 内核解析自测 11 例 / 45 断言）：
+
+- [x] `user: storage_volumes count=1 total=1`：`/bin/volumes` 真的把卷表读出来（GPT 两分区镜像里
+      识别出 FAT 卷并列出其 `id`/`disk`/`part`/`fs`/`label`/`health`）；
+- [x] 枚举确定性：同一镜像两次枚举的 `storage: vol …` 行逐字节相同；
+- [x] 无分区表的镜像（`fat.img`/`disk.img` 形态）仍被识别为**整盘一卷**（`table=none partitions=1`）；
+- [x] 主表头损坏 → 回退备用表头；两表 CRC 都不对 → `health=degraded`；未识别文件系统 → `health=unsupported`
+      但**仍然列出**（可见但不挂载）。
 
 ## 4. 调用链示例
 
@@ -698,3 +734,4 @@ fd ≥ 3 一律经 VFS 抽象路由，syscall 层不认识具体后端。
 | 2026-10-11 | **v0.9 第五步：基础用户程序（`ls`/`cat`/`echo`/`ps`）与目录/进程枚举** —— 新增 3.8；新增 `syscall/dir.rs`（`getdents = 78`，定长 88 字节记录、VFS `list()` 转发、截断语义与 `-EINVAL` 边界）与 `syscall/process.rs::sys_getprocs`（**扩展号段 256**，定长 40 字节记录）；`syscall_table.rs` 的 `SYS_MAX` 256 → 257，并写明「`0..=255` = Linux 语义、`>= 256` = Cerlesse 扩展」；`process/process.rs` 新增定长 `comm: [u8; 16]`（`create` 填充、`execve` 改写为程序名），顶层程序运行前置为 `RUNNING`；`libc` 新增 `getdents`/`getprocs` 与 `dirent_*`/`procinfo_*` 解析器；新增 `user/{ls,cat,echo,ps}` 四个程序（`kernel/build.rs`/`workspace`/`fs::init` 清单 3 → 7）；Shell 的帮助文本补上四个程序并说明「内建遮蔽同名程序」；新增 `make test-programs`（17 项 + 5 条正则）与编排 `programs` 场景（场景数 **13 → 14**）；`make test-proc` 的负例由 `ls` 改为 `foo`（`/bin/ls` 已存在，不能再当“找不到的程序”） |
 | 2026-10-11 | **v0.9 第六步：内核侧最小动态链接** —— 新增 3.9；`syscall/elf.rs::load` 按 `e_type` 分流（`ET_DYN` → 新增 `syscall/dynamic.rs`，`ET_EXEC` 路径不变）；`address_space.rs` 新增共享库窗口（`USER_DYN_BASE` = 基址 + 1 MiB、32 页）与 `map_dyn_page`/`dyn_page_count`/`phys_of`（内核 CR3 下写重定位），`fork` 复制窗口、`page_flags` 认可该窗口、`Drop` 整树释放；`dynamic.rs` 解析 `PT_INTERP`/`PT_DYNAMIC`/`DT_NEEDED`（`/lib/<name>` 递归装载，上限 8 个对象）并应用 `R_X86_64_RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`R_X86_64_64`（按名字线性扫描 `.dynsym`；`DT_PLTREL=REL` 明确拒绝）；新增夹具 `user/dynhello/`（`as`+`ld` 现编，`kernel/build.rs` 内嵌）与 RAMFS `/lib`（`fs::init` 新增 `libraries` 参数，程序清单 7 → 8）；新增 `make test-dyn`（10 项）与 `make dyn-hostcheck`（宿主 glibc 独立复核），`make test-fs` 20 → 21 项、`test-programs` 的 `/` 与 `/bin` 条目数同步 5/7；3.8 的条目数断言与 3.1 的地址布局/`ET_EXEC` 说明同步更新 |
 | 2026-10-11 | **v1.0 第一步：`mprotect`（运行时改保护属性）** —— 新增 3.10；`syscall/memory.rs` 新增 `sys_mprotect`（页对齐/`len>0`/未知位/`W^X` 四类 ABI 拒绝，每类留一行 `user: mprotect rejected (<reason>)`）+ `mmap(PROT_NONE)` 由拒绝改为合法；`address_space.rs` 新增 `mprotect`（范围须在同一窗口、每页已映射，否则 `-EINVAL`；`PROT_NONE` = 清 `USER` 留 `PRESENT`）、`UserWindow`、`prot_to_flags`、`accessible`（`PRESENT`+`USER` 齐备才算可访问）与 `set_page_flags`（改权限即 `invlpg`），堆窗口新增逐页 `heap_flags`（`brk` 增长/收缩与 `fork` 同步，`page_flags` 据此判断堆页）；`syscall_table` 注册 10 号、`UNIMPLEMENTED` 因此**空表**（`mod.rs` 的打印注释同步）；`libc` 新增 `mprotect`/`PROT_NONE`（`lib.rs` re-export）；`user/hello` 新增 `mprotect_selftest`（`PROT_NONE` → 内核拒收 `-EFAULT` → 内容原样 → `RX` 后真的执行机器码 → 6 个负例 → `munmap` 照常归还）；`make test-user` 61 → **91 项** PASS（含 brk 堆窗口的 `PROT_NONE` 往返）；头部状态与 2.7 表、1、3.4/3.5 的「未做」清单同步 |
+| 2026-10-11 | **CSS-1：存储枚举（261 `storage_volumes` / 265 `storage_rescan`）** —— 新增 3.11；`syscall/storage.rs` 实现两个号（定长 64 字节卷记录、确定性枚举、`storage_volumes` 无需能力位、`rescan` 设备不存在 `-ENODEV`）；`syscall_table.rs` 的 `SYS_MAX` 257 → **267**，并在 CKM 预留的 257–260 之后开出 CSS 号段 261–266（261/265 已实现，262/263/264/266 落 `UNIMPLEMENTED` 桩，串口可区分「未实现」与「号越界」）；`libc` 新增 `storage_volumes`/`storage_rescan` + `volume_*` 解析器，新增用户程序 `user/volumes` → `/bin/volumes`；头部号段表、1 节分发表说明、3.4 与 3.10 的「空表」表述同步 |

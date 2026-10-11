@@ -47,11 +47,13 @@ pub mod ramfs;
 pub mod vfs;
 
 use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::String;
 
-use crate::driver::block::BlockDevice;
 use crate::driver::serial;
 use crate::fs::inode::NodeKind;
-use crate::fs::vfs::FileSystem;
+// `mount` / `vfs` 都是本模块的子模块（上面已 `pub mod`），因此这里只导入类型/  trait。
+use crate::fs::vfs::{FileSystem, MountOptions};
 
 /// `/etc/motd` 的内容。
 ///
@@ -122,31 +124,68 @@ pub fn init(
 /// - `blk1`（`mkfs` 生成的测试盘，只有测试时才挂第二块盘）→ `/mnt/fat`。
 ///   `/mnt/fat` 挂在 `/mnt`（自测用的 RAMFS）下面，因此顺带验证了挂载表的**最长前缀路由**。
 ///
-/// 返回挂载成功的卷数。
-pub fn mount_disks() -> Result<usize, &'static str> {
+/// 第二块盘**不一定是 FAT**：`make test-storage` 用 GPT/MBR 夹具盘，它上面没有可挂的
+/// 文件系统（`docs/storage.md` §6.8 的分区识别与文件系统后端是两件事）。因此 dev1 的
+/// 探测失败只留一行证据后跳过，不 halt —— 启动盘（dev0）仍然严格：它的 FAT 挂不上
+/// 就等于没有根文件系统，必须停。
+///
+/// 返回挂载成功的卷数；失败是 **errno**（`docs/storage.md` 4.5：挂载失败必须是 errno，
+/// 否则「拒绝理由」不可断言；`docs/storage.md` 5.2 的 CSS-2 条款）。
+pub fn mount_disks() -> Result<usize, i64> {
     if crate::driver::block::count() == 0 {
-        return Err("fs: no block device to mount");
+        return Err(vfs::ENODEV);
     }
-    let mut mounted = 0;
-    if let Some(dev) = crate::driver::block::get(0) {
-        mount_fat(dev, "/disk")?;
-        mounted += 1;
-    }
-    if let Some(dev) = crate::driver::block::get(1) {
-        mount_fat(dev, "/mnt/fat")?;
-        mounted += 1;
+    // 启动盘（dev0）严格：它的 FAT 挂不上就等于没有根文件系统。
+    mount_fat_device(0, "/disk")?;
+    let mut mounted = 1;
+    if crate::driver::block::count() > 1 {
+        match mount_fat_device(1, "/mnt/fat") {
+            Ok(()) => mounted += 1,
+            Err(errno) => {
+                // 第二块盘不一定是 FAT：`make test-storage` 用 GPT/MBR 夹具盘，它上面
+                // 没有可挂的文件系统（分区识别与文件系统后端是两件事，§6.8）。
+                serial::print("fs: skip /mnt/fat errno=");
+                serial::print_dec(errno.unsigned_abs());
+                serial::println(" (no mountable FAT volume on this device)");
+            }
+        }
     }
     Ok(mounted)
 }
 
-/// 打开一个块设备上的 FAT 卷并挂到 `point`。
-fn mount_fat(dev: &'static mut dyn BlockDevice, point: &str) -> Result<(), &'static str> {
-    let fs = fat::FatFs::open(dev)?;
+/// 挂载一块**整盘** FAT 卷（CSS-2：带上卷身份与选项）。
+///
+/// 卷身份取自 CSS-1 的卷表（无分区表的整盘卷 = `part_index 0`）。分区里的 FAT 拿不到
+/// 卷身份 —— 现状 FAT 后端还不接受分区偏移（见 `fat.rs` 模块头），因此这里退化为
+/// 「非卷挂载」而不是伪造一个 `vol_id`。
+fn mount_fat_device(index: usize, point: &str) -> Result<(), i64> {
+    let Some(dev) = crate::driver::block::get(index) else {
+        return Err(vfs::ENODEV);
+    };
+    let vol_id = crate::storage::registry::find_at(index as u16, 0)
+        .map(|volume| String::from(volume.id.as_str()));
+    let fs = match fat::FatFs::open(dev) {
+        Ok(fs) => fs,
+        Err(err) => {
+            serial::print("fs: mount point=");
+            serial::print(point);
+            serial::print(" failed errno=");
+            serial::print_dec(err.errno.unsigned_abs());
+            serial::print(": ");
+            serial::println(err.reason);
+            return Err(err.errno);
+        }
+    };
     let backend = fs.name();
+    let caps = fs.caps();
     let geometry = fs.geometry();
-    mount::table()
-        .mount(point, Box::new(fs))
-        .map_err(|_| "fs: FAT mount failed (duplicate mount point or table full)")?;
+    // 兼容挂载点保持默认选项（可写）：只读是**后端的能力**（`ro-backend`），
+    // 不是这里的挂载参数（`ro-mount`）—— 两者都在记录里有各自的取值（3.5）。
+    let options = MountOptions::RW;
+    match &vol_id {
+        Some(id) => mount::table().mount_volume(point, Box::new(fs), id, options)?,
+        None => mount::table().mount(point, Box::new(fs))?,
+    };
     serial::print("fs: mount point=");
     serial::print(point);
     serial::print(" fs=");
@@ -158,7 +197,26 @@ fn mount_fat(dev: &'static mut dyn BlockDevice, point: &str) -> Result<(), &'sta
     serial::print(" clusters=");
     serial::print_dec(geometry.cluster_count as u64);
     serial::println("");
+    // CSS-2 证据行（`docs/storage.md` 6.7）：卷身份 + 只读**原因**（不是布尔）。
+    serial::print("storage: mount point=");
+    serial::print(point);
+    serial::print(" vol=");
+    serial::print(vol_id.as_deref().unwrap_or("-"));
+    serial::print(" ro=");
+    serial::println(read_only_reason(caps, options));
     Ok(())
+}
+
+/// 只读原因（`docs/storage.md` 3.5）：后端能力优先于挂载参数 ——
+/// 「后端根本没实现写」比「这次是只读挂的」更能解释为什么写不下去。
+fn read_only_reason(caps: vfs::FsCaps, options: MountOptions) -> &'static str {
+    if caps.read_only {
+        caps.read_only_reason()
+    } else if options.read_only {
+        "ro-mount"
+    } else {
+        "rw"
+    }
 }
 
 /// `fs: write <path> bytes=<n>`。
@@ -186,12 +244,20 @@ pub fn selftest() -> Result<(), &'static str> {
     if meta.kind != NodeKind::File || meta.size != MOTD.len() as u64 {
         return Err("fs: /etc/motd metadata mismatch");
     }
+    // CSS-2：`stat` 行末尾给出**卷身份**（路径 → 卷在串口上可断言，见 `docs/storage.md` 5.2）。
+    // RAMFS 的 `/` 不是卷（没有 `storage` 里的记录），因此这里是 `vol=-` —— 这不是
+    // 「查不到」，而是「这个挂载点没有卷语义」，两种情形不该混成一个值。
+    let vol = vfs::route("/etc/motd")
+        .and_then(|route| route.vol_id)
+        .unwrap_or_else(|| String::from("-"));
     serial::print("fs: stat /etc/motd kind=");
     serial::print(meta.kind.name());
     serial::print(" size=");
     serial::print_dec(meta.size);
     serial::print(" perms=");
-    serial::println(meta.perms());
+    serial::print(meta.perms());
+    serial::print(" vol=");
+    serial::println(&vol);
 
     // 2. 内容读回（这条链路的终点是用户态 open/read，见 user/hello）
     let data = vfs::read_all("/etc/motd").map_err(|_| "fs: read /etc/motd failed")?;
@@ -406,6 +472,180 @@ pub fn disk_selftest() -> Result<(), &'static str> {
     serial::println("fs: disk negative cases PASS (ENOENT/ENOTDIR/EISDIR/EROFS)");
 
     serial::println("fs: disk selftest PASS");
+    Ok(())
+}
+
+// ---- CSS-2：挂载收口验收（`docs/storage.md` 第 9 节 CSS-2 出口）----
+
+/// CSS-2 自测：只读原因可读、记录被消费者读对、同一卷多挂载点、卸载。
+///
+/// 断言的都不是「函数返回 Ok」，而是四个**机制**在生效：
+///
+/// 1. **只读原因来自后端能力位**：FAT 后端的 `caps().read_only` 为真，挂载行里的
+///    `ro=` 就是从这里算出来的（不是写死的字面量）；
+/// 2. **记录被消费者读对**：后端报的序列号/卷标与 `storage_volumes` 的记录逐字段一致
+///    —— 同一张 BPB 的两条读路径（后端 `volume_info()` 与卷表记录）必须给出同一个答案；
+/// 3. **同一卷多挂载点**：给已挂载的卷加一个别名挂载点后，两个路径读到**同一份数据**，
+///    且 `route()` 报出**同一个** `vol_id`（`docs/storage.md` 4.1 的验收前置）；
+/// 4. **卸载**：卸载别名后路径消失（`ENOENT`），卷仍在卷表里、挂载计数回到 1。
+///
+/// 没有「卷背书的挂载点」时（例如纯 RAMFS 启动）打印一行 `skipped` 后返回 Ok ——
+/// 「没有可测的对象」不是失败。
+pub fn storage_mount_selftest() -> Result<(), &'static str> {
+    serial::println("fs: storage mount selftest begin");
+
+    let Some(vol_id) = vfs::route("/disk").and_then(|route| route.vol_id) else {
+        serial::println("fs: storage mount selftest skipped (no volume-backed mount point)");
+        return Ok(());
+    };
+
+    // 1. 只读原因必须来自后端能力位（而不是字面量）：FAT 应声明「只读 + 大小写不敏感 +
+    //    有卷标 + 支持 255 字符长名」。任何一条不对，路径解析层后面的决定就是基于错的输入。
+    let caps = vfs::backend_caps("/disk").ok_or("fs: /disk has no backend")?;
+    if !caps.read_only || !caps.case_insensitive || !caps.has_label || caps.max_name_len < 255 {
+        return Err("fs: the FAT backend reported unexpected capability bits");
+    }
+
+    // 2. 后端报的卷身份必须与卷记录一致（两条读路径同一答案）
+    let info = vfs::backend_volume_info("/disk").ok_or("fs: /disk reports no volume info")?;
+    let volume = crate::storage::registry::find(&vol_id)
+        .ok_or("fs: the mounted volume is not in the volume table")?;
+    let record_serial = volume
+        .uuid
+        .and_then(|uuid| (uuid.len == 4).then(|| u32::from_le_bytes([uuid.bytes[0], uuid.bytes[1], uuid.bytes[2], uuid.bytes[3]])));
+    if info.serial != record_serial {
+        return Err("fs: the backend serial disagrees with the volume record");
+    }
+    let (label, label_len, _truncated) = crate::storage::volume::normalize_label(&info.label);
+    if info.label_len != crate::fs::vfs::VolumeInfo::trimmed_len(&info.label)
+        || label[..label_len as usize] != volume.label[..volume.label_len as usize]
+        || label_len != volume.label_len
+    {
+        return Err("fs: the backend label disagrees with the volume record");
+    }
+    if info.total_bytes != volume.total_bytes {
+        return Err("fs: the backend geometry disagrees with the volume record");
+    }
+    serial::print("storage: volcheck id=");
+    serial::print(&vol_id);
+    serial::print(" backend=");
+    serial::print(vfs::backend_name("/disk").unwrap_or("?"));
+    serial::print(" caps=ro-backend case=insensitive label=");
+    // 打规范化后的卷标（= 记录里的形式）；与后端原始字节的一致已在上面断言
+    serial::print(volume.label_str().unwrap_or("-"));
+    serial::print(" bytes=");
+    serial::print_dec(info.total_bytes);
+    serial::println(" record=ok (serial + label read the same BPB)");
+
+    // 3. 同一卷的第二个挂载点（别名）：默认挂载点规则见 `docs/storage.md` 4.3
+    let alias_point = match volume.label_str() {
+        Some(label) => format!("/volumes/{label}"),
+        None => format!("/volumes/{vol_id}"),
+    };
+    mount::table()
+        .alias_volume(&alias_point, &vol_id, MountOptions::RO)
+        .map_err(|_| "fs: mounting an alias of a mounted volume failed")?;
+    serial::print("storage: mount point=");
+    serial::print(&alias_point);
+    serial::print(" vol=");
+    serial::print(&vol_id);
+    serial::print(" ro=");
+    serial::println(read_only_reason(caps, MountOptions::RO));
+
+    let alias_file = format!("{alias_point}/KERNEL.ELF");
+    let route = vfs::route(&alias_file).ok_or("fs: the alias path is not routed")?;
+    if route.vol_id.as_deref() != Some(vol_id.as_str()) {
+        return Err("fs: the alias path resolved to a different volume");
+    }
+    serial::print("fs: route path=");
+    serial::print(&alias_file);
+    serial::print(" point=");
+    serial::print(&route.point);
+    serial::print(" vol=");
+    serial::print(&vol_id);
+    serial::print(" fs=");
+    serial::print(route.backend);
+    serial::print(" ro=");
+    serial::println(read_only_reason(caps, route.options));
+
+    // `stat` 也走挂载表路由，因此它必须给出**同一个**卷身份（这是 `vol=` 这条 ABI 的用途）
+    let meta = vfs::stat(&alias_file).map_err(|_| "fs: stat through the alias mount point failed")?;
+    serial::print("fs: stat path=");
+    serial::print(&alias_file);
+    serial::print(" kind=");
+    serial::print(meta.kind.name());
+    serial::print(" size=");
+    serial::print_dec(meta.size);
+    serial::print(" vol=");
+    serial::println(&vol_id);
+
+    // 比的是**同一段字节**（文件中部，不是开头）：`read` 走 fd 那条路（offset 分派），
+    // 因此这条断言同时也是「两个入口不是两份数据」的证据。
+    // 不整文件读：启动盘上的 `KERNEL.ELF` 有 4 MB 多，`read_all` 会把内核堆撑爆
+    //（内核堆不是为「把整个内核映像读回内存」准备的）。
+    const WINDOW: usize = 64;
+    const OFFSET: u64 = 4096;
+    let mut via_disk = [0u8; WINDOW];
+    let mut via_alias = [0u8; WINDOW];
+    let n_disk = vfs::read("/disk/KERNEL.ELF", OFFSET, &mut via_disk)
+        .map_err(|_| "fs: offset read of /disk/KERNEL.ELF failed")?;
+    let n_alias = vfs::read(&alias_file, OFFSET, &mut via_alias)
+        .map_err(|_| "fs: offset read through the alias mount point failed")?;
+    if n_disk != WINDOW || n_alias != WINDOW || via_disk != via_alias {
+        return Err("fs: two mount points of one volume returned different bytes");
+    }
+    serial::print("fs: alias point=");
+    serial::print(&alias_point);
+    serial::print(" offset=");
+    serial::print_dec(OFFSET);
+    serial::print(" bytes=");
+    serial::print_dec(WINDOW as u64);
+    serial::println(" (same bytes as /disk/KERNEL.ELF)");
+
+    // 4. 卸载别名：路径消失，卷仍在卷表里
+    let removed = mount::table()
+        .umount(&alias_point)
+        .map_err(|_| "fs: unmounting the alias mount point failed")?;
+    if removed.as_deref() != Some(vol_id.as_str()) {
+        return Err("fs: unmount reported the wrong volume");
+    }
+    if vfs::stat(&alias_file) != Err(vfs::ENOENT) {
+        return Err("fs: the alias path is still reachable after unmount");
+    }
+    let volume = crate::storage::registry::find(&vol_id)
+        .ok_or("fs: the volume left the table after unmount")?;
+    if volume.mount_count != 1 {
+        return Err("fs: the volume mount count did not drop back to the default mount");
+    }
+    serial::print("storage: unmount point=");
+    serial::print(&alias_point);
+    serial::print(" vol=");
+    serial::print(&vol_id);
+    serial::print(" mounts=");
+    serial::print_dec(volume.mount_count as u64);
+    serial::println(" (volume still listed)");
+    serial::print("fs: after unmount path=");
+    serial::print(&alias_file);
+    serial::print(" errno=");
+    serial::print_dec(vfs::ENOENT.unsigned_abs());
+    serial::println("");
+
+    // 5. 反例：挂载表拒绝的理由必须是具体 errno
+    if mount::table().umount("/nope") != Err(vfs::ENOENT) {
+        return Err("fs: unmounting a path that is not a mount point must be ENOENT");
+    }
+    if mount::table().umount("/") != Err(vfs::EINVAL) {
+        return Err("fs: unmounting the root must be EINVAL");
+    }
+    if mount::table().alias_volume("/volumes/none", "raw:99", MountOptions::RO) != Err(vfs::ENOENT) {
+        return Err("fs: aliasing a volume that is not mounted must be ENOENT");
+    }
+    if mount::table().alias_volume("/disk", &vol_id, MountOptions::RO) != Err(vfs::EEXIST) {
+        return Err("fs: mounting a second time on the same point must be EEXIST");
+    }
+    serial::println("fs: mount negative cases PASS (ENOENT/EINVAL/EEXIST)");
+
+    serial::println("fs: storage mount selftest PASS");
     Ok(())
 }
 

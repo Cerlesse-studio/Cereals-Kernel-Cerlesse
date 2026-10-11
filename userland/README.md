@@ -48,6 +48,7 @@ L /lib/ld.so    ld.so               # L = 被装载对象（解释器 / 共享�
 | `user/shell/` | 交互式 Shell（`/bin/sh`）：键盘行缓冲 → `stdin` → 内建命令 + `fork`/`execve`/`wait4` |
 | `user/hello-bin/` | 外部程序（`/bin/hello`）：由 Shell `fork` + `execve` 起来，打印 PID 与 `argv` |
 | `user/{ls,cat,echo,ps}/` | coreutils：`getdents` / 文件 syscall / `write` / `getprocs` |
+| `user/volumes/` | 存储卷枚举（`/bin/volumes`）：`storage_volumes`（CSS-1），打印卷表（`id`/`disk`/`part`/`fs`/`label`/`health`/`mounts`） |
 | `user/dynhello/` | 动态链接夹具（`as`+`ld` 现编）：`dynhello` + `libgreet.so` + `ld.so` |
 | `user/init/` | v0.9 占位（2 行）；真正的 `/init` 是 `user/hello` 的产物 |
 | `tools/check_dyn_fixture.py` | 动态链接夹具结构自检（ET_DYN + `PT_INTERP` + `DT_NEEDED`） |
@@ -55,7 +56,7 @@ L /lib/ld.so    ld.so               # L = 被装载对象（解释器 / 共享�
 ## 3. 构建
 
 ```bash
-make -C userland images        # 构建 7 个程序 + 3 个动态链接对象 + manifest.txt
+make -C userland images        # 构建 8 个程序（+3 个动态链接对象）+ manifest.txt
 make -C userland check         # 同上，并逐个校验 ELF 段布局（基址/页对齐/W^X/窗口/无重定位）
 make -C userland dyn           # 只重编动态链接夹具（需要 binutils：as/ld）
 make -C userland dyn-hostcheck # 用宿主机 glibc 的 ld.so 复核同一批夹具（缺工具则跳过）

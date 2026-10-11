@@ -92,10 +92,10 @@ Cerlesse/
 | `kernel/src/process/` | 进程/线程模型、PID、状态机 | v0.5 |
 | `kernel/src/scheduler/` | 调度队列、Round Robin | v0.5 |
 | `kernel/src/syscall/` | 系统调用入口/分发、用户地址空间、ELF Loader、首批与文件 syscall、**用户堆（`memory.rs`：`brk`/`mmap`/`munmap`）**、**进程调用（`process.rs`：`fork`/`execve`/`wait4` + argv 用户栈 + `getprocs`）**、**目录枚举（`dir.rs`：`getdents`）**、**最小动态链接（`dynamic.rs`：`ET_DYN`/`PT_INTERP`/`DT_NEEDED`/重定位）** | v0.6–v0.7 ✅ / v0.9 第一·三·五·六步 ✅ |
-| `kernel/src/fs/` | VFS 抽象（trait + 路径工具）、挂载表路由、RAMFS、fd 表、**FAT12/16/32 只读后端** | v0.7 ✅ / v0.8 ✅ |
+| `kernel/src/fs/` | VFS 抽象（trait + 路径工具）、挂载表路由、RAMFS、fd 表、**FAT12/16/32 只读后端**；**CSS-2 收口：后端能力位/卷信息、挂载表带卷身份与多挂载点、卸载、挂载错误改 errno** | v0.7 ✅ / v0.8 ✅ / CSS-2 ✅ |
 | `kernel/src/driver/` | 串口（v0.1）、键盘（v0.4）、**驱动注册框架 / PCI 枚举 / 块设备抽象 / virtio-blk**（v0.8 ✅） | v0.4 / v0.8 |
 | `kernel/src/driver/{pci,driver,block,virtio_blk}.rs` | `pci` 只回答「总线上有什么」；`driver` 回答「谁来管它」（`Driver` trait + `probe_all`）；`block` 是上层唯一可见的按扇区接口；`virtio_blk` 是具体实现（同时实现 `Driver` 与 `BlockDevice`） | v0.8 ✅ |
-| `kernel/src/fs/fat.rs` | 块设备上的 FAT12/16/32 **只读**后端（第二个 `FileSystem` 实现）：BPB 解析、固定根目录区/簇链目录、8.3 + NT 标志 + LFN、任意偏移读；写操作 `EROFS`；损坏结构 `EUCLEAN` | v0.8 ✅ |
+| `kernel/src/fs/fat.rs` | 块设备上的 FAT12/16/32 **只读**后端（第二个 `FileSystem` 实现）：BPB 解析、固定根目录区/簇链目录、8.3 + NT 标志 + LFN、任意偏移读；写操作 `EROFS`；损坏结构 `EUCLEAN`；**CSS-2 起同时是 FAT 的探测唯一入口（`probe`/`probe_sector`）与 `caps`/`volume_info` 的提供方，`open` 返回 `OpenError{errno,reason}`** | v0.8 ✅ / CSS-2 ✅ |
 | `kernel/src/memory/frame.rs` | 位图帧分配器；v0.8 追加 `allocate_contiguous` / `free_contiguous`（virtqueue 与 DMA 要求的物理连续缓冲） | v0.3 ✅ / v0.8 ✅ |
 | `kernel/src/arch/x86_64/port.rs` | 端口 I/O 统一入口：`inb/inw/inl` + `outb/outw/outl`（PCI 配置空间与 legacy virtio 寄存器窗口依赖 32 位读写） | v0.8 ✅ |
 | `kernel/src/ipc/` | 管道、通道、共享内存 | v0.5+ |
@@ -139,6 +139,25 @@ CKM（内核级权限控制与扩展管理，见 [ckm.md](ckm.md)）预计新开
 > 边界：CKM Core 是内核机制（`tools/check-boundary.py` 的门禁继续生效），
 > `ckmd`/`ckm` 必须进 `userland/`；内核不认识 `.ckc`，也不解析扩展清单。
 
+### 3.2 CSS 规划新增（第十二阶段，尚未创建）
+
+CSS（存储管理，见 [storage.md](storage.md)）预计新开/扩展以下目录；**当前都还不存在或未扩展**，
+按 CSS-1…CSS-6 分期创建并回填（**CSS-1/CSS-2 已落地**）：
+
+| 规划目录 | 职责 | 分期 |
+| ---- | ---- | ---- |
+| `kernel/src/storage/{mod,registry,partition,gpt,mbr,volume,selftest}.rs` | CSS：设备/分区/卷登记、GPT/MBR **只读**解析、稳定卷标识 `vol_id`、卷标/健康状态/只读原因（✅ CSS-1 已落地） | CSS-1 |
+| `kernel/src/syscall/storage.rs` | CSS 的 syscall 入口（号 **261–266**：卷枚举/挂载/卸载/分配字母/重扫/格式化；✅ 261/265 已实现，其余桩） | CSS-1 / CSS-3 |
+| `kernel/src/fs/{vfs,mount,inode,file,ramfs,fat}.rs` | ✅ **CSS-2 已落地**：加 `caps`/`volume_info`（及 `FsCaps`/`VolumeInfo`/`MountOptions`）、FAT 探测收归 `fs/fat.rs`、挂载表拆「后端 / 挂载点」并带 `vol_id`/`options`（`alias_volume`/`umount`/`sync_counts`）、挂载错误改 errno、`stat` 输出 `vol=` | CSS-2 ✅ |
+| `kernel/src/fs/{exfat,ext2,ext4,ntfs,iso9660}/` | 新文件系统后端（各自实现 `FileSystem`，VFS 不变） | CSS-4 / CSS-6 |
+| `userland/libc` 的 path 模块 | Windows 式路径（`C:\x`）→ POSIX 路径重写（查 `storage_volumes`，不硬编码字母） | CSS-3 |
+| `userland/ckm/`（`ckm storage …`） | CSS Manager：列出磁盘/分区/卷、挂载/卸载、分配盘符、显示健康与只读原因 | CSS-5 |
+| `tools/mkfs/` | ✅ **GPT/MBR 分区表镜像生成**（CSS-1 已落地，`make test-storage` 的夹具），沿用「自己生成 + 宿主独立复核」的做法 | CSS-1 |
+
+> 边界：**盘符不属于文件系统驱动**（`fs/*` 不认识 `C:`）；CSS 不重写 VFS（新格式 = 再实现一个
+> `FileSystem`）；第一版不写分区表（GPT/MBR 只读扫描）；权限判定走 CKM，界面在 `userland/`。
+> 见 [storage.md](storage.md) 第 0/6/11 节。
+
 ## 4. 纯内核化（已执行大部分，见 [pure-kernel.md](pure-kernel.md) 第 8 节）
 
 内核只保留机制；用户态已拆成**独立 workspace** `userland/`（本轮），后续用
@@ -169,6 +188,7 @@ time,process,scheduler,fs,driver,network,ipc,security}`、`boot/`、`shared/` �
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-11 | v1.0 之后规划：新增第 3.2 节（**CSS 存储管理**预计新开/扩展的目录：`kernel/src/storage/`、`syscall/storage.rs`、`fs/{exfat,ext2,ext4,ntfs,iso9660}/`、libc 路径模块、`ckm storage`、`mkfs` 分区表生成 —— 均未创建，进入 CSS-1…CSS-6 时回填） |
 | 2026-10-11 | 纯内核化**执行阶段二/四/五（部分）**：`libc/`(7) 与 `user/`(33) 移入 `userland/` 独立 workspace（目录树重写为本节的 userland/ 子树，含 `Cargo.toml`/`.cargo/config.toml`/`Makefile`/`tools/check_dyn_fixture.py`）；`kernel/build.rs` 改为「按 `manifest.txt` 内嵌」（不再构建用户程序）；新增 `tools/check-boundary.py`；根 `Cargo.toml` 收敛为 `shared/boot/kernel` + `exclude userland`；第 4 节由「规划」改为「已执行大部分」（实测：无 userland 的 checkout 仍能 `make image` + `make test-kernel-only`） |
 | 2026-10-11 | 纯内核化规划：新增第 4 节（目标结构：内核/用户态双仓库、新增 `abi/`、9 个内核文件改动清单）；修订记录顺延为第 5 节 |
 | 2026-10-11 | v1.0 之后规划：新增第 3 节（桌面路线预计新开的模块：`dev`/`procfs`/`sysfs`/`input`/`display`/`sound`/`acpi`/`ipc` 扩展 —— 均未创建，进入里程碑时回填） |

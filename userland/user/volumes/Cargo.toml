@@ -1,0 +1,12 @@
+[package]
+name = "user-volumes"
+version = "0.1.0"
+edition = "2021"
+description = "CSS-1 基础用户程序（/bin/volumes）：storage_volumes 打印内核卷表"
+
+[dependencies]
+libc = { path = "../../libc" }
+
+[[bin]]
+name = "user-volumes"
+path = "src/main.rs"

@@ -24,6 +24,7 @@ mod memory;
 mod network;
 mod process;
 mod scheduler;
+mod storage;
 mod time;
 
 type KernelTaskEntry = extern "C" fn() -> !;
@@ -251,15 +252,36 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
         }
     }
 
+    // CSS-1（H-08）：块设备之上的分区/卷只读识别 —— 先看清「有哪些卷」，再谈挂载。
+    // 位置在块设备验收之后、`fs::mount_disks` 之前：扫描是只读的，失败不会残留在盘上。
+    if let Err(err) = storage::init() {
+        driver::serial::print("storage: FAIL: ");
+        driver::serial::println(err);
+        halt();
+    }
+    if let Err(err) = storage::selftest() {
+        driver::serial::print("storage: FAIL: ");
+        driver::serial::println(err);
+        halt();
+    }
+
     // v0.8：把块设备上的 FAT 卷挂进 VFS（`/disk` = 启动盘、`/mnt/fat` = mkfs 生成的测试盘），
     // 然后在**文件系统层**做一次验收 —— syscall 层不需要任何改动就能 open/read 磁盘上的文件。
-    if let Err(err) = fs::mount_disks() {
-        driver::serial::print("fs: disk mount FAIL: ");
-        driver::serial::println(err);
+    if let Err(errno) = fs::mount_disks() {
+        driver::serial::print("fs: disk mount FAIL errno=");
+        driver::serial::print_dec(errno.unsigned_abs());
+        driver::serial::println("");
         halt();
     }
     if let Err(err) = fs::disk_selftest() {
         driver::serial::print("fs: disk FAIL: ");
+        driver::serial::println(err);
+        halt();
+    }
+    // CSS-2：挂载收口自测 —— 只读原因可读、记录被消费者读对、同一卷多挂载点、卸载。
+    // 位置在 `disk_selftest` 之后（它已经证明 `/disk` 上有真文件可读）。
+    if let Err(err) = fs::storage_mount_selftest() {
+        driver::serial::print("fs: storage mount FAIL: ");
         driver::serial::println(err);
         halt();
     }
