@@ -53,6 +53,12 @@ pub fn init(boot_info: &BootInfo) -> Result<(), &'static str> {
     frame::stress_test()?;
     serial::println("frame: stress PASS (1024 frames alloc/unique/free)");
 
+    // v0.8：连续帧分配（DMA / virtqueue 的前置条件）
+    let contiguous = frame::contiguous_selftest()?;
+    serial::print("frame: contiguous PASS (4 frames @ ");
+    serial::print_hex(contiguous);
+    serial::println(")");
+
     paging::selftest()?;
     serial::println("paging: map/unmap PASS (fresh address space, 3 pages)");
 

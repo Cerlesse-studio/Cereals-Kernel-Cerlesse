@@ -1,9 +1,19 @@
 # Cerlesse OS 主开发文档（DEVELOPMENT）
 
 - 阶段：第一阶段
-- 最后更新：2026-10-08
+- 最后更新：2026-10-11
 - 状态：v0.1–v0.5 全部完成（v0.4：中断/Timer/键盘/上下文切换 + H-04/H-05 Go 工具，`make go-test` / `make test-orch` 通过；v0.5：线程模型 + Round Robin 时间片调度 + IPC pipe 骨架，`make test-scheduler` / `make test-ipc` 通过）；
-  v0.6/v0.7 仍为占位文档，尚未进入编码
+  v0.6 核心已落地并通过 `make test-user` 验收（syscall/sysret 入口 + ring3 + 用户地址空间隔离），
+  并且**用户态脚手架已可用**（`libc/` 最小运行时 + `user/hello` 真实 Rust 用户程序 + `kernel/build.rs` 构建期摊平内嵌，`make user` 可单独验证）；
+  **v0.7 已落地并通过 `make test-fs`（19 项）+ `make test-user`（32 项）验收**：
+  VFS（trait + 挂载表最长前缀路由）、RAMFS、fd 表、`read`/`write`/`open`/`close`，
+  以及 **ELF Loader**（用户程序不再是摊平映像，而是 RAMFS 上的 `/init` 经 `elf.rs` 按段权限装载，
+  `RW` 段对 ring3 可写）；`make user` 追加 `tools/check_user_elf.py` 独立校验段布局；
+  **v0.8 前半已落地并通过 `make test-driver`（22 项）验收**：驱动注册框架（`Driver` trait + 注册表 + `probe_all`）、
+  PCI 枚举（配置机制 #1 + BAR 探测 + 窗口大小）、块设备抽象（按 512 字节扇区读写）、
+  **legacy virtio-blk 0.9.5**（virtqueue + 同步轮询 + bounce buffer）、`frame::allocate_contiguous`（DMA 前置条件）；
+  启动盘已改为 virtio-blk（`disable-modern=on`）；v0.8 剩余的 **FAT32 挂到 VFS** 与 H-03 `mkfs` 仍待做，
+  v0.9（Shell/用户程序/网络）仍为占位
 - 关联文档：[docs/architecture.md](docs/architecture.md) · [docs/roadmap.md](docs/roadmap.md) · [docs/project-structure.md](docs/project-structure.md) · [docs/drivers.md](docs/drivers.md) · [docs/syscall.md](docs/syscall.md) · [docs/filesystem.md](docs/filesystem.md) · [docs/process.md](docs/process.md)
 
 ---
@@ -68,11 +78,13 @@ boot ──→ arch(x86_64) ──→ interrupt ──→ time
 ## 3. Cargo Workspace 规划（v0.1 初始化）
 
 ```toml
-# 根 Cargo.toml（v0.1 已落地）
+# 根 Cargo.toml（v0.1 落地；v0.6 加入 libc 与 user/*，并新增 user-release profile）
 [workspace]
 resolver = "2"
-members = ["shared", "boot", "kernel", # "user/*"（v0.6 起加入）
-];
+members = ["shared", "boot", "kernel", "libc", "user/hello"]
+# 用户程序只能为目标 x86_64-unknown-none 构建（链接在 2^39），
+# 因此 `cargo build`（不带 --target）仍只构建前三者。
+default-members = ["shared", "boot", "kernel"]
 
 [profile.dev]
 panic = "abort"
@@ -81,6 +93,12 @@ panic = "abort"
 opt-level = 2
 lto = true
 panic = "abort"
+
+# 用户程序专用：large 代码模型与 LTO 不兼容（见 libc/README.md 第 3 节）
+[profile.user-release]
+inherits = "dev"
+opt-level = 2
+lto = false
 ```
 
 约定：
@@ -88,7 +106,9 @@ panic = "abort"
 - `shared`：boot 与 kernel 共享的 `BootInfo` 等纯数据结构（no_std）。
 - `kernel`：`#![no_std]`，目标 `x86_64-unknown-none`，链接脚本 `kernel/link.ld`（32MiB）。
 - `boot`：UEFI 引导 crate，目标 `x86_64-unknown-uefi`；与内核边界调用必须 `extern "sysv64"`（ADR-006）。
-- `user/*`：`no_std` 用户态程序，产出静态 ELF（v0.6 起加入 workspace）。
+- `libc`：最小用户态运行时（syscall 封装 + `_start` + `print!/println!`，v0.6 起加入 workspace）。
+- `user/*`：`no_std` 用户态程序，产出静态 ELF（v0.6 起加入 workspace）；
+  当前 `user/hello` 为可运行的真实程序，`init/shell/ls/cat/echo/ps` 仍是 v0.9 占位。
 - `tools/`（Python）与 `tools-go/`（Go）**不进 Cargo workspace**，各自独立管理。
 - 交叉编译在 Linux 与 Windows 主机上均通过 `rustup target add` 相同目标完成（见 docs/boot.md）。
 
@@ -203,7 +223,7 @@ v0.4 发现并修复的缺陷（随本阶段一并落地）：
   主机侧 H-04/H-05（testorch / serialmon）已落地，`make go-test` 与 `make test-orch`（6 场景并行）均实测通过。
 - v0.5 整体标记为**已完成**：线程模型 + 上下文切换 + Round Robin 时间片调度已验收，
   IPC（pipe 骨架）已落代码并通过 `make test-ipc` 验收；channel / shared_memory 按计划保留为后续占位。
-- 下一开发顺序按 DEVELOPMENT.md 第 5 节版本顺序继续：进入 v0.6（syscall/user space）。
+- 下一开发顺序按 DEVELOPMENT.md 第 5 节版本顺序继续：v0.6 核心与用户态脚手架均已落地，继续 v0.7（ELF Loader / VFS 文件语义 / 更多 syscall）。
 
 v0.5 踩坑记录（已修复，建议保留）：
 
@@ -213,38 +233,113 @@ v0.5 踩坑记录（已修复，建议保留）：
 | B-11 | **高** | IRQ 的 EOI 原先在回调**之后**发出；IRQ0 回调会触发任务切换，本调用栈很晚才恢复 → PIC 不再递交 IRQ0 | `irq_dispatch` 改为「先 EOI，后分发」（中断门已清 IF，提前 EOI 无嵌套风险） |
 | B-12 | 中 | 启动上下文切出后没有回到就绪队列，Round Robin 永远绕不回 pid 0，`start()` 无法返回 | `start()` 在切出前把 pid 0 压回队尾 |
 
-### v0.6 — Syscall + User Space（尚未开始编码；本次已把文档细化到可直接开工程度；当前仍为规划/占位）
-- [ ] syscall 指令入口（`syscall`/`sysret` 或 `int 0x80`）
-    - 当前草案优先候选 `syscall`/`sysret`，备选 `int 0x80` 风格入口
-    - 选型与寄存器/错误返回约定在编码时固化
-- [ ] `exit/write/read/open/close/fork/exec/wait/getpid/sleep`
-    - v0.6 最小集：`exit / write / getpid / sleep` 为核心目标
-    - `read / fork / exec / wait` 可在 v0.6 起步或留到 v0.7 完善
-    - `open / close` 留到 v0.7 与 VFS 对接
-- [ ] 用户地址空间隔离 + 最小 libc（`libc/`）
-    - 高半区映射与用户态隔离按 ADR-009 推迟到本阶段一并做
-    - `libc/` 至少提供 `start -> main` 胶水 + `exit / write / read` 等封装
-- [ ] 验收：用户态 `hello` 运行、退出码回收
-- [ ] v0.6 验收（细化后）：
-    - [ ] 用户态 `hello` 程序通过 ELF Loader 加载并运行
-    - [ ] 用户态隔离下 syscall 入口/返回可观察
-    - [ ] `exit` 能回收退出码（至少在串口可观察到）
-    - [ ] `fork`/`exec`/`wait` 基本流程可用（v0.7 完善前，v0.6 至少具备可验证骨架）
-    - [ ] `getpid`/`sleep` 可用
+### v0.6 — Syscall + User Space（核心 + 用户态脚手架已实现并通过 `make test-user` 验收，2026-10-10 / 收尾 2026-10-11）
+- [x] syscall 指令入口：**选定 `syscall` / `sysret`**（`int 0x80` 方案不保留）
+    - `IA32_LSTAR` → `syscall_entry`；`IA32_STAR` 决定 GDT 用户段布局（udata 必须紧邻 ucode 之前）；
+      `IA32_FMASK` = IF\|DF\|TF，内核在关中断下运行 syscall handler
+    - 寄存器约定：号 `rax`；参数 `rdi/rsi/rdx/r10/r8`；返回值 `rax`；负数 = `-errno`
+- [x] `syscall/mod.rs` 分发层 + `syscall_table.rs` 全号段分发表（未实现号落在 `-ENOSYS` 桩）
+- [x] 已实现的 syscall（v0.6 最小集）
+    - [x] `write`（fd=1/2 写串口；用户缓冲先用当前用户地址空间校验，越界 `-EFAULT`）
+    - [x] `exit`（记录退出码并结束当前用户态执行）
+    - [x] `getpid`（返回当前用户程序 PID）
+    - [x] `sleep`（PIT tick 粒度等待；等待期间 `sti; hlt`）
+- [x] 用户地址空间隔离（`syscall/address_space.rs`）
+    - [x] 独立 PML4 + 用户映射固定在下标 1（0x8000000000），Drop 整棵释放
+    - [x] 内核子树 `USER` 位惰性清理（只在该位确为 1 时写回）
+    - [x] 代码页只读可执行、栈页可写不可执行；每级中间表均置 `USER`
+- [x] ring3 异常终止语义：`exception_dispatch` 用 `cs & 3` 区分来源，用户态异常不再 panic
+- [x] 用户态执行期收敛：`scheduler::suspend()` + `TSS.RSP0` 切到专用陷阱栈
+- [x] 用户态脚手架（2026-10-11 收尾，`make user` + `make test-user` 实测通过）：
+    - [x] `libc/`：syscall 封装（`write`/`getpid`/`nanosleep`/`exit`）、`_start`（`.text.start` → 用户 `main`）、
+      `print!`/`println!`（一次宏调用 = 一次 `write`）、`#[panic_handler]`
+    - [x] `user/hello`：真实 Rust 用户程序（不再是内嵌机器码），进入 workspace 与构建链
+    - [x] `kernel/build.rs`：构建期构建用户程序 → 解析 ELF → 摊平成连续映像 → `include_bytes!` 内嵌
+      （同时断言装载基址 = `USER_VIRT_BASE`、入口在映像第 0 字节、无可装载重定位）
+    - [x] `UserSpace::load_program` 支持多代码页（1..=8 页，实测 `user/hello` 占 2 页），
+      代码区/栈区间固定布局
+    - [x] `make user` 单独验证脚手架（不启 QEMU）；`make test-user` 断言 `user: program=hello source=libc`
+- [x] v0.6 验收（`make test-user`，19 项串口断言实测 PASS）：
+    - [x] 用户态隔离下 syscall 入口/返回可观察（`user: write fd=1 len=22` / `user: getpid -> 1`）
+    - [x] `exit` 能回收退出码（`user: exit code=42` → `user: hello PASS`）
+    - [x] `getpid`/`sleep` 可用（`user: sleep done ticks=2`，计时真实推进）
+    - [x] 隔离硬证据：probe 读内核页被拦下（`vector=0xe error=0x5 cr2=0x2000000`）+ 内核继续运行
+- [x] 推进到 v0.7 的部分（v0.6 时明确未做；2026-10-11 已在 v0.7 完成的部分）：
+    - [x] 用户程序通过 **ELF Loader** 从文件加载运行（RAMFS 上的 `/init`）
+    - [x] `read` / `open` / `close`（与 VFS 对接）
+    - [x] 用户静态数据可写（`RW` 段按段权限映射，实测 `hello: static counter=1`）
+- [ ] 仍未做（属于 v0.8+，不应被读成已完成）：
+    - [ ] `fork` / `exec` / `wait`
+    - [ ] 进程/线程对象（`exit` 是「结束当前用户态执行」，不是「销毁进程」）
+    - [ ] 高半区迁移（隔离当前靠页表 `USER` 位而非地址空间划分）
+    - [ ] 用户堆/`brk`/`mmap`、`argc/argv` 传递（用户程序只有映像窗口 + 4 页栈）
 
-### v0.7 — VFS + RAMFS + ELF
-- [ ] VFS trait（FileSystem/File/Directory、Inode、Mount）
-- [ ] RAMFS 实现与目录骨架
-- [ ] ELF Loader 完整化（User Stack/Heap）
-- [ ] Python mkfs（H-03）
-- [ ] 验收：`ls`/`cat`/`cd` 操作 RAMFS
+v0.6 踩坑记录（已修复，建议保留）：
 
-### v0.8 — Driver + PCI + Disk
-- [ ] Driver Manager 与驱动注册框架
-- [ ] PCI 枚举 + Vendor/Device 匹配
-- [ ] 块设备驱动（virtio-blk 或 ATA）
-- [ ] 磁盘 FS 后端（FAT32）挂载到 VFS
-- [ ] 验收：PCI 列表输出、磁盘读写、FAT32 挂载
+| # | 级别 | 问题 | 修复措施 |
+| ---- | ---- | ---- | ---- |
+| B-13 | **高** | 创建用户地址空间时无条件重写整棵内核页表来清 `USER` 位。OVMF/EDK2 把自己建立的页表页标为**只读** → 启动路径上直接 #PF（实测 `CR2=0x1fc03000`，`error=P\|W`） | `scrub_user_bits` 改为**惰性**：只在 `USER` 确为 1 时才写回，并打印清位数（实测 OVMF 全为 0） |
+| B-14 | **高** | `syscall` 返回路径栈算术写成 `add rsp, 48`。8 次 push 是从栈顶**向下**增长，该写法把 rsp 移到栈顶之上，`pop r11/rcx` 取到垃圾 → `sysretq` 跳飞到 `RIP=0x3` | 改为 `sub rsp, 16` 后 `pop r11` / `pop rcx`（r11/rcx 位于 top-16 / top-8） |
+
+### v0.7 — VFS + RAMFS + ELF（核心已实现并通过验收，2026-10-11）
+- [x] VFS 抽象（`kernel/src/fs/vfs.rs`）：`FileSystem` trait（stat/read/read_all/write/create/mkdir/list/usage）
+      + 路径工具（`normalize`/`components`/`within`）+ 系统级入口（经挂载表路由，错误一律负数 errno）
+- [x] 挂载管理（`fs/mount.rs`）：挂载点 → 后端，**最长前缀路由**（`/mnt/*` 落到 `/mnt` 的后端）
+- [x] Inode/元数据（`fs/inode.rs`）：`NodeKind`、`Metadata`（含 `ls -l` 风格权限串）、`DirEntry`
+- [x] RAMFS（`fs/ramfs.rs`）：`Node { name, kind, data: Vec<u8>, children }`，单文件上限 256 KiB；
+      `fs::init` 建立初始文件树 `/init` + `/etc/motd` + `/tmp`
+- [x] fd 表与文件 syscall（`fs/file.rs` + `syscall/file.rs`）：0/1/2 保留、动态 fd ≥ 3（最小空闲槽位）、
+      `open`（指针 + 长度、`O_CREAT`）/`read`/`write`/`close`，用户缓冲按页校验（`-EFAULT`）
+- [x] **ELF Loader**（`syscall/elf.rs`）：ELF64/`ET_EXEC`/`EM_X86_64` 解析 → 按段权限逐页映射
+      （`W` → 可写、非 `X` → `NX`）→ 拷贝 `p_filesz`、`p_memsz` 余下置 0 → 入口取 `e_entry`；
+      拒绝畸形 ELF 时打印 `user: ELF rejected: <reason>`
+- [x] 用户程序改为从文件加载：`kernel/build.rs` 内嵌 ELF → RAMFS `/init` → `vfs::read_all` → `elf::load`
+      （v0.6 的「构建期摊平」已移除）；`user.ld` 四个段分别 `ALIGN(0x1000)`，`W^X` 不退化
+- [x] 隔离探针保留为 `map_raw` 路径（探针不依赖被测的 ELF Loader）
+- [x] 验收：`make test-fs` 19 项 PASS（挂载/初始文件树/stat/内容读回/挂载点路由/`ls`/负例 errno）；
+      `make test-user` 32 项 PASS（`source=elf` + 段数/页数/可写页 + `open/read/close/write` 全链路 +
+      用户写入被内核读回 + `static counter=1`（`RW` 段可写）+ `EFAULT` + 退出码/隔离回归）
+- [x] `make user` 追加 `tools/check_user_elf.py`：不启 QEMU 即可校验基址/段页对齐/`W^X`/映像窗口/无重定位
+- [ ] Shell 里 `ls`/`cat`/`cd` 操作 RAMFS → **v0.9**（需要 shell 与 `argc/argv`；v0.7 已在内核侧与
+      `/init` 里验证了同样的路径/文件语义）
+- [ ] 磁盘文件系统后端（FAT32）+ Python mkfs（H-03）→ **v0.8**（RAMFS 是内核内建，不需要镜像生成）
+- [ ] 用户堆 / `brk` / `mmap`、`argc/argv`、`fork`/`execve`/`wait4`、动态链接 → v0.8+（见 docs/syscall.md 3.4）
+
+### v0.8 — Driver + PCI + Disk（前半已实现并通过验收，2026-10-11）
+- [x] Driver Manager 与驱动注册框架（`kernel/src/driver/driver.rs`）：`Driver` trait（`name`/`matches`/`attach`）、
+      固定容量注册表、`probe_all()` 按注册顺序匹配 + 挂接、`ProbeStats { devices, matched, attached, failed }`
+- [x] PCI 枚举 + Vendor/Device 匹配（`kernel/src/driver/pci.rs`）：配置机制 #1（`0xCF8`/`0xCFC`）、
+      全总线扫描（多功能位修剪）、BAR 探测（写全 1 读掩码）与**窗口大小**计算、类别三元组解码、`print_bdf`
+- [x] 块设备抽象 + 注册表（`kernel/src/driver/block.rs`）：`BlockDevice`（`read`/`write`/`sectors`/`sector_size`）、
+      512 字节扇区粒度、长度非整扇区直接报错（不静默取整）
+- [x] 块设备驱动：**legacy virtio-blk（0.9.5）**（`kernel/src/driver/virtio_blk.rs`）：
+      virtqueue（描述符表 + avail + 4 KiB 对齐 used）→ notify → 轮询 used ring（PIT tick 超时），
+      描述符链「请求头 → 数据 → 状态字节」，页对齐 bounce buffer 分块搬运（不要求调用方缓冲对齐/连续）；
+      status 机 `ACKNOWLEDGE → DRIVER → FEATURES_OK → DRIVER_OK`，modern（0x1042）明确拒绝并给出原因
+- [x] 基础设施：`arch/x86_64/port.rs`（`inb/inw/inl`+`outb/outw/outl`）、`frame::allocate_contiguous` / `free_contiguous`
+      （virtqueue 必须物理连续，legacy 的队列地址只装一个 PFN）
+- [x] 硬件路线改变：QEMU 启动盘由 IDE/AHCI 改为 **virtio-blk（legacy）** —— 「镜像能启动」与
+      「内核驱动能读写这块盘」变成同一台设备上的同一条路径（Makefile `run` / `tests/test_boot.py` / `tests/test_keyboard.py`）
+- [x] 验收：`make test-driver` 22 项 PASS（`vendor=0x1af4 device_id=0x1001`、`bar0=io:`、
+      `queue0 size=256 ... 3 pages contiguous`、`capacity=131072 sectors (64 MiB)`、
+      `boot sector sig=0x55aa fstype=FAT16`、分块读一致性 512/4096/4608、写回读 + 还原、三类负例）；
+      编排场景由 8 个增至 **9 个**（`driver`），`make test-orch` 9 passed / 0 failed（127.2s）
+- [ ] 磁盘 FS 后端（FAT32）挂载到 VFS → v0.8 剩余部分（见 docs/filesystem.md）
+- [ ] Python `mkfs` 工具（H-03）→ 与 FAT32 后端一起做
+
+#### v0.8 缺陷与设计记录
+
+| 编号 | 等级 | 现象 | 处理 |
+| ---- | ---- | ---- | ---- |
+| B-16 | 中 | BAR 窗口大小算错：低字掩码（u32）被当成 u64 取反 → 类型正确的 I/O BAR 报出 `0xFFFFFFFF00000080` 这种尺寸（真实值 0x80） | 大小改为在该字**自己的位宽**里求 `~mask + 1`（`0x1_0000_0000 - (mask & !0xF)`）；另补两条边界：掩码全 1 = BAR 未实现，64 位 BAR 低字掩码为 0 → 大小由高字决定 |
+| B-17 | 高 | `lba + sectors` 用 `u64` 加法：`lba = u64::MAX - 1` 时环绕后的和为 0，「看起来」在容量内 → 越界请求会发给设备 | 改用 `checked_add`，溢出即报错；负例测试加入 `lba=u64::MAX-1` |
+
+设计取舍（与 ADR 同级，理由见 docs/drivers.md 1.2）：
+
+- PCI 走配置机制 #1（不依赖 ACPI）而不是 ECAM；
+- 只实现 legacy virtio，modern 遇到就报错（QEMU 用 `disable-modern=on` 提供 legacy）；
+- 块 I/O 同步轮询（自旋 + PIT tick 超时），不配置 MSI-X/INTx；
+- 驱动注册表容量固定、启动期写入、之后只读（`main` 只看 `ProbeStats`）。
 
 ### v0.9 — Shell + User Programs + Network
 - [ ] `init` + `sh`（ls/cat/cp/mv/rm/mkdir/ps/kill/echo）
@@ -270,6 +365,7 @@ v0.5 踩坑记录（已修复，建议保留）：
 | 压力测试 | 帧分配、任务轮转、fork 风暴 | Python + Go 编排 | v0.3/v0.5 |
 | 回归测试 | 每个里程碑的验收标准固化为测试用例 | Go 编排服务 | v0.4 |
 | 异常测试 | 故意触发 #DE/#PF，校验诊断输出（`make test-exception` / `make test-pagefault`） | Python | v0.2（#PF 于 v0.3 加入） |
+| 驱动/块设备测试 | PCI 枚举 → 驱动挂接 → 扇区读写/分块一致性/负例（`make test-driver`） | Python | v0.8 |
 
 约定：
 
@@ -281,12 +377,16 @@ v0.5 踩坑记录（已修复，建议保留）：
 启动（计划的 Makefile 目标）：
 
 ```bash
-# 构建镜像后启动（v0.1 起提供）
+# 构建镜像后启动（v0.1 起提供；v0.8 起启动盘挂在 virtio-blk 上）
 make run
 # 底层等价于：
 qemu-system-x86_64 -machine q35 -m 512M -serial stdio -display none \
-  -drive format=raw,file=build/disk.img
+  -drive if=none,id=blk0,format=raw,file=build/disk.img \
+  -device virtio-blk-pci,drive=blk0,disable-modern=on
 ```
+
+注：`disable-modern=on` 是必需的 —— 内核只实现 legacy virtio（见 docs/drivers.md 1.2）；
+测试脚本会再加 `snapshot=on`（临时写时复制），使并行场景共享同一镜像且不污染原始文件。
 
 调试流程：
 
@@ -324,11 +424,13 @@ qemu-system-x86_64 -machine q35 -m 512M -serial stdio -display none \
 | 2026-10-07 | v0.3 完成：内存管理（帧分配器/页表 Mapper/内核堆）；新增 test-memory、test-pagefault 验收目标；补记 B-06/B-07 |
 | 2026-10-08 | v0.4 完成：PIC/PIT 100Hz/PS-2 键盘/上下文切换原语；新增 test-keyboard 验收目标；补记 B-08/B-09；H-04/H-05 主机侧 Go 工具仍待开工 |
 | 2026-10-08 | v0.5 内核侧落地：线程模型/PID/就绪队列/Round Robin 时间片调度接入 PIT/IRQ0；新增 test-scheduler；补记 B-10/B-11/B-12；IPC 仍待做 |
-| 2026-10-08 | v0.4 收尾（H-04/H-05）：复核发现测试编排器（testorch）/串口日志分析（serialmon）代码已落地，实测 `make go-test`（vet + test）与 `make test-orch`（6 场景并行，6 passed / 0 failed）均通过，v0.4 标记为整体完成 |
-| 2026-10-08 | v0.4 收官：复核发现 H-04/H-05 代码已落地，实测 `make go-test`（vet + test）与 `make test-orch`（6 场景并行，6 passed / 0 failed）均通过，v0.4 标记为整体完成 |
-| 2026-10-08 | v0.5 收官：IPC（pipe）落地（`kernel/src/ipc/pipe.rs` 环形缓冲单向管道 + 串口摘要日志 + 自测），新增 `make test-ipc` 并入 `test-all` 与 orchestrate.json 编排场景；IPC 验收项全部通过，v0.5 标记为整体完成 |
-| 2026-10-08 | 本次 docs 迭代统一各阶段文档顶部元信息（阶段 / 最后更新 / 状态）、修订记录与本文件描述一致，保持索引与主开发文档一致 |
 | 2026-10-08 | 本次 docs 迭代统一文档与代码库状态不一致点：v0.4 收官前，部分文档一度记载 H-04/H-05 仍待编写；但工具代码已实际落地；随后复核确认 `make go-test`（vet + test）与 `make test-orch`（6 场景并行，6 passed / 0 failed）均通过，v0.4 最终标记为整体完成 |
 | 2026-10-08 | 继续 v0.5 后续开发前，统一当前未完成项表述：v0.5 仅剩 IPC(pipe/channel/shared_memory) 未落地；syscall.md 与 filesystem.md 仍为占位文档，尚未进入 v0.6/v0.7 编码 |
 | 2026-10-08 | 按开发流程复查后更新：v0.4 与 v0.5 都尚未在 DEVELOPMENT 里标记为整体“以完成”，因为当前尚未完成项尚未通过验收/尚未实现 |
 | 2026-10-08 | 本次 docs 迭代统一各阶段文档顶部元信息（阶段 / 最后更新 / 状态）、修订记录与本文件描述一致，保持索引与主开发文档一致 |
+| 2026-10-10 | **v0.6 核心落地**：`syscall`/`sysret` 入口 + 真实用户页表（PML4 下标 1，每级 `USER`）+ ring3 进入/退出 + `write/exit/getpid/sleep` + ring3 异常终止（不再 panic）；新增 `make test-user` 18 项断言与 orchestrate.json `user` 场景（7 场景）；补记 B-13（固件页表只读 → 惰性清 `USER`）、B-14（`syscall` 返回栈算术）；同步 docs/syscall.md 从占位改为实现记录 |
+| 2026-10-11 | **v0.6 用户态脚手架可用**：`libc/` 从占位变为实现（syscall 封装 + `_start` + `print!/println!` + `panic_handler`）；新增真实用户程序 `user/hello` 并入 workspace（含 `default-members` 与 `user-release` profile，large 代码模型 + `lto = false`）；`kernel/build.rs` 构建期构建用户程序并摊平成连续映像内嵌（断言装载基址 / 入口在映像第 0 字节 / 无可装载重定位）；`UserSpace::load_program` 支持多代码页（1..=8）；新增 `make user`，`make test-user` 增至 **19 项断言**（含 `user: program=hello source=libc`）；全量回归（test / test-memory / test-scheduler / test-ipc / test-exception / test-pagefault / test-keyboard / go-test / test-orch 7 场景）PASS |
+| 2026-10-11 | **v0.7 落地（VFS + RAMFS + ELF Loader）**：`fs/` 从占位变为实现（`vfs` trait + 路径工具 + 系统级入口、`mount` 最长前缀路由、`inode` 元数据、`ramfs` 内存后端、`file` fd 表）；`read`/`write`/`open`/`close` 接入 `syscall_table`（fd 0/1/2 保留、动态 fd ≥ 3、用户缓冲按页校验）；新增 `syscall/elf.rs`：用户程序改为「RAMFS `/init` → ELF Loader 按段权限逐页映射」（`build.rs` 不再摊平，`user.ld` 四个段 `ALIGN(0x1000)`，`.lbss.*` 必须归入 `.bss`），`RW` 段对 ring3 可写；新增 `make test-fs`（19 项）与 `tools/check_user_elf.py`（`make user` 验段布局），`make test-user` 增至 **32 项断言**；修 B-15（syscall 入口未恢复 caller-saved 寄存器 → 用户态 `r9` 被破坏，#PF）；全量回归（9 个串口测试目标 + `go-test` + `test-orch` **8 场景**）PASS |
+| 2026-10-11 | **v0.8 前半落地（驱动框架 + PCI + 块设备）**：新增 `driver/driver.rs`（`Driver` trait + 注册表 + `probe_all` + `ProbeStats`）、`driver/pci.rs`（配置机制 #1 + BAR 探测/窗口大小）、`driver/block.rs`（`BlockDevice` + 注册表 + 验收自测）、`driver/virtio_blk.rs`（legacy virtio 0.9.5：virtqueue/描述符链/轮询/bounce buffer）、`arch/x86_64/port.rs`（端口 I/O 32 位入口）、`frame::allocate_contiguous`（DMA/virtqueue 前置）；启动盘改为 **virtio-blk（`disable-modern=on`）**，`main.rs` 在 `Kernel started!` 后接入「枚举 → 注册 → 探测/挂接 → 块设备自测」；新增 `make test-driver`（22 项）与编排场景 `driver`（**9 场景**，127.2s 全 PASS），全量回归 PASS（含非 snapshot 启动后镜像 md5 不变，验证写测试真的还原了扇区）；修 B-16（BAR 大小 32→64 位宽错误 → I/O BAR 尺寸报错）、B-17（`lba + sectors` 环绕 → 越界请求漏拦）；同步 docs/drivers.md（v0.8 实现记录 + 设计取舍 + 限制） |
+
+

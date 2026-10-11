@@ -1,40 +1,65 @@
-//! 系统调用号到内核处理函数的表（v0.6 骨架）
+//! 系统调用号到内核处理函数的表（v0.6）
 //!
-//! 本子模块仅维护编号与分发签名；具体 handler 放在
-//! `kernel/src/syscall/{process,file,memory}.rs` 里供整个子模块导入。
+//! 编号沿用 **Linux x86_64** 语义，便于以后直接跑现成的用户态程序：
+//! `read=0, write=1, open=2, close=3, getpid=39, nanosleep=35, exit=60,
+//! fork=57, execve=59, wait4=61`。
 //!
-//! Linux x86_64 syscall 号的最小子集（v0.6）：
-//! read=0, write=1, open=2, close=3, getpid=39, nanosleep=35, exit=60,
-//! fork=57, execve=59, wait4=61。未注册号按 `-ENOSYS` 失败。
+//! 表按 `SYS_MAX` 排满：未单独实现的号落在公共 ENOSYS 桩上，
+//! 因此「号合法但未实现」与「号越界」是两种可区分的失败
+//! （前者查表命中桩，后者 `parse` 返回 `None`，两者最终都返回 `-ENOSYS`）。
+
+// 编号表本身就是对外契约：尚未实现的号也必须有名字，否则调用方只能靠魔法数。
+#![allow(dead_code)]
+
+use crate::syscall::address_space::UserSpace;
 
 /// 系统调用号（Linux x86_64 语义）
 pub const SYS_READ: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_OPEN: u64 = 2;
 pub const SYS_CLOSE: u64 = 3;
+pub const SYS_SLEEP: u64 = 35; // nanosleep
 pub const SYS_GETPID: u64 = 39;
-pub const SYS_SLEEP: u64 = 35;
-pub const SYS_EXIT: u64 = 60;
 pub const SYS_FORK: u64 = 57;
 pub const SYS_EXEC: u64 = 59;
+pub const SYS_EXIT: u64 = 60;
 pub const SYS_WAIT: u64 = 61;
-/// 系统调用号上限（不包含），用于边界检查。
+/// 系统调用号上限（不含），用于边界检查。
 pub const SYS_MAX: u64 = 256;
 
-/// 系统调用处理函数的类型。`args[0..5]` = rdi, rsi, rdx, r10, r8。
-pub type SyscallHandler = unsafe fn(args: &[u64; 5], space: *const crate::syscall::address_space::UserSpace) -> i64;
+/// 已定义但尚未实现的系统调用号（v0.8 起逐个补齐）。
+///
+/// 显式列出而不是「不写」：查表时它们落在 ENOSYS 桩上，
+/// 与「号越界」是两种不同的失败原因，调试时不会被混为一谈。
+/// v0.7 已把 `read/open/close` 从这张表里摘掉（见下方 [`SYS_TABLE`]）。
+const UNIMPLEMENTED: [u64; 3] = [SYS_FORK, SYS_EXEC, SYS_WAIT];
 
-/// 公共 ENOSYS 桩。
-pub(crate) fn syscall_enosys(_args: &[u64; 5], _space: *const crate::syscall::address_space::UserSpace) -> i64 {
-    -38 // -ENOSYS
+/// 系统调用处理函数类型。`args[0..5]` = `rdi, rsi, rdx, r10, r8`。
+pub type SyscallHandler = unsafe fn(args: &[u64; 5], space: *const UserSpace) -> i64;
+
+/// 按系统调用号查表：号越界返回 `None`，否则返回槽位中的 handler
+/// （未实现的号命中 [`syscall_enosys`]）。
+pub fn parse(nid: u64) -> Option<SyscallHandler> {
+    if nid >= SYS_MAX {
+        return None;
+    }
+    Some(SYS_TABLE[nid as usize])
 }
 
-/// 系统调用表（按 SYS_MAX 排满，已注册槽位替换为具体 handler）。
+/// 公共 ENOSYS 桩（`-ENOSYS` = -38）。
+pub(crate) fn syscall_enosys(_args: &[u64; 5], _space: *const UserSpace) -> i64 {
+    -38
+}
+
+/// 系统调用表。已注册的号在 `const` 求值期替换为具体 handler。
 pub const SYS_TABLE: [SyscallHandler; SYS_MAX as usize] = {
     let mut table: [SyscallHandler; SYS_MAX as usize] = [syscall_enosys; SYS_MAX as usize];
-    table[SYS_EXIT as usize] = crate::syscall::process::sys_exit;
+    table[SYS_READ as usize] = crate::syscall::file::sys_read;
     table[SYS_WRITE as usize] = crate::syscall::file::sys_write;
+    table[SYS_OPEN as usize] = crate::syscall::file::sys_open;
+    table[SYS_CLOSE as usize] = crate::syscall::file::sys_close;
     table[SYS_GETPID as usize] = crate::syscall::process::sys_getpid;
     table[SYS_SLEEP as usize] = crate::syscall::process::sys_sleep;
+    table[SYS_EXIT as usize] = crate::syscall::process::sys_exit;
     table
 };

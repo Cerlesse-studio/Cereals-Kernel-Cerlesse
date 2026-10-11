@@ -1,0 +1,7 @@
+[package]
+name = "libc"
+version = "0.1.0"
+edition = "2021"
+description = "Cerlesse 最小用户态运行时（v0.6 脚手架）：syscall 封装 + 启动代码 + 控制台输出"
+
+[dependencies]

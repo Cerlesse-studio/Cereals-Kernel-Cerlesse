@@ -1,165 +1,207 @@
-# 设备驱动 / PCI / 网络（阶段文档）
+# 设备驱动 / PCI / 磁盘（阶段文档）
 
-- 阶段：第八阶段（v0.8 驱动框架 / PCI / 磁盘；v0.4 中断控制时钟键盘已完成）
-- 最后更新：2026-10-08
-- 状态：✅ v0.4 已完成（中断控制器 + PIT Timer + PS/2 键盘 + 上下文切换原语 + H-04/H-05 Go 工具，均已验收，见 `kernel/src/interrupt/`、`kernel/src/time/`、`kernel/src/driver/keyboard.rs`、`kernel/src/arch/x86_64/context.rs`、`tools-go/`；v0.8–v0.9 驱动/PCI/磁盘/网络 尚未编写，待对应阶段）
+- 阶段：第八阶段（v0.8 驱动框架 / PCI / 块设备；v0.4 中断控制时钟键盘已完成）
+- 最后更新：2026-10-11
+- 状态：🟡 v0.8 前半已完成（**驱动注册框架 + PCI 枚举 + 块设备抽象 + virtio-blk（legacy）**，`make test-driver` 22 项 PASS）；**磁盘文件系统（FAT32 挂到 VFS）仍待做**；v0.4（中断控制器 + PIT + PS/2 键盘 + 上下文切换原语 + H-04/H-05 Go 工具）已完成
+- 依赖：interrupt（IRQ 分发）、memory（连续物理帧 → DMA / virtqueue）、arch::port（端口 I/O）
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
-- 依赖：interrupt（IRQ 分发）、memory（DMA 缓冲）、process（网络可后置）
 
-## 1. 当前状态（2026-10-08）
+## 1. 当前状态（2026-10-11）
 
-### 1.1 已落地部分（v0.4 完成：中断控制器 + PIT 100Hz + PS/2 键盘 + 上下文切换原语）
+### 1.1 v0.8 已落地：驱动框架 + PCI 枚举 + 块设备
+
+代码位置与职责：
+
+| 文件 | 职责 |
+| ---- | ---- |
+| `kernel/src/driver/pci.rs` | PCI 枚举（配置机制 #1：`0xCF8`/`0xCFC`）、BAR 探测与窗口大小计算、设备表、`print_bdf` |
+| `kernel/src/driver/driver.rs` | 驱动注册表 + `Driver` trait（`name`/`matches`/`attach`）+ `probe_all()` 匹配与挂接 + `ProbeStats` |
+| `kernel/src/driver/block.rs` | 块设备抽象 `BlockDevice`（按 512 字节扇区读写）+ 设备注册表 + 块设备验收自测 |
+| `kernel/src/driver/virtio_blk.rs` | legacy virtio-blk 0.9.5 驱动：virtqueue 布局、描述符链、notify、used ring 轮询、bounce buffer |
+| `kernel/src/arch/x86_64/port.rs` | 端口 I/O 统一入口（`inb/inw/inl` / `outb/outw/outl`） |
+| `kernel/src/memory/frame.rs` | `allocate_contiguous(count)` / `free_contiguous(...)`：virtqueue 需要的**物理连续**帧 |
+
+启动顺序（`kernel/src/main.rs`，在 `Kernel started!` 之后、调度器/用户态之前）：
+
+```text
+pci::init()            → 枚举 256×32 个 function，填设备表并逐设备打印一行
+find_by_id(1af4,1001)   → 断言启动盘所在的 legacy virtio-blk 确实在总线上
+driver::register_builtin() → 注册表里放入 virtio-blk-pci
+driver::probe_all()    → 逐设备匹配（注册顺序优先）→ attach → 统计 matched/attached/failed
+block::selftest(disk)  → 引导扇区 / 分块读 / 写回读 / 负例
+```
+
+### 1.2 关键设计决策（为什么是这样）
+
+**PCI 用配置机制 #1（`0xCF8`/`0xCFC`）而不是 ECAM。** 机制 #1 每次访问两条端口指令，不依赖 ACPI；
+ECAM 需要先解析 MCFG（ACPI）表，那是引入 ACPI 之后才划算的优化。代价（约 8k 次端口读扫描全总线）
+在启动日志里可忽略，换来的是「枚举」这条路径自成一体、可被单测形态的串口断言完全覆盖。
+
+**只实现 legacy virtio（0.9.5），不做 modern（virtio 1.0）。** 设备 ID 决定接口：`0x1001`（legacy，
+BAR0 是 I/O 窗口，寄存器是简单偏移）/ `0x1042`（modern，寄存器在 capability 指向的 MMIO 里，
+队列布局也不同）。legacy 的实现量大约只有现代接口的三分之一，而 QEMU 用
+`disable-modern=on` 就能稳定提供 legacy 设备；真遇到 modern 设备时 `attach` 会**打印明确原因并返回错误**
+（不静默失败），错误会计入 `ProbeStats::failed`。
+
+**块 I/O 走同步轮询，不用中断。** v0.8 不配置 MSI-X/INTx，每次请求提交后自旋等 used ring 的 `idx` 前进
+（上限由 PIT tick 给出）。理由是：块 I/O 常在无法睡眠的路径上发生，而中断上下文里做块 I/O 是另一类
+复杂度的开始。代价是等待期间忙等；v0.9 起再改为「中断 + 等待队列」。
+
+**bounce buffer 换掉一整类 DMA 对齐问题。** 调用方缓冲长度只要整扇区对齐即可，驱动内部用一块
+页对齐静态缓冲（8 扇区 = 4 KiB）分块搬运。因此不要求调用方缓冲物理连续、也不要求对齐；
+一次性拷贝的成本换来「上层随便传缓冲」的可用性。
+
+**驱动框架只做匹配与挂接，不做生命周期管理。** 注册表容量固定（`MAX_DRIVERS`），启动阶段写入、
+此后只读；一个设备最多被一个驱动接管；`attach` 失败不阻断其它设备。上层（`main`）只需要看
+`ProbeStats`，不需要知道总线上有多少种设备。
+
+### 1.3 验收证据（`make test-driver`，22 项断言；以下是真实串口输出）
+
+```text
+pci: 00:03.0 vendor=0x1af4 device_id=0x1001 class=0x1 subclass=0x0 prog_if=0x0   ← legacy virtio-blk
+pci: 00:03.0 bar0=io:0x6000 size=0x80                                            ← BAR0 是 I/O 窗口（legacy 的标志）
+pci: enumerated devices=5
+pci: virtio-blk (legacy) at 00:03.0 class=0x1 subclass=0x0
+driver: registered index=0 name=virtio-blk-pci
+driver: match 00:03.0 -> virtio-blk-pci
+virtio-blk: legacy BAR0=0x6000 size=0x80
+virtio-blk: host features=0x71006ed4
+virtio-blk: guest features=0x0
+virtio-blk: queue0 size=256 region=0x100000 (3 pages contiguous)
+virtio-blk: capacity=131072 sectors (64 MiB)
+virtio-blk: status=0xf (DRIVER_OK)
+virtio-blk: registered as block device 0
+driver: attached 00:03.0 -> virtio-blk-pci
+driver: probe PASS (devices=5 matched=1 attached=1 failed=0)
+block: registered devices=1
+block: device=virtio-blk0 sector_size=512 sectors=131072 bytes=67108864
+block: boot sector sig=0x55aa fstype=FAT16 oem=MTOO4032 sectors_per_cluster=2
+block: chunked read PASS (512/4096/4608 bytes consistent at lba 0)
+block: write/readback PASS (lba=131071 pattern=0xa5)
+block: negative cases PASS (unaligned len, lba beyond capacity, overflow)
+block: selftest PASS
+```
+
+这些断言的意义（「硬件事实」而不是日志措辞）：
+
+- `device_id=0x1001` + `bar0=io:`：QEMU 在 `disable-modern=on` 下暴露的**就是** legacy 接口，
+  与驱动实现的前提一致（modern 是 `0x1042`）；
+- `queue0 size=256 region=0x100000 (3 pages contiguous)`：队列深度来自设备，队列区来自
+  `frame::allocate_contiguous`（描述符表 + avail + 4 KiB 对齐的 used 三段必须物理连续，
+  因为 legacy 的队列地址寄存器只装一个 PFN）；
+- `capacity=131072 sectors (64 MiB)`：容量由设备报出，与 `tools/image-builder/build_image.py`
+  的镜像尺寸互相印证；
+- `boot sector sig=0x55aa fstype=FAT16`：从磁盘真的读回了本次构建的 FAT 引导扇区
+  （类型串取自 BPB 的根目录项数决定的位置，不是写死的字符串）；
+- `chunked read PASS`：4608 字节的读**跨过**驱动内部 8 扇区（4 KiB）搬运边界，与 4096 / 512
+  两次独立读的拼接结果逐字节一致 → 分块重组与 LBA 偏移换算正确；
+- `write/readback PASS (lba=131071 ...)`：最后一个扇区写 → 读回 → **还原** → 再读回；
+  用非 snapshot 方式启动后比对镜像 md5，确认「还原」真的把盘恢复原样（见 1.5）；
+- `negative cases PASS`：长度非整扇区、LBA 越过容量、LBA 溢出（`u64::MAX-1`）三种输入都必须
+  报错 —— 最后一条曾经真的漏过（`lba + sectors` 环绕后看起来在容量内），见 B-16/B-17。
+
+### 1.4 已知限制（明确未做，不要读成已完成）
+
+- **磁盘文件系统（FAT32）尚未挂到 VFS**：v0.8 只做到「块设备可用」，`block.rs` 之上还没有 FAT 后端；
+  因此 `docs/filesystem.md` 里的磁盘后端、以及 H-03（Python `mkfs`）仍未落地。
+- **不分配/重定位 BAR**：直接使用固件分配的地址。真实平台上若出现未分配窗口（全 0）会打日志而不是猜测
+  （v0.8 的实现里 `read_bar` 对全 0 返回「未实现」）。
+- **不解析 capability 链、不配置中断**：MSI-X/INTx、设备特定能力结构都留给 v0.9 与网络驱动一起做。
+- **只支持一块 virtio-blk 盘**（`block` 注册表容量 2，驱动状态是单个实例）。
+- **不实现 modern（virtio 1.0）接口**：见 1.2；遇到 modern 设备时明确报错。
+- **queue 只支持 0 号队列**：块设备只有一个 virtqueue，够用；多队列留给 v0.9+。
+- 端口 I/O 的新统一入口（`arch/x86_64/port.rs`）只被 PCI / virtio 使用；早期驱动（serial/keyboard/PIC）
+  仍各自保留私有副本 —— 改造它们只会扩大 diff，与 v0.8 目标无关。
+
+### 1.5 磁盘写入的「无损」验证
+
+`block: selftest` 会写最后一个扇区再做还原。为确认还原有效（而不只是「读回自身缓存」），
+用**不带 `snapshot=on`** 的方式启动一次并比对镜像：
+
+```text
+before=26a5e771b617734a3ac211caff0fa189
+after =26a5e771b617734a3ac211caff0fa189
+IMAGE UNCHANGED (write test restored the scratch sector)
+```
+
+测试套件里则统一用 `snapshot=on`（临时写时复制），既让并行场景共享同一镜像，也不污染原始文件。
+
+### 1.6 v0.4 已落地部分（中断控制器 + PIT 100Hz + PS/2 键盘 + 上下文切换原语）
 
 - [x] 中断控制器骨架与 PIC 第一版（初始化、IRQ→向量映射、mask/EOI 原语）
 - [x] `kernel/src/interrupt/` 绑定为 `controller` / `exception` / `irq` 三子模块
 - [x] `kernel_main` 中接入 PIC 初始化（默认全屏蔽，不使能外设 IRQ）
-- [x] 外部流程快照：`kernel/src/interrupt/doc CONTRIBUTING_CHAIN.md`（当前仅作本模块集成上下文，不覆盖 DEVELOPMENT.md 的阶段定义）
 - [x] 选型策略记录：`kernel/src/interrupt/pic_policy.md`
-- [x] v0.4 中断控制器回归测试已跑通（`make test` / `make test-exception` / `make test-memory` / `make test-pagefault` / `make test-all`）
-- [x] PIT/Timer 子系统雏形已接入（`kernel/src/time/`：timer 设置通道 0 重装载值、clock 提供 tick 计数）
-- [x] IRQ 分发入口与 16 槽 IRQ 注册表已实现（`kernel/src/interrupt/irq.rs`），`irq_dispatch` 接收完整中断帧并按 `frame.vector` 分发
-- [x] IRQ0（PIT）回调已注册并在串口观测心跳（100Hz 下每 100 tick = 1 秒打印一次 `IRQ0_heartbeat tick=<n>`，串口打印期间有重入保护）
-- [x] PIT 通道 0 频率校正为 100Hz（10ms/tick）：`time::timer::TICK_RELOAD_100HZ`
-- [x] PS/2 键盘中断输入（`kernel/src/driver/keyboard.rs`）：8042 初始化（排空输出缓冲、设置 IRQ1 使能位）、IRQ1 扫描码接收、
-      set 1 解码（字母/数字/Space/Enter/Backspace/符号 + Shift + `0xE0` 扩展前缀）、串口回显 `KB <字符>`
-- [x] 上下文切换原语（`kernel/src/arch/x86_64/context.rs`）：callee-saved + 栈切换的 `switch_to` / `init_context`，
-      并提供内核自测（主上下文 ↔ 备用上下文往返）输出 `context: switch PASS`
-- [x] 新增自动化验收：`make test-keyboard`（QEMU monitor `sendkey` 注入真实按键）—— 断言 `KBIRQ ENTRY` / `KB a` / `KBIRQ EXIT` + PIT 心跳
+- [x] PIT/Timer 子系统（`kernel/src/time/`：通道 0 重装载值、tick 计数）
+- [x] IRQ 分发入口与 16 槽 IRQ 注册表（`kernel/src/interrupt/irq.rs`）
+- [x] IRQ0（PIT）回调：100Hz，每 100 tick 打印一次 `IRQ0_heartbeat tick=<n>`
+- [x] PS/2 键盘中断输入（`kernel/src/driver/keyboard.rs`）：8042 初始化、IRQ1、set 1 解码、回显 `KB <字符>`
+- [x] 上下文切换原语（`kernel/src/arch/x86_64/context.rs`）：`switch_to` / `init_context` + 内核自测
+- [x] `make test-keyboard`：QEMU monitor `sendkey` 注入真实按键并断言回显
 
-### 1.2 已知状态与限制
+### 1.7 中断/时钟侧的已知状态与限制
 
-- PIC 第一版的映射固定为常见形式：**master/slave + IRQ0..15 → 向量 32..47**，后续可通过映射函数与控制器枚举（`ControllerKind::Pic` / `ControllerKind::Apic`）扩展。
-- APIC（LAPIC/IOAPIC/redirection）尚未实现，目前仅保留枚举与 no-op 语义占位。本阶段不尝试同时实现 PIC 与 APIC 两条路线。
-- 串口驱动已在 v0.1/v0.2 的串口日志通道中隐含使用；本阶段不单独抽出通用串口驱动框架，直到需要可复用的串口输入/输出接口时再补（预期在 v0.4 键盘/控制台交互或 v0.8 串口驱动框架时）。
-- 当前验收仍以 QEMU + 串口断言为主；中断控制器子模块的宿主侧单元测试占位尚未作为可独立运行的测试投入使用，真实中断路径验证仍依赖 QEMU 集成测试。
-- IRQ 汇编入口（`irq_common`）保存/恢复 15 个通用寄存器并在 `call` 前强制 16 字节对齐；**不保存** XMM/FPU 状态（当前内核不用浮点），v0.5 若引入浮点再补。
-- 键盘初始化末尾会排空输出缓冲，但启用 IRQ1 后仍可能立即收到一个（硬件自发的）扫描码中断，回调会正常处理并打印空的 `KBIRQ ENTRY/EXIT`。
-- 键盘驱动当前在中断上下文读扫描码后再打印；未实现键盘环形缓冲，故主循环无法“读取”按键（v0.5/v0.9 控制台时再补）。
+- PIC 映射固定为 master/slave + IRQ0..15 → 向量 32..47；APIC（LAPIC/IOAPIC/redirection）仍为占位。
+- IRQ 汇编入口（`irq_common`）保存/恢复 15 个通用寄存器，**不保存** XMM/FPU 状态（内核不用浮点）。
+- 键盘暂无环形缓冲，主循环无法「读取」按键（v0.9 控制台时再补）；驱动在中断上下文直接打印。
 
-### 1.3 为何 drivers.md 现在看起来“只有中断控制器”
+## 2. 开发路线
 
-- v0.4 目标由三部分组成：Timer tick、PS/2 键盘输入、上下文切换原语（为 v0.5 铺路）。**三者均已落地并自动化验收。**
-- 已验证输出样例（串口，节选；`make test-keyboard`）：
-  ```
-  Cerlesse kernel v0.4
-  PIC initialized
-  keyboard initialized
-  KBIRQ enabled
-  PIT 100Hz + PIC IRQ0/IRQ1 unmasked; IF enabled
-  ...
-  heap: Box/Vec/String PASS
-  frame: stress PASS (1024 frames alloc/unique/free)
-  paging: map/unmap PASS (fresh address space, 3 pages)
-  context: switch PASS
-  Kernel started!
-  IF=1
-  KBIRQ ENTRY
-  KB a
-  KBIRQ EXIT
-  ...
-  IRQ0_heartbeat tick=100
-  ```
-- v0.8 起的驱动框架、PCI 枚举、块设备、网络栈尚未编写；本文件在 v0.8 开发时再补具体实现记录。
+### 2.1 v0.8（Driver Manager → PCI → 块设备 → 磁盘 FS 挂载）
 
-## 2. 开发路线（按依赖展开）
-
-### 2.1 v0.4（中断 → Timer → 键盘 → 上下文切换原语）
-
-完成顺序（粗粒度）：
-
-1. PIC 初始化完成后，建立 IRQ→向量映射与 EOI 语义并接入外部中断入口。
-2. PIT Timer tick：初始化 PIT（通道 0）、提供系统计时基准、在串口观察到 tick 递增。
-3. 建立 IRQ 分发注册表骨架，使后续 IRQ 回调可按向量号注册与分发；当前阶段以 IRQ0（PIT）心跳为最小验证闭环。
-4. PS/2 键盘中断输入：键盘控制器初始化、扫描码接收、扫描码解码、按键回显/基本回显逻辑。
-5. 上下文切换原语（为 v0.5 的 Task/Thread 切换铺路）：至少让调度入口与切换桩可在中断时钟驱动下观察到。
-
-验收（v0.4）：
-
-- [x] tick 递增可观察（100Hz → 每 100 tick 打印一次 `IRQ0_heartbeat tick=<n>`，经 `make test` / `make test-keyboard` 确认）
-- [x] 按键回显可观察（QEMU monitor `sendkey a` → 串口输出 `KB a`，经 `make test-keyboard` 确认）
-- [x] 上下文切换原语可用且回归测试不崩溃（`context: switch PASS`，随 `make test-memory` 断言）
-- [x] Go 测试编排/串口日志工具（H-04/H-05）已落地（2026-10-08）：
-      `tools-go/cmd/testorch`（并行调度 6 个 QEMU 场景 + 串口日志二次复核，`make test-orch`）、
-      `tools-go/cmd/serialmon`（tail -f 式实时分类/心跳异常检测/`-expect` 核对）；
-      `make go-test` 为宿主侧单元测试入口（详见 tools-go/README.md）
-
-### 2.2 v0.8（Driver Manager → PCI → 块设备 → 磁盘 FS 挂载）
-
-1. 驱动框架：Driver Manager，按 Block / Input / Network 分类注册与匹配。
-2. PCI 枚举：遍历 PCI 总线，按 Vendor/Device ID 匹配驱动。
-3. 块设备驱动：优先 virtio-blk 或 ATA（QEMU 环境下更易验证）。
-4. 磁盘文件系统后端：FAT32 挂载进入 VFS（见 docs/filesystem.md）。
+1. [x] 驱动框架：`Driver` trait + 注册表 + 匹配/挂接统计（`driver/driver.rs`）。
+2. [x] PCI 枚举：遍历总线、解析类别/BAR、按 Vendor/Device ID 匹配。
+3. [x] 块设备抽象（`block.rs`）与 virtio-blk（legacy）驱动（`virtio_blk.rs`）。
+4. [ ] **磁盘文件系统后端：FAT32 挂载进 VFS**（见 `docs/filesystem.md`）—— v0.8 剩余部分。
+5. [ ] 验收补齐：`ls`/`cat` 能读到磁盘上的文件（依赖 4）。
 
 验收（v0.8）：
 
-- [ ] PCI 列表输出，包含 Vendor/Device ID
-- [ ] 磁盘读写可验证
+- [x] PCI 列表输出，包含 Vendor/Device ID（`make test-driver`）
+- [x] 磁盘读写可验证（引导扇区读 + 最后扇区写回读 + 分块读一致性 + 负例）
 - [ ] FAT32 挂载完成，可在 VFS 层访问磁盘文件
 
-### 2.3 v0.9（网络栈顺序 + Socket syscall 最小集）
+### 2.2 v0.9（网络栈顺序 + Socket syscall 最小集）
 
-网络栈分层顺序（自底向上）：
-
-1. Network Driver（例如 virtio-net）
-2. Ethernet
-3. ARP
-4. IPv4
-5. ICMP
-6. UDP
-7. TCP（尽力，非完整工业栈）
-8. Socket API：`socket/bind/listen/accept/connect/send/recv`
+1. Network Driver（例如 virtio-net，可复用 v0.8 的 `Driver` 框架与 PCI 枚举）
+2. Ethernet → ARP → IPv4 → ICMP → UDP → TCP（尽力） → Socket API
 
 验收（v0.9）：
 
 - [ ] Shell 交互可用
 - [ ] ping/HTTP 简例可跑
 
-## 3. 驱动列表（计划）
+## 3. 驱动列表
 
-### 3.1 优先级高的第一批驱动
+### 3.1 已实现
 
-| 驱动 | 计划版本 | 说明 |
+| 驱动 | 版本 | 说明 |
 | ---- | ---- | ---- |
-| Serial（串口） | v0.1（串口日志通道） / 框架化待定 | 当前为开发期唯一输出通道；通用驱动框架化晚于基本输入输出需求出现时补 |
-| Keyboard（PS/2） | v0.4 | 在中断入口之上实现键盘输入 |
-| Timer（PIT/APIC Timer） | v0.4 | 调度与系统计时基础 |
-| Framebuffer | v0.4/v0.8 视需要 | 输出显示能力；本阶段不作为强约束，串口优先 |
-| PCI | v0.8 | 枚举与匹配 |
-| Disk（virtio-blk/ATA） | v0.8 | 块设备，为磁盘 FS 提供后端 |
+| Serial（串口） | v0.1 | 开发期唯一日志通道（`print`/`println`/`print_dec`/`print_hex`/`print_hex_pad`/`put_bytes`） |
+| Keyboard（PS/2） | v0.4 | IRQ1 扫描码解码与串口回显 |
+| Timer（PIT） | v0.4 | 100Hz tick：调度时间片与块 I/O 超时基准 |
+| PCI | v0.8 | 枚举与 BAR 探测（配置机制 #1） |
+| Disk（virtio-blk legacy） | v0.8 | 块设备：`BlockDevice` trait 的实现者 |
 
-### 3.2 后续驱动（v1.0 之前按需补）
+### 3.2 后续（按需补）
 
-- USB、NVMe、AHCI、VirtIO（更多设备类型）、Audio、GPU 等排在后续，非第一版目标。
+- virtio-net（v0.9，网络栈的底座）、AHCI/NVMe、USB、Audio、GPU、Framebuffer（视需要）。
 
-## 4. 网络栈顺序与验收（v0.9）
-
-网络栈顺序（再次强调）：
-
-1. Network Driver → Ethernet → ARP → IPv4 → ICMP → UDP → TCP → Socket
-
-Socket API（最小集，v0.9）：
-
-- `socket`、`bind`、`listen`、`accept`、`connect`、`send`、`recv`
-
-验收（重复，为了与文档索引和 DEVELOPMENT.md 保持一致）：
-
-- [ ] PCI 设备可枚举并打印 Vendor/Device ID
-- [ ] 可通过网络栈运行简易 HTTP Server（v0.9 简化网络可达时再验收）
-
-## 5. 非目标 / 后续
+## 4. 非目标 / 后续
 
 - SMP 多核下的中断均衡与高级 APIC 语义：v1.0 之后。
 - USB、Wi-Fi、GPU、完整 TCP/IP 工业栈：非第一版目标。
-- DMA 缓冲管理细节：在实际驱动（尤其是块设备/网络）用到时再补，把 DMA 缓冲依赖记到 memory.md 对应位置。
+- DMA 缓冲管理细节：v0.8 只做了「连续物理帧」这一最小的 DMA 前置条件；IOMMU/散列（scatter-gather）
+  留给真实硬件需求出现时。
 
-## 6. 修订记录
+## 5. 修订记录
 
 | 日期 | 变更 |
 | ---- | ---- |
 | 2026-10-06 | 第一阶段创建占位 |
-| 2026-10-07 | 补记当前状态：PIC 第一版已接入 kernel_main，中断控制器子模块位置与选型策略已就位，v0.4 剩余（Timer/键盘/切换原语）与 v0.8/v0.9 仍为待编写 |
-| 2026-10-08 | v0.4 完成：IRQ stub 修正（B-08）、IRQ 入口保存寄存器（B-09）、PIT 100Hz、PS/2 键盘回显、上下文切换原语；新增 `make test-keyboard`；更新本文件当前状态与验收清单 |
-| 2026-10-08 | v0.4 最后一项 H-04/H-05 落地：Go 编排器 `testorch` + 串口分析器 `serialmon`；测试脚本支持并行隔离参数与磁盘 `snapshot=on`；新增 `make go-test` / `make test-orch`，验收清单全部勾选 |
-| 2026-10-08 | 本次 docs 迭代统一文档顶部元信息（阶段 / 最后更新 / 状态）与修订记录，保持与 DEVELOPMENT.md 与索引文档描述一致 |
-| 2026-10-08 | v0.4 复核收官：`make go-test` / `make test-orch` 实测通过，状态行由“部分完成”改为 v0.4 已完成（v0.8–v0.9 仍待对应阶段） |
+| 2026-10-07 | 补记当前状态：PIC 第一版已接入 kernel_main；v0.4 剩余（Timer/键盘/切换原语）与 v0.8/v0.9 待编写 |
+| 2026-10-08 | v0.4 完成：IRQ stub 修正（B-08）、IRQ 入口保存寄存器（B-09）、PIT 100Hz、PS/2 键盘回显、上下文切换原语；新增 `make test-keyboard` |
+| 2026-10-08 | v0.4 最后一项 H-04/H-05 落地：Go 编排器 + 串口分析器；`make go-test` / `make test-orch` 通过 |
+| 2026-10-08 | 统一文档顶部元信息与修订记录（阶段 / 最后更新 / 状态） |
+| 2026-10-11 | **v0.8 前半落地**：新增 `driver/pci.rs`（机制 #1 + BAR 探测 + 窗口大小）、`driver/driver.rs`（注册框架 + `probe_all`）、`driver/block.rs`（按扇区读写 + 验收自测）、`driver/virtio_blk.rs`（legacy virtio 0.9.5，同步轮询 + bounce buffer）、`arch/x86_64/port.rs`（端口 I/O）、`frame::allocate_contiguous`；启动盘改为 virtio-blk（Makefile / `tests/test_boot.py` / `tests/test_keyboard.py`，`disable-modern=on`）；新增 `make test-driver`（22 项）与编排场景 `driver`（9 场景）；修 B-16（BAR 大小 32→64 位宽错误）、B-17（LBA 溢出未拦）；状态行由「v0.8 尚未编写」改为「v0.8 前半完成，FAT32 待做」 |

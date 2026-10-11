@@ -6,6 +6,7 @@ pub mod gdt;
 pub mod idt;
 pub mod interrupt;
 pub mod paging;
+pub mod port;
 
 use crate::interrupt::controller;
 

@@ -1,8 +1,8 @@
 # 总体开发路线图（第一阶段）
 
 - 阶段：第一阶段 / 路线规划
-- 最后更新：2026-10-08
-- 状态：✅ 已完成（2026-10-08 补记 docs 完善进度与 v0.4/v0.5 验收状态）
+- 最后更新：2026-10-11
+- 状态：🟡 持续更新（2026-10-08 补记 v0.4/v0.5；2026-10-11 补记 v0.6/v0.7 实际进度与 v0.8 前半落地）
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
 
@@ -53,9 +53,9 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 | **v0.3 ✅** | Physical/Virtual Memory + Heap（2026-10-07 验收通过；高半区映射移至 v0.6，ADR-009） | memory.md |
 | **v0.4 ✅** | Interrupt + Timer + Keyboard（2026-10-08 验收通过）；含上下文切换原语 + H-04/H-05 Go 工具（`make go-test` / `make test-orch` 通过） | drivers.md |
 | **v0.5 ✅** | Process + Thread + Scheduler + IPC（2026-10-08 验收通过：线程模型 + 上下文切换 + Round Robin 时间片调度 + pipe 骨架，`make test-scheduler` / `make test-ipc` 通过） | process.md |
-| **v0.6** | Syscall + User Space | syscall.md |
-| **v0.7** | VFS + RAMFS + ELF | filesystem.md / syscall.md |
-| **v0.8** | Driver + PCI + Disk | drivers.md |
+| **v0.6 🟡** | Syscall + User Space（2026-10-10 核心已验收：`syscall`/`sysret` 入口 + ring3 + 用户地址空间隔离 + `write/exit/getpid/sleep`；2026-10-11 用户态脚手架可用：`libc/` + `user/hello` 真实用户程序跑在 ring3，`make user` / `make test-user` PASS）；ELF Loader / VFS 文件语义 / 进程对象留到 v0.7 | syscall.md |
+| **v0.7 🟡** | VFS + RAMFS + ELF（2026-10-11 核心已验收：`FileSystem` trait + 挂载表最长前缀路由 + RAMFS 后端 + fd 表 + `open/read/write/close` + **ELF Loader**（RAMFS `/init` 按段权限逐页装载，`RW` 段对 ring3 可写）；`make test-fs` 19 项 / `make test-user` 32 项 PASS）。Shell 里 `ls/cat/cd` 属 v0.9、磁盘 FS（FAT32）与 `mkfs` 属 v0.8 | filesystem.md / syscall.md |
+| **v0.8 🟡** | Driver + PCI + Disk（2026-10-11 前半验收：驱动注册框架 + PCI 枚举 + 块设备 + **legacy virtio-blk**，`make test-driver` 22 项 PASS，启动盘改为 virtio-blk）；**剩余：FAT32 磁盘 FS 挂到 VFS + H-03 `mkfs`** | drivers.md |
 | **v0.9** | Shell + User Programs + Network | drivers.md / filesystem.md |
 | **v1.0** | 完整可启动的类 Linux 小型 OS | — |
 
@@ -68,8 +68,9 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 3. **第三阶段（v0.3）**：物理/虚拟内存 + 内核堆 —— 编写 memory.md（✅）。
 4. **第四阶段（v0.4）**：中断控制器 + Timer + 键盘 + 上下文切换原语（含 H-04/H-05 Go 工具） —— 见 drivers.md（✅）。
 5. **第五阶段（v0.5）**：进程/线程/调度 + IPC（pipe 骨架） —— 见 process.md（✅）。
-6. **第六阶段（v0.6–v0.7）**：系统调用/用户态/文件系统 —— 占位，见 syscall.md、filesystem.md（⬜ 待编写）。
-7. **第七阶段（v0.8–v0.9）**：驱动/PCI/网络/Shell —— 占位，见 drivers.md、filesystem.md（⬜ 待编写）。
+6. **第六阶段（v0.6–v0.7）**：系统调用/用户态/文件系统 —— v0.6（syscall 入口 + ring3 + 隔离 + 用户态脚手架）与 v0.7（VFS/RAMFS/fd 表/文件 syscall/ELF Loader）均已落地并验收，见 syscall.md 与 filesystem.md（均 🟡）；剩余的 `fork/exec/wait`、进程对象、用户堆、磁盘 FS 归入 v0.8+。
+7. **第七阶段（v0.8–v0.9）**🟡：v0.8 前半（驱动注册框架 / PCI 枚举 / 块设备 / legacy virtio-blk）已落地并验收，
+   见 drivers.md（✅ 前半）；剩余 FAT32 磁盘后端与 `mkfs`、以及 v0.9 的网络/Shell（⬜ 待编写）。
 8. **第八阶段（v1.0）**：整合、安全机制、发布。
 
 ## 5. 修订记录
@@ -84,3 +85,7 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 | 2026-10-08 | v0.4 完成（PIC/PIT 100Hz/PS-2 键盘/上下文切换原语 + 自动化验收），里程碑表标记 ✅ |
 | 2026-10-08 | v0.5 内核侧核心完成（线程/PID/就绪队列/Round Robin 时间片抢占 + `make test-scheduler`），里程碑表标记 🟡（IPC 待做）；本次 docs 迭代统一各阶段文档顶部元信息、修订记录与主开发文档（DEVELOPMENT.md）描述一致 |
 | 2026-10-08 | v0.4/v0.5 收官复核：`make go-test` / `make test-orch` 实测通过（H-04/H-05 落地），IPC pipe 骨架落代码并通过 `make test-ipc`；v0.4、v0.5 里程碑均标记 ✅ |
+| 2026-10-10 | v0.6 核心落地：syscall/sysret 入口 + ring3 + 用户地址空间隔离 + 首批 4 个 syscall，`make test-user` PASS；里程碑标记 🟡（ELF Loader 完整化 / 进程对象留到 v0.7） |
+| 2026-10-11 | v0.6 用户态脚手架可用：`libc/` 落地（syscall 封装 + `_start` + `print!/println!`）、真实用户程序 `user/hello` 并入 workspace、`kernel/build.rs` 构建期摊平内嵌、`load_program` 支持多代码页；新增 `make user`，`make test-user` 增至 19 项断言 |
+| 2026-10-11 | **v0.8 前半落地**（驱动注册框架 + PCI 枚举 + 块设备 + legacy virtio-blk）：新增 `driver/{driver,pci,block,virtio_blk}.rs` 与 `arch/x86_64/port.rs`、`frame::allocate_contiguous`；启动盘改为 virtio-blk（`disable-modern=on`）；新增 `make test-driver`（22 项）与编排第 9 个场景；里程碑记为 🟡（FAT32/`mkfs` 未做，故不标 ✅） |
+| 2026-10-11 | **v0.7 核心落地**：VFS + RAMFS + fd 表 + `read/open/write/close` + **ELF Loader**（用户程序改为从 RAMFS `/init` 装载，按段权限逐页映射；`build.rs` 不再摊平）；`user.ld` 四段 `ALIGN(0x1000)`；新增 `make test-fs` 与 `tools/check_user_elf.py`，`make test-user` 增至 32 项；v0.7 里程碑标记 🟡（Shell `ls/cat/cd` → v0.9，磁盘 FS + `mkfs` → v0.8） |
