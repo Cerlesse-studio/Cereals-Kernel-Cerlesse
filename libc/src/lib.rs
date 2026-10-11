@@ -5,6 +5,9 @@
 //!
 //! - [`syscall`]：`syscall` 指令封装 + 调用（`write` / `read` / `open` / `close` /
 //!   `getpid` / `nanosleep` / `exit` / `brk` / `mmap` / `munmap`）；
+//!   v0.9 第三步起 `fork` / `execve` / `wait4` 也不再是桩：它们有真实的进程对象
+//!   （独立地址空间 + 独立内核栈 + 完整用户帧）作为后端，`user/shell` 用它跑外部程序；
+//! - [`args`]：`argc` / `argv`（由 `execve` 与内核运行驱动一起送入 `_start`）；
 //! - [`heap`]：`#[global_allocator]`（bump over `mmap`）—— 用户程序因此可以用
 //!   `Vec`/`String`/`Box`（在此之前只能把数据放在栈或静态数组里）；
 //! - [`console`]：`print!` / `println!`（固定缓冲，一次 `write` 送出一整行）；
@@ -41,15 +44,18 @@
 
 #![no_std]
 
+pub mod args;
 pub mod console;
 pub mod heap;
 pub mod syscall;
 
+pub use crate::args::{arg, arg_str, argc, Args};
 pub use crate::console::Writer;
 pub use crate::syscall::{
-    brk, close, exit, getpid, mmap, munmap, nanosleep, open, read, write, EBADF, EFAULT, EISDIR,
-    EINVAL, ENOENT, ENOMEM, ENOSPC, ENOSYS, MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDONLY, O_RDWR,
-    O_WRONLY, PROT_EXEC, PROT_READ, PROT_WRITE, STDERR, STDIN, STDOUT,
+    brk, close, execve, exit, fork, getpid, mmap, munmap, nanosleep, open, read, wait4, write,
+    ARG_MAX, EAGAIN, EBADF, ECHILD, EFAULT, EISDIR, EINVAL, ENOENT, ENOMEM, ENOSPC, ENOSYS,
+    MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, PROT_EXEC, PROT_READ,
+    PROT_WRITE, STDERR, STDIN, STDOUT,
 };
 
 use core::arch::global_asm;
@@ -60,25 +66,34 @@ use core::arch::global_asm;
 // `main` 由用户程序提供（`#[no_mangle] pub extern "C" fn main() -> i32`），
 // 返回值即退出码，交给 `exit` 系统调用。
 //
+// **入口寄存器 ABI**：内核把 `argc` 放在 `rdi`、`argv` 放在 `rsi`（见
+// `kernel/src/syscall/process.rs::build_user_frame` 与 `docs/syscall.md`）。
+// `_start` 原样把它们传给 [`cer_start`]（Rust 侧），由它存进 [`args`] 模块
+// 再调用用户 `main` —— 用户程序不必关心这段汇编。
+//
 // 注意：`global_asm!` 是宏调用，不能挂文档注释（会被判为 unused doc comment）。
 global_asm!(
     ".section .text.start,\"ax\"",
     ".global _start",
     ".type _start, @function",
     "_start:",
-    "xor ebp, ebp",              // 栈回溯终点
+    "xor ebp, ebp",              // 栈回溯终止
     "and rsp, -16",              // SysV：call 前保持 16 字节对齐（栈顶本就对齐，这里是防御）
-    "call main",
-    "mov edi, eax",              // 退出码 = main 的返回值
-    "mov eax, 60",               // SYS_exit
-    "syscall",
-    "ud2",                       // exit 不返回；到达这里说明内核违反了约定
+    "call cer_start",            // rdi = argc，rsi = argv（内核已放好）
+    "ud2",                       // cer_start 不返回；到达这里说明入口 ABI 被破坏
     ".size _start, . - _start",
 );
 
-// 只被 `_start` 的汇编 `call main` 引用，Rust 侧看不到使用点，因此对死代码
-// 检查显式豁免；真正的检查发生在链接期（用户程序没提供 `main` 就会报未定义符号）。
-#[allow(dead_code)]
+/// 用户程序的总入口：记录 `argc`/`argv` → 调用用户 `main` → `exit`。不返回。
+#[no_mangle]
+pub extern "C" fn cer_start(argc: u64, argv: u64) -> ! {
+    args::set(argc, argv);
+    // SAFETY: `main` 由用户程序提供，链接期保证存在（缺失就是未定义符号）。
+    let code = unsafe { main() };
+    exit(code)
+}
+
+// 只被 `cer_start` 引用，Rust 侧看不到外部定义的使用点由这一行表达。
 extern "C" {
     /// 由用户程序提供的 C ABI 入口，返回值作为退出码。
     fn main() -> i32;

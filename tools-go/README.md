@@ -31,7 +31,7 @@ go run ./cmd/testorch -config ../tests/orchestrate.json -root .. boot,memory  # 
 go run ./cmd/serialmon -file ../build/orch/keyboard/serial.log
 # 快照分析 + 期望核对（退出码 0=通过 1=异常/缺失 2=用法或 IO 错误）
 go run ./cmd/serialmon -file ../build/orch/keyboard/serial.log -once \
-    -expect "KB a" -expect "IRQ0_heartbeat tick="
+    -expect "kbd: line ready len=3" -expect "IRQ0_heartbeat tick="
 # 异常注入场景允许 PANIC/EXCEPTION
 go run ./cmd/serialmon -file ../build/orch/exception/serial.log -once -allow-panic
 ```

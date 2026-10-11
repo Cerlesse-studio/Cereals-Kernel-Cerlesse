@@ -142,6 +142,7 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
         halt();
     }
 
+
     // v0.4：内核级上下文切换原语自测（为 v0.5 的任务/调度铺路）。
     if let Err(err) = arch::x86_64::context::selftest() {
         driver::serial::print("context: FAIL: ");
@@ -151,8 +152,9 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
     driver::serial::println("context: switch PASS");
 
     // v0.7：VFS + RAMFS（RAMFS 用内核堆保存文件内容，因此必须在 memory::init 之后）。
-    // `/init` 的内容是内嵌的用户程序 ELF，`user/hello` 稍后从 VFS 读它并交给 ELF Loader。
-    if let Err(errno) = fs::init(syscall::user::init_image()) {
+    // `/init` 与 `/bin/sh` 的内容都是内嵌的用户程序 ELF，`syscall::user` 稍后
+    // 从 VFS 读它们并交给 ELF Loader（v0.9 的 Shell 走的也是这条普通路径）。
+    if let Err(errno) = fs::init(syscall::user::program_images()) {
         driver::serial::print("fs: FAIL errno=");
         driver::serial::print_dec(errno.unsigned_abs());
         driver::serial::println("");
@@ -256,6 +258,7 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
         driver::serial::println(err);
         halt();
     }
+
 
     // v0.2 验收：异常注入测试（feature 门控，默认构建不触发）
     #[cfg(feature = "exception-test")]

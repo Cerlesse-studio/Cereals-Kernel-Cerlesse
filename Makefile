@@ -27,8 +27,12 @@ KERNEL_ELF := target/x86_64-unknown-none/debug/kernel
 USER_RUSTFLAGS := -C relocation-model=static -C code-model=large
 USER_PROFILE   := user-release
 USER_ELF       := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-hello
+# v0.9：第二个用户程序 —— 交互式 Shell（RAMFS 上落在 /bin/sh，见 kernel/build.rs）。
+USER_SHELL_ELF := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-shell
+# v0.9 第三步：外部程序（RAMFS 上落在 /bin/hello，由 Shell fork+execve 起来）。
+USER_HELLO_BIN_ELF := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-hello-bin
 
-.PHONY: help build boot kernel image image-exception image-pagefault fat-image run test test-exception test-memory test-pagefault test-keyboard test-scheduler test-ipc test-fs test-user test-driver test-fat test-all user test-pkg go-test test-orch clean
+.PHONY: help build boot kernel image image-exception image-pagefault fat-image run test test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-scheduler test-ipc test-fs test-user test-driver test-fat test-all user test-pkg go-test test-orch clean
 
 help:
 	@echo "targets:"
@@ -38,19 +42,22 @@ help:
 	@echo "  test-exception - v0.2: trigger #DE, assert exception diagnostics"
 	@echo "  test-memory - v0.3/v0.4: assert frame/heap/paging/context-switch self-tests"
 	@echo "  test-pagefault - v0.3: touch unmapped address, assert #PF diagnostics"
-	@echo "  test-keyboard - v0.4: inject keys via QEMU monitor, assert IRQ1 echo + PIT heartbeat"
+	@echo "  test-keyboard - v0.4/v0.9: inject keys via QEMU monitor, assert IRQ1 markers + line buffer + PIT heartbeat"
+	@echo "  test-shell - v0.9: inject keys into the interactive shell (help / cat /etc/motd / exit) via QEMU monitor"
+	@echo "  test-proc - v0.9: fork/execve/wait4 through the shell: external program + argv + missing program + reap"
 	@echo "  test-scheduler - v0.5: assert >=3 kernel tasks rotate under PIT time slices"
 	@echo "  test-ipc - v0.5: assert pipe create/write/read summary logs + selftest"
 	@echo "  test-fs - v0.7: assert VFS mount routing + RAMFS read/write/ls + negative errno cases"
-	@echo "  test-user - v0.7: assert ELF loaded from RAMFS + ring3 file syscalls + user write readback + isolation"
+	@echo "  test-user - v0.7/v0.9: assert ELF loaded from RAMFS + ring3 file syscalls + user heap + isolation + shell"
 	@echo "  test-driver - v0.8: assert PCI enumeration + driver probe + virtio-blk sector read/write"
 	@echo "  fat-image - v0.8: build the FAT test volume (tools/mkfs/mkfs.py from tests/fatroot/data)"
 	@echo "  test-fat - v0.8: assert FAT16/32 on disk mounted in VFS: read/ls/LFN/multi-cluster/EROFS"
-	@echo "  user   - v0.7: build+validate the user-space scaffold alone (libc + user/hello -> static ELF)"
+	@echo "  user   - v0.7/v0.9: build+validate the user-space scaffold alone (libc + user/hello + user/shell + user/hello-bin)"
 	@echo "  test-pkg - H-06: assert the .ckc package container (CKC) format + packaging rules (host-side)"
 	@echo "  test-all - run every integration test"
+
 	@echo "  go-test  - v0.4 H-04/H-05: Go unit tests for tools-go (host side)"
-	@echo "  test-orch - v0.4 H-04: run all 10 scenarios in parallel via Go orchestrator"
+	@echo "  test-orch - v0.4 H-04: run all 12 scenarios in parallel via Go orchestrator"
 	@echo "  clean  - remove build artifacts"
 
 build: image
@@ -120,7 +127,7 @@ test-pagefault: image-pagefault
 		--expect "CR2=0x500000000000" \
 		--expect "KERNEL PANIC: unhandled exception"
 
-test-all: test test-exception test-memory test-pagefault test-keyboard test-scheduler test-ipc test-fs test-user test-driver test-fat
+test-all: test test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-scheduler test-ipc test-fs test-user test-driver test-fat
 
 # v0.5 验收：≥3 个内核任务在 PIT 时间片驱动下轮转（Round Robin）
 test-scheduler: image
@@ -155,8 +162,9 @@ test-fs: image
 		--expect "fs: mount point=/mnt fs=ramfs-scratch" \
 		--expect "fs: route /mnt/note.txt fs=ramfs-scratch" \
 		--expect "fs: readback /mnt/note.txt len=7 data=v0.7-ok" \
-		--expect "fs: ls / entries=3" \
+		--expect "fs: ls / entries=4" \
 		--expect "fs: ls / name=init kind=file size=" \
+		--expect "fs: ls / name=bin kind=dir size=0 perms=drwxr-xr-x" \
 		--expect "fs: ls / name=etc kind=dir size=0 perms=drwxr-xr-x" \
 		--expect "fs: ls / name=tmp kind=dir size=0 perms=drwxr-xr-x" \
 		--expect "fs: negative cases PASS" \
@@ -179,6 +187,9 @@ test-fs: image
 #            write/getpid/open/read/close/nanosleep/exit 全链路往返，exit code=42；
 #   probe —— 内嵌位置无关机器码（map_raw），直接读内核映像地址（0x2000000），
 #            必须被 ring3 #PF 拦下（error=P|U）。
+# v0.9 第二步追加**交互式 Shell**（`/bin/sh` = `user/shell`）：命令来自键盘行缓冲（stdin, fd 0），
+#   没人按键时它会两次 `-EAGAIN` 后自行退出 —— 因此这条非交互路径断言的是
+#   `user: program=/bin/sh source=elf` 与 `user: shell PASS`（交互路径见 `make test-shell`）。
 # 硬证据（不是日志措辞）：
 #   - `source=elf` + `segments=4 image_pages=7 writable_pages=2`：ELF 装载真的发生了，
 #     且 RW 段（.data/.bss）确实被映射成可写；
@@ -213,6 +224,8 @@ test-user: image
 		--expect "hello: bad write ret=-14" \
 		--expect "user: brk query -> 0x8000020000" \
 		--expect "user: brk addr=0x8000022000 -> 0x8000022000 pages=2" \
+		--expect "user: program=/bin/sh source=elf" \
+		--expect "user: shell PASS (keyboard line buffer -> stdin -> builtins + external program)" \
 		--expect "hello: brk grown=0x8000022000" \
 		--expect "hello: heap zeroed=1" \
 		--expect "hello: heap pattern=1" \
@@ -350,24 +363,101 @@ test-ipc: image
 		--expect "pipe: selftest PASS"
 
 # v0.4 验收：PIT 心跳递增 + PS/2 键盘 IRQ1 扫描码回显（经 QEMU monitor 注入真实按键）
+# v0.9 起回显协议改了（字符原样回显，见 driver/keyboard.rs 模块文档的表），
+# 因此这里断言的是「IRQ 真的进了、进了行缓冲、行真的组好了、PIT 还在走」，
+# 而不是旧的 `KB <字符>` 那一行。
+#
+# 按键顺序是刻意选的：`a b Backspace c Enter` → 交付行必须是 **3 字节**（`ac` + `\n`）。
+# 若退格没生效就是 `abc\n` = 4 字节 —— 于是 `len=3` 同时证明了「行缓冲收到了字符」
+# 与「行编辑真的删掉了一个字符」，而不只是「有个标记出现了」。
 test-keyboard: image
 	$(PYTHON) tests/test_keyboard.py \
 		--disk $(BUILD)/disk.img \
 		--serial-log $(BUILD)/serial-kb.log \
 		--key a \
 		--key b \
+		--key backspace \
+		--key c \
+		--key ret \
 		--expect "KBIRQ enabled" \
 		--expect "KBIRQ ENTRY" \
-		--expect "KB a" \
+		--expect "kbd: line ready len=3" \
 		--expect "KBIRQ EXIT" \
 		--expect "IRQ0_heartbeat tick="
+
+# v0.9 验收（交互式 Shell 第一步）：键盘行缓冲 → stdin(0) → 解析 → 内建命令。
+#
+# 硬断言（不是「日志里有 Shell 字样」）：
+#   - `user: program=/bin/sh source=elf`：Shell 与 /init 一样是**从 VFS 装载的 ELF**；
+#   - `user: read fd=0 want=128 got=5`：注入的 `help` + Enter 真的经键盘进了 stdin（5 = 4 + 行尾 \n）；
+#   - `user: write fd=1 len=17` + `root@cerlesse C:>`：提示符按默认加载样式输出（17 字节），一次 write；
+#   - `user: open path=/etc/motd ...` + `user: write fd=1 len=23`：`cat` 走真实文件 syscall；
+#   - `syscall: ENOSYS nr=57 name=fork`：外部命令（`ls`）真的调了 fork，内核还没有进程模型；
+#   - `sh: bye` + `user: shell PASS`：`exit` 正常结束。
+test-shell: image
+	$(PYTHON) tests/test_keyboard.py \
+		--disk $(BUILD)/disk.img \
+		--serial-log $(BUILD)/serial-shell.log \
+		--ready-marker "user: program=/bin/sh" \
+		--key h --key e --key l --key p --key ret \
+		--key c --key a --key t --key spc --key slash \
+		--key e --key t --key c --key slash --key m --key o --key t --key d --key ret \
+		--key e --key x --key i --key t --key ret \
+		--expect "user: program=/bin/sh source=elf" \
+		--expect "user: read fd=0 want=128 got=5" \
+		--expect "root@cerlesse C:>" \
+		--expect "user: write fd=1 len=17" \
+		--expect "sh: builtins (v0.9 step 3):" \
+		--expect "sh:   /bin/hello      - external program" \
+		--expect "user: open path=/etc/motd flags=0x0 fd=3" \
+		--expect "motd: hello from ramfs" \
+		--expect "sh: cat /etc/motd bytes=23" \
+		--expect "sh: bye" \
+		--expect "user: shell PASS"
+
+# v0.9 第三步验收：**进程模型**（fork / execve / wait4）—— 从 Shell 交互触发，
+# 断言的是「内核真的把另一个程序跑起来了」，而不是日志措辞：
+#   - `user: fork parent=3 -> child pid=N image_pages=7`：地址空间被复制（7 个映像页 = Shell 的映像）；
+#   - `user: run child pid=N name=fork-child`：子进程在父进程 wait4 时被恢复（单 CPU 的延迟调度）；
+#   - `user: exec pid=N path=/bin/hello ... segments=4 image_pages=5`：映像被换掉，**PID 不变**；
+#   - `hello-bin: argc=2` / `argv[0]=hello` / `argv[1]=world`：内核把 argv 写进了新进程的用户栈；
+#   - `user: exec /bin/ls -> ENOENT` + `sh: ls: exit code=127`：
+#     **找不到的程序**也是完整路径（fork 成功 → exec 失败 → 子进程 exit(127) → 父进程拿到退出码）；
+#   - `user: frames free before=… after=…`：父进程 + 所有子进程的帧**全部归还**（没有地址空间泄漏）。
+#
+# 注意 PID 用**反向引用**断言而不是常数：syscall 手测里 `/bin/sh` 固定是 PID 3，但 fork
+# 出的子进程号取决于此前消耗了多少个 PID（调度器自测会先取几个），写常数会让测试随
+# 启动顺序变化而碎。`\1` 把 fork / execve / wait4 三处的 PID 绑定为同一个值。
+test-proc: image
+	$(PYTHON) tests/test_keyboard.py \
+		--disk $(BUILD)/disk.img \
+		--serial-log $(BUILD)/serial-proc.log \
+		--ready-marker "user: program=/bin/sh" \
+		--key h --key e --key l --key l --key o --key spc \
+		--key w --key o --key r --key l --key d --key ret \
+		--key l --key s --key ret \
+		--key e --key x --key i --key t --key ret \
+		--expect "user: program=/bin/sh source=elf" \
+		--expect "hello-bin: Hello from an external program!" \
+		--expect "sh: exec /bin/ls failed errno=-2" \
+		--expect "sh: hello: exit code=1" \
+		--expect "sh: ls: exit code=127" \
+		--expect "sh: bye" \
+		--expect "user: heap frame reclamation PASS" \
+		--expect "user: selftest PASS" \
+		--expect-re "user: fork parent=3 -> child pid=([0-9]+) image_pages=7.*?user: run child pid=\1 name=fork-child.*?sh: child pid=\1 exec /bin/hello \(argc=2\).*?user: exec pid=\1 path=/bin/hello segments=4 image_pages=5 entry=0x8000000000.*?hello-bin: pid=\1.*?user: reaped pid=\1 exit=1" \
+		--expect-re "hello-bin: argc=2.*?hello-bin: argv\[0\]=hello.*?hello-bin: argv\[1\]=world" \
+		--expect-re "user: run child pid=([0-9]+) name=fork-child.*?user: exec /bin/ls -> ENOENT \(no such program\).*?user: reaped pid=\1 exit=127" \
+		--expect-re "user: frames free before=([0-9]+) after=\1"
 
 # v0.7 用户态脚手架：单独构建 libc + user/hello（内核构建时会自动重建同一程序，
 # 这个目标用于在不启动 QEMU 的情况下验证脚手架可编译、可链接、**段布局合法**）。
 user:
-	RUSTFLAGS="$(USER_RUSTFLAGS)" $(CARGO) build -p user-hello \
+	RUSTFLAGS="$(USER_RUSTFLAGS)" $(CARGO) build -p user-hello -p user-shell -p user-hello-bin \
 		--target x86_64-unknown-none --profile $(USER_PROFILE) --target-dir $(BUILD)/user
 	@$(PYTHON) tools/check_user_elf.py $(USER_ELF)
+	@$(PYTHON) tools/check_user_elf.py $(USER_SHELL_ELF)
+	@$(PYTHON) tools/check_user_elf.py $(USER_HELLO_BIN_ELF)
 
 # H-06 P0a 验收：CKC 包容器（后缀 `.ckc`）。**主机侧、不启 QEMU、纯标准库**：
 #

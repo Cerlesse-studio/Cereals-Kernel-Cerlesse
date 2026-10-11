@@ -1,12 +1,17 @@
-//! 用户态 ↔ 内核态边界（v0.6 实现）
+//! 用户态 ↔ 内核态边界（v0.6 建立，v0.9 第三步扩展为「完整用户帧 + 可恢复运行」）
 //!
-//! 本模块提供 v0.6 用户态路径的全部汇编入口：
+//! 本模块提供用户态路径的全部汇编入口：
 //!
 //! 1. [`syscall_entry`]：`IA32_LSTAR` 指向的 `syscall` 指令入口。`syscall` 只保存
 //!    RIP→RCX、RFLAGS→R11，**不切换栈**，因此入口第一件事是把用户 RSP 存起来、
-//!    换到专用的 syscall 内核栈，然后再调用 Rust 分发函数。
-//! 2. [`enter_user`]：内核态 → ring3 的最初进入（构造 `iretq` 帧）。
-//! 3. [`leave_user`]：从用户态回到内核调用者（`sys_exit` / ring3 异常终止路径）。
+//!    换到当前进程的系统调用栈，再把**完整寄存器帧**压栈后调用 Rust 分发函数；
+//! 2. [`run_user_frame`]：把一个保存好的 [`UserFrame`] 恢复成 ring3 现场（`iretq`），
+//!    同时把「回到内核的位置」写进 [`RunCtx`]（这是 `fork`/`wait4` 的关键：
+//!    内核可以停在某个进程的 `sys_wait` 里，去跑另一个进程，再回到原地）；
+//! 3. [`enter_user_frame`]：只恢复现场、**不**记录返回点 —— `execve` 用（它换了
+//!    映像但返回点仍是父进程的 `wait4`，不能被覆盖）；
+//! 4. [`return_to_suspended`]：从用户态回到暂停在 [`RunCtx`] 上的内核调用者
+//!    （`sys_exit` 与 ring3 异常终止路径）。
 //!
 //! 约定（与 `syscall/mod.rs` 一致）：`rax` = syscall 号，`rdi/rsi/rdx/r10/r8` =
 //! 第 1..5 参数，返回值在 `rax`。
@@ -17,45 +22,116 @@
 //! 会把活跃值放在任意 caller-saved 寄存器（实测踩中 `r9`），不恢复就会在 `sysretq`
 //! 之后写到一个垃圾地址（v0.7 实测 `cr2=0x105` 的 ring3 #PF）。
 //!
-//! 栈模型：
-//! - 用户态执行期间的中断/异常由 CPU 依据 `TSS.RSP0` 切到**陷入栈**（`TRAP_STACK`）；
-//! - `syscall` 指令切到**系统调用栈**（`SYSCALL_STACK`）。
-//!   两条栈分开，避免中断在系统调用处理期间压入同一条栈造成覆盖。
+//! ## 为什么连 callee-saved 寄存器也要压栈（v0.9 第三步）
+//!
+//! 单进程往返时 `rbx/rbp/r12..r15` 由 C 调用约定保证不变，不必保存。但 `fork`
+//! 要**克隆父进程停在 `syscall` 里的现场**：子进程恢复后要继续执行 `fork()` 之后的
+//! 代码，而那段代码可能把活跃值放在这些寄存器里。因此入口把 15 个通用寄存器
+//! **全部**压栈，形成 [`UserFrame`]；`fork` 直接复制这一帧并把 `rax` 改成 0。
+//!
+//! ## 栈模型
+//!
+//! - 用户态执行期间的中断/异常由 CPU 依据 `TSS.RSP0` 切到**陷入栈**；
+//! - `syscall` 指令切到**系统调用栈**（`CER_SYSCALL_STACK_TOP`）。
+//!
+//! 两条栈都是**每进程**的（`kernel/src/process/process.rs`）：父进程停在 `sys_wait`
+//! 里时，子进程的 syscall 必须落在另一条栈上，否则会覆盖父进程的帧 —— 这正是
+//! v0.9 第二步留下的「进程模型」缺口。
 
 use core::arch::global_asm;
 
-/// 系统调用专用内核栈大小
-pub const SYSCALL_STACK_SIZE: usize = 16 * 1024;
-/// ring3 中断/异常陷入栈大小
-pub const TRAP_STACK_SIZE: usize = 16 * 1024;
+/// 一次 `syscall` 在系统调用栈上保存的**完整用户寄存器帧**。
+///
+/// 布局与 `syscall_entry` 的 push 顺序严格对应（栈顶 = `user_rsp`）。任何一侧
+/// 改动都必须同步另一侧 —— 偏移在汇编里是硬编码的。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UserFrame {
+    /// 用户 RSP（入口第一件事存进 `CER_USER_RSP`，最后才压栈 → 位于帧底）
+    pub user_rsp: u64, // +0
+    pub r15: u64,      // +8
+    pub r14: u64,      // +16
+    pub r13: u64,      // +24
+    pub r12: u64,      // +32
+    pub rbp: u64,      // +40
+    pub rbx: u64,      // +48
+    pub rdi: u64,      // +56  ← &args[0]
+    pub rsi: u64,      // +64
+    pub rdx: u64,      // +72
+    pub r10: u64,      // +80
+    pub r8: u64,       // +88
+    pub r9: u64,       // +96
+    pub rax: u64,      // +104 ← syscall 号 / 返回值
+    pub rflags: u64,   // +112
+    pub rip: u64,      // +120
+}
 
-#[repr(align(16))]
-struct SyscallStack([u8; SYSCALL_STACK_SIZE]);
-static mut SYSCALL_STACK: SyscallStack = SyscallStack([0; SYSCALL_STACK_SIZE]);
+/// 用户帧字节数（汇编按这个值计算帧位置）。
+pub const USER_FRAME_SIZE: u64 = core::mem::size_of::<UserFrame>() as u64;
+const _: () = assert!(USER_FRAME_SIZE == 128);
 
-#[repr(align(16))]
-struct TrapStack([u8; TRAP_STACK_SIZE]);
-static mut TRAP_STACK: TrapStack = TrapStack([0; TRAP_STACK_SIZE]);
+impl UserFrame {
+    /// 新建「从 `entry` 开始、用户栈顶 `rsp`」的初始帧。
+    ///
+    /// `argc`/`argv` 按本内核的入口 ABI 放在 `rdi`/`rsi`（`libc` 的 `_start`
+    /// 把两者存进全局后再调用 `main`）—— Linux 是放在栈上，两种都行，这里选
+    /// 寄存器是因为总入口是我们自己的 `_start`。
+    pub const fn new_user(entry: u64, rsp: u64, argc: u64, argv: u64) -> Self {
+        Self {
+            user_rsp: rsp,
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            rbp: 0,
+            rbx: 0,
+            rdi: argc,
+            rsi: argv,
+            rdx: 0,
+            r10: 0,
+            r8: 0,
+            r9: 0,
+            rax: 0,
+            rflags: 0x202, // bit1 固定 1，bit9 = IF
+            rip: entry,
+        }
+    }
+}
+
+/// 进程表下标里的「无当前进程」哨兵（与 `process::NO_PROCESS` 一致）。
+pub const NO_PROCESS: u64 = u64::MAX;
+
+/// 运行上下文：从用户态回到内核所需的最小状态。
+///
+/// 每个进程在**被运行前**填写「谁在等我」的那一半（`cr3`…`current`），
+/// `krsp` 由 [`run_user_frame`] 的汇编在进入用户态前写入。
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct RunCtx {
+    /// 内核栈指针（**必须位于偏移 0**：`return_to_suspended` 直接 `mov rsp,[rdi]`）
+    pub krsp: u64,
+    /// 恢复时要写回 CR3 的页表根
+    pub cr3: u64,
+    /// 恢复时要写回 `TSS.RSP0` 的陷入栈顶
+    pub rsp0: u64,
+    /// 恢复时要写回的 `CER_SYSCALL_STACK_TOP`
+    pub syscall_top: u64,
+    /// 恢复时要写回的 `CER_USER_SPACE`
+    pub space: u64,
+    /// 恢复时要写回的当前进程下标（[`NO_PROCESS`] = 回到内核启动上下文）
+    pub current: u64,
+}
 
 // 以下静态量供汇编直接以 `[rip + SYMBOL]` 访问，因此必须 `#[no_mangle]`。
 /// `syscall` 进入时保存的用户 RSP
 #[no_mangle]
 pub static mut CER_USER_RSP: u64 = 0;
-/// `enter_user` 保存的内核 RSP（`leave_user` 据此恢复内核调用栈）
-#[no_mangle]
-pub static mut CER_KERNEL_RSP: u64 = 0;
-/// `enter_user` 之后内核继续执行的地址（`leave_user` 的跳转目标）
-#[no_mangle]
-pub static mut CER_KERNEL_RET: u64 = 0;
 /// 当前用户地址空间指针（作为 `sys_enter` 的 `space` 参数传入）
 #[no_mangle]
 pub static mut CER_USER_SPACE: u64 = 0;
-/// 系统调用内核栈顶
+/// 当前进程的系统调用栈顶（每进程不同，切换进程时由 Rust 侧改写）
 #[no_mangle]
 pub static mut CER_SYSCALL_STACK_TOP: u64 = 0;
-/// 中断/异常陷入栈顶（写入 `TSS.RSP0`）
-#[no_mangle]
-pub static mut CER_TRAP_STACK_TOP: u64 = 0;
 
 global_asm!(
     // ---------------------------------------------------------------------
@@ -63,24 +139,11 @@ global_asm!(
     // ---------------------------------------------------------------------
     // 进入时：rcx = 用户 RIP，r11 = 用户 RFLAGS，rsp 仍是用户栈。
     //
-    // 栈帧（自上而下 push，栈顶 = CER_SYSCALL_STACK_TOP）：
-    //
-    //   top-8   rcx（用户 RIP）      ┐ 最后 sysret 用
-    //   top-16  r11（用户 RFLAGS）   ┘
-    //   top-24  rax（syscall 号）    ← 返回值最后写在 rax，这个副本只用于取号
-    //   top-32  r9                   ┐
-    //   top-40  r8                   │
-    //   top-48  r10                  │ 进入前保存、返回前恢复
-    //   top-56  rdx                  │（SysV 里它们是 caller-saved，
-    //   top-64  rsi                  │  Rust 分发函数会把它们改掉）
-    //   top-72  rdi                  ┘  ← rsp（= &args[0]）
-    //
-    // **为什么连 r9 也要存**：SysV 约定下 caller-saved 的寄存器（rax/rcx/rdx/rsi/rdi/
-    // r8/r9/r10/r11）在 `call syscall_dispatch` 之后值不再被保证。用户态的编译器
-    // 却把它们当作**跨 syscall 存活**（它只知道 `rcx`/`r11`/`rax` 会被 `syscall`
-    // 指令破坏）。v0.7 实测踩中过一次：`Writer::flush` 把自身指针留在 `r9` 上，
-    // syscall 返回后 `movq $0, 0x100(%r9)` 写到了 `cr2=0x105` → ring3 #PF。
-    // 因此这里按 Linux syscall ABI 的语义收口：**除 rax/rcx/r11 外全部寄存器原样返回**。
+    // 压栈顺序（先压的在**高地址**）：
+    //   rcx r11 rax r9 r8 r10 rdx rsi rdi rbx rbp r12 r13 r14 r15 用户rsp
+    // 因此帧基址 F = CER_SYSCALL_STACK_TOP - 128，且
+    //   F+0 用户rsp  F+8 r15  … F+56 rdi  … F+104 rax  F+112 r11  F+120 rcx
+    // —— 与 Rust 侧 `UserFrame` 的字段顺序逐项对应。
     ".global syscall_entry",
     "syscall_entry:",
     "mov [rip + CER_USER_RSP], rsp",
@@ -94,59 +157,97 @@ global_asm!(
     "push rdx",
     "push rsi",
     "push rdi",
-    "mov rsi, rsp",              // rsi = &args[0]（rdi, rsi, rdx, r10, r8 连续）
-    "mov rdi, [rsp + 48]",       // rdi = syscall 号（rax 在 top-24 = rsp+48）
+    "push rbx",
+    "push rbp",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "push qword ptr [rip + CER_USER_RSP]",
+    // 分发参数：rdi = 号（F+104），rsi = &args[0] = &rdi（F+56），rdx = space
+    "lea rsi, [rsp + 56]",
+    "mov rdi, [rsp + 104]",
     "mov rdx, [rip + CER_USER_SPACE]",
-    "and rsp, -16",              // SysV：call 前 16 字节对齐
+    // 帧基址 16 字节对齐（栈顶对齐 + 128 是 16 的倍数）→ `call` 前满足 SysV
     "call syscall_dispatch",
-    "mov rsp, [rip + CER_SYSCALL_STACK_TOP]", // 丢弃对齐偏移，回到栈顶
-    "sub rsp, 72",               // 站到 rdi 槽位（top-72）
-    // 依次弹回进入前的 rdi/rsi/rdx/r10/r8/r9；rax 不动（返回值已在其中）
+    // 返回值写回帧里的 rax 槽，然后逐项恢复（顺序与压栈严格相反）
+    "mov rsp, [rip + CER_SYSCALL_STACK_TOP]",
+    "sub rsp, 128",
+    "mov [rsp + 104], rax",
+    "pop qword ptr [rip + CER_USER_RSP]",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop rbp",
+    "pop rbx",
     "pop rdi",
     "pop rsi",
     "pop rdx",
     "pop r10",
     "pop r8",
     "pop r9",
-    "add rsp, 8",                // 跳过保存的号（top-24）
-    "pop r11",                   // 用户 RFLAGS
-    "pop rcx",                   // 用户 RIP
+    "pop rax",
+    "pop r11",
+    "pop rcx",
     "mov rsp, [rip + CER_USER_RSP]",
     "sysretq",
     "\n",
 
     // ---------------------------------------------------------------------
-    // 进入用户态（内核 → ring3）
+    // 恢复一个保存好的用户帧并进入 ring3，同时记录返回点
     // ---------------------------------------------------------------------
-    // rdi = 用户入口 rip，rsi = 用户栈顶
-    ".global enter_user",
-    "enter_user:",
-    "mov [rip + CER_KERNEL_RSP], rsp",
-    "lea rax, [rip + cer_user_resume]",
-    "mov [rip + CER_KERNEL_RET], rax",
-    "push 0x1b",                 // SS = 用户数据段 | RPL3
-    "push rsi",                  // RSP = 用户栈顶
-    "push 0x202",                // RFLAGS：IF=1
-    "push 0x23",                 // CS = 用户代码段 | RPL3
-    "push rdi",                  // RIP = 用户入口
+    // rdi = *const UserFrame，rsi = *mut RunCtx
+    //
+    // `cer_run_resume` 只在被 `return_to_suspended` 拉回时经过：此时栈指针
+    // 已经是 `ctx->krsp`，`ret` 正好返回到 `run_user_frame` 的调用者。
+    ".global run_user_frame",
+    "run_user_frame:",
+    "mov [rsi], rsp",
+    ".global cer_run_resume",
+    "cer_run_resume:",
+    // ---- 落空到 enter_user_frame（同一段恢复代码）----
+    ".global enter_user_frame",
+    "enter_user_frame:",
+    // 构造 iretq 帧：SS / RSP / RFLAGS / CS / RIP
+    "mov rax, 0x1b",
+    "push rax",
+    "push qword ptr [rdi + 0]",
+    "push qword ptr [rdi + 112]",
+    "mov rax, 0x23",
+    "push rax",
+    "push qword ptr [rdi + 120]",
+    // 通用寄存器：rdi 最后加载（它是帧基址）
+    "mov r15, [rdi + 8]",
+    "mov r14, [rdi + 16]",
+    "mov r13, [rdi + 24]",
+    "mov r12, [rdi + 32]",
+    "mov rbp, [rdi + 40]",
+    "mov rbx, [rdi + 48]",
+    "mov rsi, [rdi + 64]",
+    "mov rdx, [rdi + 72]",
+    "mov r10, [rdi + 80]",
+    "mov r8, [rdi + 88]",
+    "mov r9, [rdi + 96]",
+    "mov rax, [rdi + 104]",
+    "mov r11, [rdi + 112]",
+    "mov rcx, [rdi + 120]",
+    "mov rdi, [rdi + 56]",
     "iretq",
-    "cer_user_resume:",
-    "ret",                       // 用户退出后回到 Rust 调用者
     "\n",
 
     // ---------------------------------------------------------------------
-    // 从用户态返回内核（不返回用户态）
+    // 回到暂停在 RunCtx 上的内核调用者（不返回用户态）
     // ---------------------------------------------------------------------
-    ".global leave_user",
-    "leave_user:",
-    "mov rsp, [rip + CER_KERNEL_RSP]",
-    "push qword ptr [rip + CER_KERNEL_RET]",
-    "sti",                       // 恢复内核中断使能（FMASK 已清 IF）
-    "ret",                       // → cer_user_resume → ret 回到 Rust 调用者
+    // rdi = *const RunCtx
+    ".global return_to_suspended",
+    "return_to_suspended:",
+    "mov rsp, [rdi]",
+    "ret",
     "\n",
 );
 
-// 汇编里 `enter_user` 用的是立即数 0x1b / 0x23（用户数据段/代码段 | RPL3）。
+// 汇编里 `enter_user_frame` 用的是立即数 0x1b / 0x23（用户数据段/代码段 | RPL3）。
 // 这里把两个字面量与 GDT 常量绑定，任何一侧改动都会在编译期被发现，
 // 而不是等到 ring3 返回时以 #GP 的形式炸在运行期。
 const _: () = assert!(crate::arch::x86_64::gdt::USER_DATA_RPL3 == 0x1b);
@@ -155,19 +256,15 @@ const _: () = assert!(crate::arch::x86_64::gdt::USER_CODE_RPL3 == 0x23);
 extern "C" {
     /// `syscall` 指令入口（地址写入 IA32_LSTAR）。
     fn syscall_entry();
-    /// 进入 ring3；在被 [`leave_user`] 拉回内核前不返回。
-    fn enter_user(entry: u64, stack_top: u64);
-    /// 从用户态返回内核调用者。
-    fn leave_user() -> !;
-}
-
-/// 初始化两条内核栈并记录其栈顶（不可在用户态运行期间再次调用）。
-pub fn init_stacks() {
-    unsafe {
-        CER_SYSCALL_STACK_TOP =
-            core::ptr::addr_of!(SYSCALL_STACK.0) as u64 + SYSCALL_STACK_SIZE as u64;
-        CER_TRAP_STACK_TOP = core::ptr::addr_of!(TRAP_STACK.0) as u64 + TRAP_STACK_SIZE as u64;
-    }
+    /// 恢复用户帧进入 ring3，并把返回点写进 `ctx`；被 [`return_to_suspended`] 拉回前不返回。
+    fn run_user_frame(frame: *const UserFrame, ctx: *mut RunCtx);
+    /// 恢复用户帧进入 ring3（不记录返回点）；不返回。
+    fn enter_user_frame(frame: *const UserFrame) -> !;
+    /// 回到暂停在 `ctx` 上的内核调用者；不返回。
+    ///
+    /// 符号名与 Rust 包装函数同名，因此这里用不同的绑定名 + `link_name`。
+    #[link_name = "return_to_suspended"]
+    fn return_to_suspended_asm(ctx: *const RunCtx) -> !;
 }
 
 /// `syscall` 指令入口地址（写入 IA32_LSTAR）。
@@ -175,34 +272,70 @@ pub fn syscall_entry_addr() -> u64 {
     syscall_entry as *const () as u64
 }
 
-/// 中断/异常陷入栈顶（写入 `TSS.RSP0`）。
-pub fn trap_stack_top() -> u64 {
-    unsafe { CER_TRAP_STACK_TOP }
+/// 当前 `syscall` 保存在系统调用栈上的用户帧指针。
+///
+/// 只在**当前进程的 syscall** 里有效（分发函数与 handler 都在这个窗口内）。
+pub fn current_frame() -> *mut UserFrame {
+    let top = unsafe { CER_SYSCALL_STACK_TOP };
+    (top - USER_FRAME_SIZE) as *mut UserFrame
+}
+
+/// 当前进程的系统调用栈顶。
+pub fn syscall_stack_top() -> u64 {
+    unsafe { CER_SYSCALL_STACK_TOP }
+}
+
+/// 切换到进程 `top` 的系统调用栈（进入/恢复用户态前调用，返回内核时恢复）。
+///
+/// # Safety
+/// `top` 必须是该进程独占的系统调用栈顶端。
+pub unsafe fn set_syscall_stack_top(top: u64) {
+    unsafe {
+        CER_SYSCALL_STACK_TOP = top;
+    }
 }
 
 /// 记录当前用户地址空间指针，供 `syscall` 分发时作为 `space` 参数。
 ///
 /// # Safety
-/// `space` 必须指向在用户态运行期间持续有效的 `UserSpace`。
+/// `space` 必须指向在用户态运行期间持续有效的 `UserSpace`（`0` = 无）。
 pub unsafe fn set_user_space(space: u64) {
     unsafe {
         CER_USER_SPACE = space;
     }
 }
 
-/// 进入 ring3 执行用户程序；用户调用 `sys_exit` 或发生 ring3 异常时返回。
-///
-/// # Safety
-/// 调用前必须已完成：`write_cr3(用户页表根)`、`TSS.RSP0 = trap_stack_top()`、
-/// `set_user_space(...)`，且 `entry`/`stack_top` 在用户地址空间中已映射。
-pub unsafe fn enter(entry: u64, stack_top: u64) {
-    unsafe { enter_user(entry, stack_top) }
+/// 当前用户地址空间指针（`0` = 内核上下文）。
+pub fn user_space_ptr() -> u64 {
+    unsafe { CER_USER_SPACE }
 }
 
-/// 从用户态返回内核调用者（`sys_exit` / ring3 异常终止路径使用）。
+/// 恢复 `frame` 描述的用户现场并进入 ring3；返回点写进 `ctx`。
 ///
 /// # Safety
-/// 只能在 [`enter`] 已经进入用户态之后调用；调用前须已恢复内核 CR3。
-pub unsafe fn leave() -> ! {
-    unsafe { leave_user() }
+/// 调用前必须已完成：`write_cr3(该进程页表根)`、`TSS.RSP0 = 该进程陷入栈顶`、
+/// `set_syscall_stack_top(该进程系统调用栈顶)`、`set_user_space(该进程地址空间)`，
+/// 且 `frame`/`ctx` 在调用期间持续有效（`frame` 的页在用户地址空间中已映射）。
+pub unsafe fn run(frame: *const UserFrame, ctx: *mut RunCtx) {
+    unsafe { run_user_frame(frame, ctx) }
+}
+
+/// 恢复 `frame` 描述的用户现场并进入 ring3，**不**记录返回点。
+///
+/// `execve` 用它：它换了进程映像，但返回点应保持为父进程 `wait4` 的位置
+/// （在 [`RunCtx`] 里），不能被本次进入覆盖。
+///
+/// # Safety
+/// 同 [`run`]，但调用方必须已经为该进程准备好可用的 [`RunCtx`]。
+pub unsafe fn enter(frame: *const UserFrame) -> ! {
+    unsafe { enter_user_frame(frame) }
+}
+
+/// 回到暂停在 `ctx` 上的内核调用者（`sys_exit` / ring3 异常终止路径）。
+///
+/// # Safety
+/// 调用前必须已把 `ctx` 里的 `cr3`/`rsp0`/`syscall_top`/`space`/`current`
+/// 恢复完毕（见 `syscall::process::resume_kernel_side`）。
+pub unsafe fn return_to_suspended(ctx: *const RunCtx) -> ! {
+    unsafe { return_to_suspended_asm(ctx) }
 }

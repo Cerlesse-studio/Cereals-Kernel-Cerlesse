@@ -4,12 +4,12 @@
 //!
 //! v0.6 追加**用户态脚手架**的构建；v0.7 追加 ELF 校验与内嵌：
 //!
-//! 1. 用嵌套 cargo 构建 `user/hello`（`libc` + 用户程序，见 workspace `Cargo.toml`）；
-//! 2. **校验**它的 ELF（链接基址 / 段窗口 / 页对齐 / 无可装载重定位），
+//! 1. 用嵌套 cargo 构建每个内嵌用户程序（`user/hello`、`user/shell`，见 workspace `Cargo.toml`）；
+//! 2. **校验**它们的 ELF（链接基址 / 段窗口 / 页对齐 / 无可装载重定位），
 //!    这些断言属于「错了就必然跑不起来」的前置条件，放在构建期比运行期报错更早、
 //!    信息更全；
-//! 3. 把 ELF **原样**写入 `$OUT_DIR/user_hello.elf`，内核用 `include_bytes!` 内嵌，
-//!    在启动时写进 RAMFS 的 `/init`，再由内核自己的 ELF Loader 装载
+//! 3. 把 ELF **原样**写入 `$OUT_DIR/<name>.elf`，内核用 `include_bytes!` 内嵌，
+//!    在启动时写进 RAMFS（`/init`、`/bin/sh`），再由内核自己的 ELF Loader 装载
 //!    （`syscall/elf.rs`）—— v0.6 的「构建期摊平成连续映像」在 v0.7 已被替换。
 //!
 //! 为什么在 build.rs 里构建而不是交给 Makefile：这样 `cargo build -p kernel`
@@ -30,8 +30,18 @@ const USER_IMAGE_BASE: u64 = 0x0000_0080_0000_0000;
 /// 用户映像窗口大小（必须与 `address_space.rs::USER_IMAGE_MAX` 一致：16 页 = 64 KiB）。
 const USER_IMAGE_MAX_BYTES: u64 = 16 * 4096;
 
-/// 用户程序包名（`user/hello`）。
-const USER_PROGRAM: &str = "user-hello";
+/// 内嵌的用户程序：`(cargo 包名, $OUT_DIR 下的 ELF 文件名)`。
+///
+/// 每个程序在 RAMFS 上的落点与运行时机见 `syscall/user.rs`：
+/// - `user-hello` → `/init`：v0.7 起的验收基准（文件 syscall / 用户堆 / 退出码 42）；
+/// - `user-shell` → `/bin/sh`：v0.9 的交互式 Shell（键盘行缓冲 → `stdin` → 内建命令）；
+/// - `user-hello-bin` → `/bin/hello`：v0.9 第三步的**外部程序** —— 它不由内核直接运行，
+///   而是被 Shell 用 `fork` + `execve` 起来（`make test-shell` 断言这条路径）。
+const USER_PROGRAMS: [(&str, &str); 3] = [
+    ("user-hello", "user_hello.elf"),
+    ("user-shell", "user_shell.elf"),
+    ("user-hello-bin", "user_hello_bin.elf"),
+];
 /// 用户程序使用的 cargo profile（workspace 根定义；`lto = false`，见其注释）。
 const USER_PROFILE: &str = "user-release";
 /// 用户程序必须用 large 代码模型：链接地址 2^39 超出 small 模型 ±2GiB 的
@@ -50,26 +60,32 @@ fn main() {
         .to_path_buf();
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
-    build_user_program(&root, &out_dir);
+    for (package, elf_file) in USER_PROGRAMS {
+        build_user_program(&root, &out_dir, package);
 
-    let elf_path = out_dir
-        .join("user-target")
-        .join("x86_64-unknown-none")
-        .join(USER_PROFILE)
-        .join(USER_PROGRAM);
-    let elf = fs::read(&elf_path)
-        .unwrap_or_else(|err| panic!("读取用户程序 ELF 失败 {}: {err}", elf_path.display()));
+        let elf_path = out_dir
+            .join("user-target")
+            .join("x86_64-unknown-none")
+            .join(USER_PROFILE)
+            .join(package);
+        let elf = fs::read(&elf_path)
+            .unwrap_or_else(|err| panic!("读取用户程序 ELF 失败 {}: {err}", elf_path.display()));
 
-    let image = validate_image(&elf);
-    // 布局事实只用于把「校验过了什么」写进构建脚本日志（`cargo build -vv` 可见），
-    // 不打印 warning：它会随每次构建重复出现，而运行期串口已有更完整的轨迹
-    // （`user: program=/init source=elf ... segments=4 image_pages=4`）。
-    assert!(image.segments >= 1);
-    assert!(image.end > USER_IMAGE_BASE && image.end <= USER_IMAGE_BASE + USER_IMAGE_MAX_BYTES);
+        let image = validate_image(&elf, package);
+        // 布局事实只用于把「校验过了什么」写进构建脚本日志（`cargo build -vv` 可见），
+        // 不打印 warning：它会随每次构建重复出现，而运行期串口已有更完整的轨迹
+        // （`user: program=/init source=elf ... segments=4 image_pages=4`）。
+        assert!(image.segments >= 1, "{package}: 没有可装载段");
+        assert!(
+            image.end > USER_IMAGE_BASE && image.end <= USER_IMAGE_BASE + USER_IMAGE_MAX_BYTES,
+            "{package}: 映像结束地址 {:#x} 超出用户映像窗口",
+            image.end
+        );
 
-    let elf_out = out_dir.join("user_hello.elf");
-    fs::write(&elf_out, &elf)
-        .unwrap_or_else(|err| panic!("写入用户程序 ELF 失败 {}: {err}", elf_out.display()));
+        let elf_out = out_dir.join(elf_file);
+        fs::write(&elf_out, &elf)
+            .unwrap_or_else(|err| panic!("写入用户程序 ELF 失败 {}: {err}", elf_out.display()));
+    }
 
     // 用户程序源码变化时重跑本脚本（否则内核会装载旧映像）。
     for watched in [
@@ -79,20 +95,26 @@ fn main() {
         "user/hello/Cargo.toml",
         "user/hello/src",
         "user/hello/user.ld",
+        "user/shell/Cargo.toml",
+        "user/shell/src",
+        "user/shell/user.ld",
+        "user/hello-bin/Cargo.toml",
+        "user/hello-bin/src",
+        "user/hello-bin/user.ld",
     ] {
         println!("cargo:rerun-if-changed={}", root.join(watched).display());
     }
 }
 
-/// 构建用户程序（独立 target 目录，避免与外层构建抢 target 锁）。
-fn build_user_program(root: &Path, out_dir: &Path) {
+/// 构建一个用户程序（独立 target 目录，避免与外层构建抢 target 锁）。
+fn build_user_program(root: &Path, out_dir: &Path, package: &str) {
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let status = Command::new(cargo)
         .current_dir(root)
         .args([
             "build",
             "-p",
-            USER_PROGRAM,
+            package,
             "--target",
             "x86_64-unknown-none",
             "--profile",
@@ -112,7 +134,7 @@ fn build_user_program(root: &Path, out_dir: &Path) {
         .expect("无法启动 cargo 构建用户程序");
     assert!(
         status.success(),
-        "用户程序构建失败（{USER_PROGRAM}，profile {USER_PROFILE}）"
+        "用户程序构建失败（{package}，profile {USER_PROFILE}）"
     );
 }
 
@@ -127,11 +149,11 @@ struct ImageInfo {
 /// 这些条件在 v0.7 由运行期装载器（`syscall/elf.rs`）**同时**检查（拒绝时打印
 /// `user: ELF rejected: ...`）。构建期再断言一次的理由：这些错误是「链接脚本被改坏」
 /// 一类的问题，在编译输出里报出来远比等到 QEMU 里发现「用户程序没跑」直观。
-fn validate_image(elf: &[u8]) -> ImageInfo {
-    assert!(elf.len() > 64 && &elf[..4] == b"\x7fELF", "用户程序不是 ELF 文件");
+fn validate_image(elf: &[u8], package: &str) -> ImageInfo {
+    assert!(elf.len() > 64 && &elf[..4] == b"\x7fELF", "{package}: 不是 ELF 文件");
     // ELF64 头：e_type = u16@16（ET_EXEC = 2），e_machine = u16@18（EM_X86_64 = 62）
-    assert_eq!(u16_at(elf, 16), 2, "用户程序不是可执行 ELF（ET_EXEC）");
-    assert_eq!(u16_at(elf, 18), 62, "用户程序不是 x86_64 ELF");
+    assert_eq!(u16_at(elf, 16), 2, "{package}: 不是可执行 ELF（ET_EXEC）");
+    assert_eq!(u16_at(elf, 18), 62, "{package}: 不是 x86_64 ELF");
 
     let entry = u64_at(elf, 24);
     let phoff = u64_at(elf, 32) as usize;
@@ -151,23 +173,23 @@ fn validate_image(elf: &[u8]) -> ImageInfo {
             u32_at(elf, ph + 4),  // p_flags
         ));
     }
-    assert!(!loads.is_empty(), "用户程序没有 PT_LOAD 段");
+    assert!(!loads.is_empty(), "{package}: 没有 PT_LOAD 段");
 
     let base = loads.iter().map(|seg| seg.0).min().expect("PT_LOAD");
     assert_eq!(
         base, USER_IMAGE_BASE,
-        "用户程序链接基址 {base:#x} != USER_IMAGE_BASE {USER_IMAGE_BASE:#x}（检查 user.ld）"
+        "{package}: 链接基址 {base:#x} != USER_IMAGE_BASE {USER_IMAGE_BASE:#x}（检查 user.ld）"
     );
     let end = loads.iter().map(|seg| seg.0 + seg.1).max().expect("PT_LOAD");
     assert!(
         end <= USER_IMAGE_BASE + USER_IMAGE_MAX_BYTES,
-        "用户程序映像 {:#x} 超出窗口（{} 字节，见 address_space.rs::USER_IMAGE_MAX）",
+        "{package}: 映像 {:#x} 超出窗口（{} 字节，见 address_space.rs::USER_IMAGE_MAX）",
         end,
         USER_IMAGE_MAX_BYTES
     );
     assert!(
         entry >= base && entry < end,
-        "用户程序入口 {entry:#x} 不在映像范围内 [{base:#x}, {end:#x})"
+        "{package}: 入口 {entry:#x} 不在映像范围内 [{base:#x}, {end:#x})"
     );
 
     // 段页对齐：ELF Loader 按页设置权限，同页既 W 又 X 会让 W^X 退化，
@@ -178,9 +200,9 @@ fn validate_image(elf: &[u8]) -> ImageInfo {
         assert_eq!(
             vaddr % 4096,
             0,
-            "PT_LOAD {vaddr:#x} 未页对齐（user.ld 里每个段需要 ALIGN(0x1000)）"
+            "{package}: PT_LOAD {vaddr:#x} 未页对齐（user.ld 里每个段需要 ALIGN(0x1000)）"
         );
-        assert!(*memsz > 0, "PT_LOAD {vaddr:#x} 的 memsz 为 0");
+        assert!(*memsz > 0, "{package}: PT_LOAD {vaddr:#x} 的 memsz 为 0");
     }
     // 同一页不允许同时出现 W 与 X 段
     for (i, &(vaddr, memsz, flags)) in loads.iter().enumerate() {
@@ -195,12 +217,12 @@ fn validate_image(elf: &[u8]) -> ImageInfo {
             let o_stop = other_vaddr + other_memsz;
             assert!(
                 !(vaddr < o_stop && other_vaddr < stop),
-                "W 段与 X 段落在同一页（{vaddr:#x}/{other_vaddr:#x}）：ELF Loader 会拒绝"
+                "{package}: W 段与 X 段落在同一页（{vaddr:#x}/{other_vaddr:#x}）：ELF Loader 会拒绝"
             );
         }
     }
 
-    assert_alloc_free(elf);
+    assert_alloc_free(elf, package);
 
     ImageInfo {
         segments: loads.len(),
@@ -213,7 +235,7 @@ fn validate_image(elf: &[u8]) -> ImageInfo {
 /// 内核不做加载时重定位（`ET_EXEC` + 固定链接地址），带 `SHF_ALLOC` 的重定位段
 /// 一旦出现，程序里的地址就会停留在链接期之外的值上，运行期表现是不可预期的崩溃。
 /// 运行期装载器同样会拒绝（`user: ELF rejected: loadable relocations present`）。
-fn assert_alloc_free(elf: &[u8]) {
+fn assert_alloc_free(elf: &[u8], package: &str) {
     let shoff = u64_at(elf, 40) as usize;
     let shentsize = u16_at(elf, 58) as usize;
     let shnum = u16_at(elf, 60) as usize;
@@ -222,7 +244,9 @@ fn assert_alloc_free(elf: &[u8]) {
         let sh_type = u32_at(elf, sh + 4);
         let sh_flags = u64_at(elf, sh + 8);
         if (sh_type == 4 || sh_type == 9) && sh_flags & 0x2 != 0 {
-            panic!("用户程序含有可装载重定位（SHT_RELA/SHT_REL + SHF_ALLOC）：内核不做加载时重定位");
+            panic!(
+                "{package}: 含有可装载重定位（SHT_RELA/SHT_REL + SHF_ALLOC）：内核不做加载时重定位"
+            );
         }
     }
 }

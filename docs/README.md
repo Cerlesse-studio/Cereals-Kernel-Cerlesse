@@ -2,7 +2,7 @@
 
 - 阶段：第一阶段 / 文档中心
 - 最后更新：2026-10-11
-- 状态：🟡 持续更新（2026-10-11 同步 v0.8 收官（驱动/PCI/块设备 + **磁盘 FAT 后端** + `mkfs`）实现记录；同日补齐 H-06 包管理器提案 v1）
+- 状态：🟡 持续更新（2026-10-11 同步 v0.9 第二步（**`stdin` + 交互式 Shell `/bin/sh`**）实现记录；同日已同步 v0.8 收官、v0.9 第一步用户堆与 H-06 包管理器 `.ckc` 提案 P0a）
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
 
@@ -21,10 +21,10 @@
 | [../DEVELOPMENT.md](../DEVELOPMENT.md) | 主开发文档：需求、依赖、任务清单、测试、QEMU、Issue 规划 | ✅ 已完成 |
 | [boot.md](./boot.md) | 阶段：Bootloader / UEFI / Kernel Entry / GDT / IDT | ✅ v0.1 + v0.2 已完成 |
 | [memory.md](./memory.md) | 阶段：物理/虚拟内存 / Heap / Allocator | ✅ v0.3 已完成 |
-| [drivers.md](./drivers.md) | 阶段：驱动框架 / PCI / 磁盘（含 v0.4 中断/时钟/键盘/上下文切换） | ✅ v0.8 已完成（驱动注册框架 + PCI 枚举 + 块设备抽象 + **legacy virtio-blk**，`make test-driver` 22 项 PASS；启动盘已改为 virtio-blk）；v0.4（PIC + PIT 100Hz + PS/2 键盘 + 上下文切换原语）已完成 |
-| [process.md](./process.md) | 阶段：进程/线程 / 上下文切换 / 调度器 / IPC | ✅ v0.5 已完成（线程模型 + 上下文切换 + Round Robin 时间片调度 `make test-scheduler`；IPC pipe 骨架 `make test-ipc`）；channel / shared_memory 仍为占位；v0.6 追加了 `scheduler::suspend()`（用户态执行期挂起调度） |
-| [syscall.md](./syscall.md) | 阶段：系统调用 / 用户空间 / ELF | 🟡 v0.7 核心已完成（`syscall`/`sysret` 入口 + ring3 隔离 + `read/write/open/close`+ `write/exit/getpid/sleep` + **ELF Loader** 从 RAMFS `/init` 按段权限装载），并已开局 v0.9：**用户堆**（`brk`/`mmap`/`munmap` + libc 全局分配器，见 3.5）；`make test-user` 59 项 PASS；`argc/argv`/`fork` 系/动态链接未做（见 3.4） |
-| [filesystem.md](./filesystem.md) | 阶段：VFS / RAMFS / 磁盘文件系统 | ✅ v0.7 + **v0.8 磁盘后端**已完成（VFS trait + 挂载表最长前缀路由 + RAMFS + fd 表；**FAT12/16/32 只读后端** + `tools/mkfs/mkfs.py`，`make test-fs` 19 项 / `make test-fat` 21 项 PASS） |
+| [drivers.md](./drivers.md) | 阶段：驱动框架 / PCI / 磁盘（含 v0.4 中断/时钟/键盘/上下文切换） | ✅ v0.8 已完成（驱动注册框架 + PCI 枚举 + 块设备抽象 + **legacy virtio-blk**，`make test-driver` 22 项 PASS；启动盘已改为 virtio-blk）；v0.4（PIC + PIT 100Hz + PS/2 键盘 + 上下文切换原语）已完成；v0.9 键盘加**行缓冲 + 终端式回显**（`make test-keyboard` 断言同步） |
+| [process.md](./process.md) | 阶段：进程/线程 / 上下文切换 / 调度器 / IPC | ✅ v0.5 已完成（线程模型 + 上下文切换 + Round Robin 时间片调度 `make test-scheduler`；IPC pipe 骨架 `make test-ipc`）；channel / shared_memory 仍为占位；v0.6 追加了 `scheduler::suspend()`；**v0.9 第三步：进程对象与 `fork`/`execve`/`wait4` 已落地**（每进程地址空间 + 每进程 64 KiB 内核栈 + 完整用户帧，`make test-proc`，见 1.4） |
+| [syscall.md](./syscall.md) | 阶段：系统调用 / 用户空间 / ELF | 🟡 v0.7 核心已完成（`syscall`/`sysret` 入口 + ring3 隔离 + `read/write/open/close`+ `write/exit/getpid/sleep` + **ELF Loader** 从 RAMFS `/init` 按段权限装载），v0.9 已落地三步：**用户堆**（3.5）、**`stdin` + 交互式 Shell**（3.6）、**`fork`/`execve`/`wait4` + `argc`/`argv`**（3.7，外部程序 `/bin/hello` 真的能跑）；`make test-user` 61 项 / `make test-shell` 11 项 / `make test-proc` 8 项 + 4 正则 PASS；只剩 `mprotect`/环境变量/动态链接未做（见 3.4） |
+| [filesystem.md](./filesystem.md) | 阶段：VFS / RAMFS / 磁盘文件系统 | ✅ v0.7 + **v0.8 磁盘后端**已完成（VFS trait + 挂载表最长前缀路由 + RAMFS + fd 表；**FAT12/16/32 只读后端** + `tools/mkfs/mkfs.py`，`make test-fs` 20 项 / `make test-fat` 21 项 PASS） |
 
 ## 阶段说明
 
@@ -38,11 +38,27 @@
 - **第七阶段（v0.8）**✅：驱动注册框架 + PCI 枚举 + 块设备（legacy virtio-blk）已实现并验收（`make test-driver` 22 项），
   见 drivers.md；磁盘文件系统（**FAT12/16/32 只读后端**）已挂到现有 VFS，H-03 `mkfs` 同步落地（`make test-fat` 21 项），
   见 filesystem.md。之后的 v0.9：Shell + 用户程序 + 网络。
-- **第八阶段（v0.9 开局）**🟡：运行时前置条件第一步 **用户堆**（`brk`/`mmap`/`munmap` +
-  `libc` 的 `#[global_allocator]`，`Vec`/`String` 可用）已落地并验收（`make test-user` 59 项，
-  含页帧泄漏检查），见 syscall.md 3.5；Shell/用户程序/网络仍为占位。
+- **第八阶段（v0.9 开局）**🟡：第一步 **用户堆**（`brk`/`mmap`/`munmap` + `libc` 的
+  `#[global_allocator]`）已落地并验收（见 syscall.md 3.5）；第二步 **`stdin` + 交互式 Shell**
+  已落地并验收 —— 键盘行缓冲 → `read(0)` 整行 → `/bin/sh`（`make test-shell` 11 项，见 syscall.md 3.6）；
+  第三步 **进程对象 + `fork`/`execve`/`wait4` + `argc`/`argv`** 已落地并验收 ——
+  Shell 能真的跑起外部程序（`/bin/hello`，`make test-proc`，见 syscall.md 3.7 与 process.md 1.4）；
+  网络仍为占位。
 - **后续**：每进入一个新阶段就编写/修订对应的主题文档；阶段内已落地部分也要及时补记当前状态（例如 v0.4 中断控制器）。
 - 本套文档**会在开发过程中被反复修改**——修改前请在对应文档顶部记录修订日期与变更点。
+-  本次（2026-10-11，第八轮）修订重点：**v0.9 第三步（进程对象 + `fork`/`execve`/`wait4`）落地** ——
+  进程表从「最小登记」换成真正的 PCB（每进程地址空间 + 每进程 64 KiB 内核栈 + 栈底哨兵
+  + 停在 syscall 里的完整用户帧）、新增 `syscall/process.rs`（fork 复制地址空间与当前帧、
+  execve 换映像并重建 argv 用户栈、wait4 延迟调度 + 回收）、`trampoline` 改为按进程切换；
+  Shell 的外部命令改走 `fork`+`execve`+`wait4`，新增外部程序 `/bin/hello`（`user/hello-bin`）；
+  新增 `make test-proc`（8 项 + 4 条正则，含 PID 一致性反向引用）与编排 `proc` 场景（11 → **12 场景**）；
+  同步 syscall.md（新增 3.7、更新 3.2/3.3/3.4/3.6/4）、process.md（新增 1.4，1.3 阻塞点关闭）、
+  libc/README（新增进程调用与 `argc`/`argv` 一节）、project-structure/roadmap/README/DEVELOPMENT。
+-  本次（2026-10-11，第七轮）修订重点：**v0.9 第二步（`stdin` + 交互式 Shell）落地** ——
+  键盘行缓冲 + 终端式回显、`read(0)` 整行交付（3 秒 `-EAGAIN`）、`user/shell` → RAMFS `/bin/sh`
+  （提示符 `root@cerlesse C:>`、内建命令、外部命令真调 `fork()` 暴露 ENOSYS）、新增 `make test-shell`（12 项）
+  与编排 `shell` 场景（11 场景）；同步 syscall.md（新增 3.6、3.2/3.3/3.4）、process.md（1.3 阻塞点）、
+  drivers.md（键盘行缓冲）、project-structure/roadmap/README/DEVELOPMENT。
 -  本次（2026-10-11，第六轮）修订重点：**H-06 P0a（`.ckc` 包容器）落地** —— 内核包后缀定名为
   `.ckc`（CKC = Cerlesse Kernel Container）：64 字节头（magic/版本/头长/flags/长度/偏移/
   32 字节 payload_sha256/保留位）+ 确定性 ustar（归档名 = 目标路径去 `/`、`PKG.toml` 第一、

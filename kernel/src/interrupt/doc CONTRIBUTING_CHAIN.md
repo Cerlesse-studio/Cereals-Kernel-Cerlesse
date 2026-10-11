@@ -66,8 +66,9 @@ IRQ stub 保存寄存器等已固定住的细节。
 | `make test-exception` | `#DE` 诊断 | ✅ |
 | `make test-memory` | 堆 / 帧 / 页表自测 + `context: switch PASS` | ✅ |
 | `make test-pagefault` | `#PF` 诊断 + CR2 | ✅ |
-| `make test-keyboard` | QEMU monitor 注入按键 → `KBIRQ ENTRY / KB a / KBIRQ EXIT` + 心跳 | ✅ |
-| `make test-orch` | Go 编排器并行跑 6 场景 + 串口二次复核 | ✅ |
+| `make test-keyboard` | QEMU monitor 注入按键 → `KBIRQ ENTRY / kbd: line ready len=3 / KBIRQ EXIT` + 心跳（v0.9 行缓冲） | ✅ |
+| `make test-shell` | 注入 `help`/`cat /etc/motd`/`ls`/`exit` → 提示符、`read fd=0`、ENOSYS 依赖证据、`user: shell PASS`（v0.9） | ✅ |
+| `make test-orch` | Go 编排器并行跑 11 场景 + 串口二次复核 | ✅ |
 | `make go-test` | Go 宿主侧单元测试 | ✅ |
 
 ## 6. 限制（当前阶段不做的部分）

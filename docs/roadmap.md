@@ -2,7 +2,9 @@
 
 - 阶段：第一阶段 / 路线规划
 - 最后更新：2026-10-11
-- 状态：🟡 持续更新（2026-10-08 补记 v0.4/v0.5；2026-10-11 补记 v0.6/v0.7 实际进度、v0.8 前半落地与 v0.8 收官）
+- 状态：🟡 持续更新（2026-10-11 补记 v0.6/v0.7 实际进度、v0.8 前半落地与 v0.8 收官、
+  v0.9 第一步（用户堆）、第二步（`stdin` + 交互式 Shell）与第三步（**进程对象 + `fork`/`execve`/`wait4`**）；
+  v0.9 剩余：动态链接与网络）
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
 
@@ -56,7 +58,7 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 | **v0.6 🟡** | Syscall + User Space（2026-10-10 核心已验收：`syscall`/`sysret` 入口 + ring3 + 用户地址空间隔离 + `write/exit/getpid/sleep`；2026-10-11 用户态脚手架可用：`libc/` + `user/hello` 真实用户程序跑在 ring3，`make user` / `make test-user` PASS）；ELF Loader / VFS 文件语义 / 进程对象留到 v0.7 | syscall.md |
 | **v0.7 🟡** | VFS + RAMFS + ELF（2026-10-11 核心已验收：`FileSystem` trait + 挂载表最长前缀路由 + RAMFS 后端 + fd 表 + `open/read/write/close` + **ELF Loader**（RAMFS `/init` 按段权限逐页装载，`RW` 段对 ring3 可写）；`make test-fs` 19 项 / `make test-user` 32 项 PASS）。Shell 里 `ls/cat/cd` 属 v0.9、磁盘 FS（FAT32）与 `mkfs` 属 v0.8 | filesystem.md / syscall.md |
 | **v0.8 ✅** | Driver + PCI + Disk（2026-10-11 验收：驱动注册框架 + PCI 枚举 + 块设备 + **legacy virtio-blk**（`make test-driver` 22 项）；**FAT12/16/32 只读后端挂到 VFS** + H-03 `mkfs`（`make test-fat` 21 项），双盘启动读 `/disk`（启动盘）与 `/mnt/fat`（测试盘）） | drivers.md / filesystem.md |
-| **v0.9** 🟡 | Shell + User Programs + Network（**已开局**：运行时前置条件第一步 **用户堆** = `brk`/`mmap`/`munmap` + `libc` 全局分配器，`make test-user` 59 项；下一步 `argc/argv`、进程对象/`fork` 系、动态链接） | syscall.md / drivers.md / filesystem.md |
+| **v0.9** 🟡 | Shell + User Programs + Network（**已落地三步**：第一步 **用户堆**（`brk`/`mmap`/`munmap` + `libc` 全局分配器）；第二步 **`stdin` + 交互式 Shell**（键盘行缓冲 → `read(0)` 整行 → `/bin/sh`）；第三步 **进程对象 + `fork`/`execve`/`wait4` + `argc`/`argv`** —— Shell 的外部程序 `/bin/hello` 真的能跑起来（`make test-shell` 11 项 / `make test-proc` 8 项 + 4 正则 / `make test-user` 61 项））。**剩余：动态链接与网络** | syscall.md / process.md / drivers.md / filesystem.md |
 | **v1.0** | 完整可启动的类 Linux 小型 OS | — |
 
 每个版本的详细任务清单见 [../DEVELOPMENT.md](../DEVELOPMENT.md)。
@@ -70,7 +72,9 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 5. **第五阶段（v0.5）**：进程/线程/调度 + IPC（pipe 骨架） —— 见 process.md（✅）。
 6. **第六阶段（v0.6–v0.7）**：系统调用/用户态/文件系统 —— v0.6（syscall 入口 + ring3 + 隔离 + 用户态脚手架）与 v0.7（VFS/RAMFS/fd 表/文件 syscall/ELF Loader）均已落地并验收，见 syscall.md 与 filesystem.md（均 🟡）；剩余的 `fork/exec/wait`、进程对象、用户堆、磁盘 FS 归入 v0.8+。
 7. **第七阶段（v0.8–v0.9）**：v0.8 已完成（驱动注册框架 / PCI 枚举 / 块设备 / legacy virtio-blk + **FAT 磁盘后端挂到 VFS** + `mkfs`），
-   见 drivers.md 与 filesystem.md（均 ✅）；v0.9 的网络/Shell 仍为占位（⬜ 待编写）。
+   见 drivers.md 与 filesystem.md（均 ✅）；v0.9 进行中：用户堆、**`stdin` + 交互式 Shell（`/bin/sh`）**
+   与 **进程对象 + `fork`/`execve`/`wait4`**（外部程序 `/bin/hello`）均已落地
+   （见 syscall.md 3.5/3.6/3.7 与 process.md 1.4），网络仍为占位（⬜ 待编写）。
 8. **第八阶段（v1.0）**：整合、安全机制、发布。
 
 ## 5. 修订记录
@@ -89,5 +93,7 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 | 2026-10-11 | v0.6 用户态脚手架可用：`libc/` 落地（syscall 封装 + `_start` + `print!/println!`）、真实用户程序 `user/hello` 并入 workspace、`kernel/build.rs` 构建期摊平内嵌、`load_program` 支持多代码页；新增 `make user`，`make test-user` 增至 19 项断言 |
 | 2026-10-11 | **v0.8 前半落地**（驱动注册框架 + PCI 枚举 + 块设备 + legacy virtio-blk）：新增 `driver/{driver,pci,block,virtio_blk}.rs` 与 `arch/x86_64/port.rs`、`frame::allocate_contiguous`；启动盘改为 virtio-blk（`disable-modern=on`）；新增 `make test-driver`（22 项）与编排第 9 个场景；该阶段里程碑当时记为 🟡（FAT/`mkfs` 未做，三日内的同一版本内补齐后标 ✅） |
 | 2026-10-11 | **v0.7 核心落地**：VFS + RAMFS + fd 表 + `read/open/write/close` + **ELF Loader**（用户程序改为从 RAMFS `/init` 装载，按段权限逐页映射；`build.rs` 不再摊平）；`user.ld` 四段 `ALIGN(0x1000)`；新增 `make test-fs` 与 `tools/check_user_elf.py`，`make test-user` 增至 32 项；v0.7 里程碑标记 🟡（Shell `ls/cat/cd` → v0.9，磁盘 FS + `mkfs` → v0.8） |
+| 2026-10-11 | **v0.9 第三步：进程对象 + `fork`/`execve`/`wait4`**：`process/process.rs` 换成真正的 PCB（每进程 64 KiB 内核栈 + 栈底哨兵、`Ready/Running/Zombie`、`return_to`、停在 syscall 里的完整用户帧），新增 `syscall/process.rs`（fork 复制地址空间与当前帧、execve 换映像并重建 argv 用户栈、wait4 延迟调度 + 回收），`trampoline` 改为按进程切 CR3/TSS.RSP0/栈顶；`libc` 补上 `args`（入口寄存器 ABI）与去桩的 `fork`/`execve`/`wait4`；新增外部程序 `user/hello-bin` → RAMFS `/bin/hello`，Shell 的 `cmd_external` 改走 `fork`+`execve`+`wait4`；`tests/test_keyboard.py` 新增 `--expect-re`（正则 + 反向引用）并新增 `make test-proc`（8 项 + 4 正则），编排场景 11 → **12**；`make test-shell` 12 → **11 项**；记录两条踩坑（debug 构建下 16 KiB 内核栈静默溢出踩坏 `.bss` 帧分配器；退出时先恢复 CR3 再 Drop 地址空间）；v0.9 里程碑仍 🟡（动态链接/网络未做） |
+| 2026-10-11 | **v0.9 第二步：`stdin` + 交互式 Shell**：键盘行缓冲（行编辑 + 终端式回显 + `kbd: line ready len=N`）、`read(0)` 整行交付（3 秒 `-EAGAIN`）、新增 `user/shell` → RAMFS `/bin/sh`（提示符 `root@cerlesse C:>`、内建 `help`/`echo`/`cat`/`pid`/`exit`、外部命令真调 `fork()` 并暴露 ENOSYS）、`kernel/build.rs` 改为多用户程序构建与内嵌、`fs::init` 加 `/bin`、`syscall/mod.rs` 打印 `syscall: ENOSYS nr=… name=…`；新增 `make test-shell`（12 项）与编排 `shell` 场景（10 → **11 场景**）；`make test-user` 59 → **61 项**、`test-fs` 根目录 3 → 4；v0.9 里程碑仍 🟡（进程对象/外部程序/网络未做，见 process.md 1.3） |
 | 2026-10-11 | **v0.9 开局（运行时前置条件第一步：用户堆）**：`syscall/memory.rs` 实现 `brk`/`mmap`/`munmap`（256 KiB 堆窗口 + 256 KiB 匿名 mmap 窗口、按需映射、新页全零、W^X、`invlpg`），`libc` 提供 `#[global_allocator]`（bump over mmap）与封装，`user/hello` 加入堆自测，`user.rs` 新增页帧泄漏检查；`make test-user` 32 → **59 项** PASS，`make test-orch` 10 场景 PASS；v0.9 里程碑标记 🟡（Shell/网络仍未做） |
 | 2026-10-11 | **v0.8 收官**（FAT 磁盘后端 + H-03 `mkfs`）：`fs/fat.rs`（FAT12/16/32 只读：BPB 按簇数定类型、固定根目录区/簇链目录、8.3 + NT 标志 + LFN 校验和、任意偏移读、`EROFS`/`EUCLEAN`）挂到 VFS（`fs::mount_disks` → `/disk` 启动盘、`/mnt/fat` 测试盘，验证最长前缀路由）；`FileSystem` trait 改为 `&mut self` + `read_all -> Vec<u8>`；`tools/mkfs/mkfs.py` 自己生成 FAT12/16/32 镜像并由 mtools 独立复核；新增 `make fat-image` / `make test-fat`（21 项，双盘）与编排第 10 个场景；v0.8 里程碑标记 ✅ |

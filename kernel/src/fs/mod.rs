@@ -13,15 +13,20 @@
 //! 初始化顺序：RAMFS 用内核堆保存文件内容，因此 [`init`] 必须在
 //! `memory::init`（帧分配器 + 内核堆就绪）之后调用，见 `main.rs`。
 //!
-//! v0.7 的初始文件树（由 [`init`] 建立）：
+//! v0.7 的初始文件树（由 [`init`] 建立，v0.9 加上 `/bin/sh`）：
 //!
 //! ```text
 //! /            ramfs
 //! ├── init     用户程序 ELF（内核内嵌，由 kernel/build.rs 产出）
+//! ├── bin/
+//! │   └── sh   交互式 Shell ELF（v0.9，同样内嵌）
 //! ├── etc/
 //! │   └── motd 文本文件（用户程序用 open/read 读它）
 //! └── tmp/     用户程序写文件的落点
 //! ```
+//!
+//! 为什么 Shell 放在 `/bin` 而不是根目录：`/bin` 是将来「外部程序」的落点
+//! （`ls`/`cat`/`ps`），Shell 只是其中第一个 —— 目录先建立，后续只添文件。
 //!
 //! v0.8 在同一个 trait 下加了第二个后端：[`fat`]（块设备上的 FAT12/16/32，**只读**），
 //! 由 [`mount_disks`] 挂到 `/disk`（启动盘）与 `/mnt/fat`（`mkfs` 生成的测试盘）。
@@ -49,20 +54,26 @@ pub const MOTD: &[u8] = b"motd: hello from ramfs\n";
 
 /// 挂载根 RAMFS 并建立初始文件树。
 ///
-/// `init_elf` 是内嵌的用户程序 ELF（见 `syscall::user::init_image`），
-/// 以 `/init` 落在 RAMFS 上 —— 内核稍后从 VFS 读它、交给 ELF Loader 装载，
-/// 这就是 v0.7「用户程序从文件加载」的完整路径（v0.6 是构建期摊平 + 直接拷贝）。
-pub fn init(init_elf: &'static [u8]) -> Result<(), i64> {
+/// `programs` 是内嵌的用户程序 ELF 清单 `(RAMFS 路径, ELF 字节)`（见
+/// `syscall::user::program_images`）—— `/init`、`/bin/sh`、`/bin/hello` 都以
+/// **普通文件**落在 RAMFS 上：内核稍后从 VFS 读它们、交给 ELF Loader 装载。
+/// v0.7 起用户程序就是「文件系统里的一个文件」，没有任何一条是特例
+/// （`/bin/hello` 还是由 Shell `fork` + `execve` 起来的）。
+pub fn init(programs: &[(&'static str, &'static [u8])]) -> Result<(), i64> {
     mount::table().mount("/", Box::new(ramfs::RamFs::new("ramfs")))?;
     serial::print("fs: mount point=/ fs=");
     serial::println(
         vfs::backend_name("/").expect("根挂载点刚建立，必须能路由"),
     );
 
-    // /init：用户程序（内容来自内核映像里内嵌的 ELF）
-    vfs::create("/init")?;
-    let written = vfs::write("/init", 0, init_elf)?;
-    log_write("/init", written);
+    // /bin 是外部程序的落点：目录先建立，随后往里放文件
+    vfs::mkdir("/bin")?;
+
+    // 用户程序：每个 `(path, elf)` 都走 `create` + `write`（与用户态看到的完全一致）
+    for (path, elf) in programs {
+        vfs::create(path)?;
+        let written = vfs::write(path, 0, elf)?;
+        log_write(path, written);    }
 
     // /etc/motd：用户程序读的对象
     vfs::mkdir("/etc")?;
@@ -215,7 +226,10 @@ pub fn selftest() -> Result<(), &'static str> {
         serial::print(" perms=");
         serial::println(entry.meta.perms());
     }
-    if entries.len() != 3 {
+    // 根目录条目数：`init` + `bin` + `etc` + `tmp`（v0.9 加上了 `/bin`）。
+    // 这是精确断言而不是「至少有几个」：新增/潦掉的根条目必须同步改这里与
+    // `make test-fs` 的期望，否则「文件树悄悄变了」不会被发现。
+    if entries.len() != 4 {
         return Err("fs: root directory entry count mismatch");
     }
 

@@ -4,10 +4,10 @@
 - 最后更新：2026-10-11
 - 状态：🟡 v0.7 已落地：**ELF Loader**（从 RAMFS 上的 `/init` 装载，按段权限逐页映射）+ 文件 syscall
   （`read`/`write`/`open`/`close`，对接 VFS/RAMFS）+ 用户 `RW` 段对 ring3 可写；
-  **v0.9 第一步已落地：用户堆**（`brk` 256 KiB / 匿名 `mmap` 256 KiB / `munmap`，
-  用户态 `#[global_allocator]` 可用 `Vec`；见 3.5）；
-  `make test-user` 59 项 / `make test-fs` 19 项串口断言 PASS；
-  `fork/exec/wait`、进程对象、`argc/argv`、动态链接仍未做（见 3.4）
+  **v0.9 已落地三步**：用户堆（3.5）、`stdin` + 交互式 Shell（3.6）、
+  **进程对象 + `fork`/`execve`/`wait4` + `argc`/`argv`**（3.7，外部程序真的能跑了）；
+  `make test-user` 61 项 / `make test-shell` 11 项 / `make test-proc` 8 项 + 4 条正则 / `make test-fs` 20 项 PASS；
+  仍未做：`mprotect`、环境变量（`envp`）、动态链接（见 3.4）
 
 > 本文档顶部保留阶段 / 最后更新 / 状态字段，与项目文档维护约定对齐。
 - 依赖：process.md（进程模型）、memory.md（用户地址空间）
@@ -19,9 +19,11 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
 1. **v0.6 核心**：建立用户态 / 内核态隔离 + 系统调用入口 + 第一批 syscall + 用户态 `hello` 运行。
 2. **v0.7 扩展（本版已完成）**：ELF Loader（从文件装载、按段权限映射）、
    VFS 对接的文件语义（`open`/`read`/`write`/`close`）。
-3. **v0.9 第一步（本版已做）**：用户堆 —— `brk`/`mmap`/`munmap` + libc 的全局分配器（见 3.5）。
-4. **仍未做**：`argc/argv`、`fork`/`execve`/`wait4` 与进程对象、`mprotect`（W^X 转换）、
-   动态链接（`PT_INTERP`/`ld.so`）、Shell 与 `ls`/`cat` 程序。
+3. **v0.9 第一步（已做）**：用户堆 —— `brk`/`mmap`/`munmap` + libc 的全局分配器（见 3.5）。
+4. **v0.9 第二步（已做）**：`stdin`（键盘行缓冲 → `read(0)` 整行交付）+ 交互式 Shell `/bin/sh`（见 3.6）。
+5. **v0.9 第三步（已做）**：进程对象与 `fork`/`execve`/`wait4` + `argc`/`argv` ——
+   Shell 现在能真的跑起外部程序（见 3.7 与 `docs/process.md` 1.4）。
+6. **仍未做**：`mprotect`（W^X 转换）、环境变量（`envp`）、动态链接（`PT_INTERP`/`ld.so`）。
 
 ## 2. v0.6 实际实现（2026-10-10 落地）
 
@@ -107,7 +109,7 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
 
 | syscall | 号 | 状态 | 行为 |
 | ---- | ---- | ---- | ---- |
-| `read` | 0 | ✅ v0.7 | fd 0 → 0（stdin 未接通，不卡住调用方）；fd ≥ 3 → 从 VFS 读入用户缓冲（要求**可写**，否则 `-EFAULT`）；偏移量随之推进，EOF 返回 0 |
+| `read` | 0 | ✅ v0.7 / v0.9 | fd 0 → **键盘行缓冲整行交付**（v0.9：行尾统一 `\n`；3 秒无整行 → `-EAGAIN`，见 3.6）；fd ≥ 3 → 从 VFS 读入用户缓冲（要求**可写**，否则 `-EFAULT`）；偏移量随之推进，EOF 返回 0 |
 | `write` | 1 | ✅ v0.6/v0.7 | `fd=1/2` 写串口；`fd ≥ 3` 写文件（VFS，偏移量随之推进）；缓冲要求可读 |
 | `open` | 2 | ✅ v0.7 | `open(path_ptr, path_len, flags)`：路径用**指针 + 长度**（内核已校验区间，不在不可信内存上找 NUL）；`flags` 只接受 `O_RDONLY`/`O_WRONLY`/`O_RDWR`/`O_CREAT`，返回**最小空闲 fd**（≥3） |
 | `close` | 3 | ✅ v0.7 | 释放动态 fd（0/1/2 是保留位，关闭它们返回 `-EBADF`） |
@@ -117,7 +119,7 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
 | `mmap` | 9 | ✅ v0.9 第一步 | 匿名映射：只收 `MAP_PRIVATE\|MAP_ANONYMOUS`、`fd` 必须 -1、**只传 5 个参数（无 offset）**；first-fit 落在 256 KiB 的 mmap 窗口；新页**保证全零**；`PROT_WRITE\|PROT_EXEC` 拒绝（W^X）、`PROT_NONE` 拒绝（没有 `mprotect`） |
 | `munmap` | 11 | ✅ v0.9 第一步 | 整段归还：页对齐 + 全段已映射，否则 `-EINVAL`；执行时清页表项 **并 `invlpg`**（否则 TLB 会留下幽灵映射） |
 | `brk` | 12 | ✅ v0.9 第一步 | 增长/收缩堆顶（窗口 256 KiB）；`addr = 0` 只查询；**Linux 语义：不返回错误**，失败返回原值（`ret < addr` 即失败）；增长全成或全不成 |
-| `fork` / `execve` / `wait4` | 57 / 59 / 61 | ⬜ 后续 | 落在 ENOSYS 桩上（需要进程对象） |
+| `fork` / `execve` / `wait4` | 57 / 59 / 61 | ✅ v0.9 第三步 | `fork` 复制地址空间与当前用户帧（子进程 `rax=0`、父进程得 PID）；`execve(path, argv)` 换映像并重建 argv 用户栈（**成功不返回**）；`wait4(pid)` 运行并回收直接子进程、返回退出码（非子进程 `-ECHILD`）；详见 3.7 |
 | `mprotect` | 10 | ⬜ 后续 | 已列入「号已定义但未实现」（`syscall_table::UNIMPLEMENTED`）：`PROT_NONE` 的映射与「先写后换只执行」都依赖它 |
 
 分发表按 `SYS_MAX`(=256) 排满：未实现的号落在公共 ENOSYS 桩，
@@ -178,18 +180,21 @@ v0.9 第一步增至 59 项，见 3.3 / 3.5）：
       `user: FAULT vector=0xe error=0x5` + `user: FAULT cr2=0x2000000` +
       `user: isolation PASS`，且**内核不 panic、继续运行**
 - [x] 用户态 `/init` 通过 **ELF Loader** 加载运行 → v0.7 已完成（见 3.1 / 3.3）
-- [ ] `fork`/`exec`/`wait` 骨架 → 推到 v0.8（v0.6/v0.7 未提供进程对象，`exit` 语义为
-      「结束当前用户态执行」而非「销毁进程」）
+- [x] `fork`/`exec`/`wait` **真实语义** → v0.9 第三步已完成（3.7）：前置条件是进程对象
+      （每进程地址空间 + 每进程内核栈），v0.6/v0.7 的 `exit` 语义因此从
+      「结束当前用户态执行」升级为「标记僵尸进程并回到 `wait4` 的调用方」
 
 ### 2.10 v0.6 明确未做的事（避免误读）
 
 - **没有** ELF Loader（用户程序是构建期摊平的内嵌映像，不是从文件加载）→ **v0.7 已做**（3.1）；
-  没有用户栈参数传递（`argc/argv`）→ 仍未做；
+  没有用户栈参数传递（`argc/argv`）→ **v0.9 第三步已做**（参数经入口寄存器 `rdi`/`rsi` 传递，见 3.7）；
 - **没有**用户堆/`brk`/`mmap`。v0.6 里用户程序连静态数据都不能写（代码页整体只读）；
   v0.7 起 `RW` 段（`.data`/`.bss`）映射为 ring3 可写（实测 `hello: static counter=1`），
   但仍然**没有堆**；
-- **没有**进程/线程对象：一次只跑一个用户程序，`exit` 结束该次执行并回到内核；
-- **没有** `fork/exec/wait`；v0.6 没有 `read/open/close` → **v0.7 已做**（见 2.7 / 3.2）；
+- **没有**进程/线程对象：一次只跑一个用户程序，`exit` 结束该次执行并回到内核
+  → **v0.9 第三步已做**（见 3.7：每进程 PCB + 每进程内核栈）；
+- **没有** `fork/exec/wait` → **v0.9 第三步已做**（见 3.7）；
+  v0.6 没有 `read/open/close` → **v0.7 已做**（见 2.7 / 3.2）；
 - **没有**高半区迁移：内核仍在低地址恒等映射内，隔离靠**页表项 `USER` 位**而不是地址空间划分
   （ADR-009 的“高半区”一项推迟，实现方式见 2.4）；
 - 用户页表是内核 PML4 的**快照**：内核在用户态运行期间新增 PML4 槽位级的映射不会出现在
@@ -307,13 +312,14 @@ user/hello (Rust + libc)
 | 项 | 实现位置 | 说明 |
 | ---- | ---- | ---- |
 | fd 表 | `kernel/src/fs/file.rs` | 0/1/2 保留（stdin/串口），动态 fd 从 3 开始、取最小空闲槽位；记录 `path` + `offset` + 模式 |
+| `read(0)`（stdin） | `syscall/file.rs::read_stdin` | **键盘行缓冲（v0.9）**：交付整行（行尾统一 `\n`）；3 秒没有整行返回 `-EAGAIN`(-11)，见 3.6 |
 | `open` | `syscall/file.rs::sys_open` | 路径用「指针 + 长度」；带 `O_CREAT` 时不存在则创建（`EEXIST` 视为成功） |
 | `read`/`write` | `syscall/file.rs` | 用户缓冲按页校验（读要求可写、写要求可读）；fd ≥ 3 转 `vfs::read/write` |
 | VFS/RAMFS | `kernel/src/fs/` | 见 [filesystem.md](filesystem.md)；挂载表最长前缀路由，`/mnt` 上挂第二个 RAMFS |
 
 ### 3.3 验收（v0.7，实测）
 
-`make test-user`（v0.7 时 32 项；v0.9 第一步增至 59 项，见 3.5）与 `make test-fs`（19 项）
+`make test-user`（v0.7 时 32 项；v0.9 第一步增至 59 项，见 3.5）与 `make test-fs`（20 项）
 串口断言全部 PASS，关键证据：
 
 - [x] **ELF 从文件装载**：`fs: create /init` → `user: program=/init source=elf bytes=15596 segments=4
@@ -332,15 +338,21 @@ user/hello (Rust + libc)
       （Linux syscall ABI 语义，见 2.1 与 B-15）；
 - [x] 隔离与退出码回归不变：`FAULT vector=0xe error=0x5 cr2=0x2000000` → `user: isolation PASS`，
       `user: exit code=42` → `user: init PASS`；
-- [ ] 除 `/init` 之外的**多个**用户程序（需要 `argc/argv` 或 shell）→ v0.9；
-- [ ] `ls`/`cat`/`cd` 用户程序 → v0.9（v0.7 在内核侧与 `/init` 里验证了同样的语义）。
+- [x] 除 `/init` 之外的**多个**用户程序：v0.9 第二步落地 `/bin/sh`（`user/shell`）——
+      同样从 VFS 读 ELF 装载，因此「多个程序」不再需要 `argc/argv`（命令来自 stdin，见 3.6）；
+- [x] `ls`/`cd` 等**外部**用户程序 → v0.9 第三步已打通：`/bin/hello`（`user/hello-bin`）
+      由 Shell `fork` + `execve` 起来，拿到 `argc/argv` 并返回退出码（`make test-proc`）；
+      `cat` 仍以 Shell **内建命令**形式跑通同样的 syscall 语义（`open/read/write/close`）。
 
 ### 3.4 仍未做（v0.9 起逐步补齐）
 
 - ~~用户堆~~ → **已做**（3.5：`brk`/`mmap`/`munmap` + libc 全局分配器）；仍缺 `mprotect`
   （`PROT_NONE`、W^X 转换）与文件映射；
-- `argc/argv`／环境变量传递：`_start` 不接收参数；
-- `fork`/`execve`/`wait4` 与进程对象（`exit` 仍是「结束当前用户态执行」）；
+- ~~`stdin`~~ → **已做**（3.6：键盘行缓冲 → `read(0)` 整行交付）；
+- ~~**`fork`/`execve`/`wait4` 与进程对象**~~ → **已做**（3.7）：每进程地址空间 +
+  每进程内核栈 + 停在 syscall 里的完整用户帧，Shell 的外部程序（`/bin/hello`）已能跑；
+- ~~`argc/argv`~~ → **已做**（3.7：参数经入口寄存器 `rdi`/`rsi` 传递，`libc::args` 读出）；
+  环境变量（`envp`）仍未做；
 - `stac`/`clac` 精细控制（内核目前直接读写用户页）、内核高半区迁移；
 - 动态链接 / `PT_INTERP` / `ET_DYN`（只接受 `ET_EXEC` + 无重定位）。
 
@@ -378,6 +390,94 @@ v0.9 的运行时前置条件按依赖顺序补：**先有可分配的用户内�
 文件映射（`mmap` 无 offset 参数、`fd` 必须 -1）、回收式分配器（`dealloc` 是空操作：
 一次运行结束由内核整棵释放；长驻程序的内存占用会单调上升）。
 
+### 3.6 交互式 Shell 与 stdin（v0.9 第二步，2026-10-11 落地）
+
+依赖顺序（与 3.5 一脉相承）：**先有用户堆 → 再有 `stdin` 与第二个用户程序 → 最后才是
+进程模型/动态链接**。本版做的是中间那一步：把 v0.4 的键盘输入接到用户态，
+并交付一个真正能交互的 Shell（`user/shell`，RAMFS 上的 `/bin/sh`）。
+
+```text
+PS/2 键盘 IRQ1 → 行缓冲 + 行编辑（driver/keyboard.rs）
+      │ kbd: line ready len=5
+      ▼
+read(0)（syscall/file.rs::read_stdin）→ 整行（内容 + \n）
+      │ user: read fd=0 want=128 got=5
+      ▼
+/bin/sh：提示符 → 解析 → 内建命令 → 循环
+```
+
+| 项 | 实现位置 | 说明 |
+| ---- | ---- | ---- |
+| 行缓冲 | `driver/keyboard.rs` | 128 字节缓冲 + 行编辑（退格、回显）；`Enter` 把整行标为可取并打印 `kbd: line ready len=N` |
+| 回显协议 | 同上 | v0.9 起改为**终端式原样回显**（旧格式 `KB <字符>` 已废弃，`make test-keyboard` 同步改断言）；`KBIRQ ENTRY/EXIT` 不变 |
+| `read(0)` | `syscall/file.rs::read_stdin` | 等待上限 `STDIN_IDLE_TICKS` = 300 tick（3 秒）→ `-EAGAIN`(-11)；等待期间 `sti; hlt`（同 `sys_sleep`），取到行后 `cli` 恢复 handler 关中断约定 |
+| Shell | `user/shell/src/main.rs` | 提示符 `root@cerlesse C:>`（用户名@主机名 盘符>）；内建 `help`/`echo`/`cat`/`pid`/`exit`；不用堆（映像 5 页） |
+| 外部命令 | 同上 `cmd_external` | `fork()` → 子进程 `execve("/bin/hello", argv)` → 父进程 `wait4(pid)` 取退出码；找不到的程序由 `execve` 返回 `-ENOENT`，子进程按惯例 `exit(127)`（见 3.7） |
+| 内嵌与装载 | `kernel/build.rs` + `syscall/user.rs` + `fs::init` | 三个用户程序同一套构建/校验/装载路径，`/bin/sh` 只是“另一个普通程序” |
+
+**为什么曾经不能“嵌套运行”外部程序**（保留这段记录，因为它是 v0.9 第三步的设计前提）：
+v0.9 第二步时 ring3 入口（当时的 `trampoline::enter_ring3`）假设“一次只有一个用户程序”：
+恢复现场用的用户上下文槽与陷入栈都是**全局唯一**的，所以从 `sys_read` 里再进去一次，
+子程序的 syscall 会覆盖父程序停在 syscall 里的现场。**结论不是放弃，而是先补前置条件**：
+v0.9 第三步把入口改成按进程切换（当前进程下标 + 每进程内核栈 + 每进程地址空间），
+`suspend/resume` 才可能成立 —— 这就是 3.7 的做法与 `docs/process.md` 1.4 的实现。
+
+验收（`make test-shell`，11 项，QEMU monitor 注入真实按键；断言的是日志行为不是
+“有 Shell 字样”）：
+
+- [x] `user: program=/bin/sh source=elf`：Shell 与 `/init` 一样**从 VFS 装载**；
+- [x] `root@cerlesse C:>` + `user: write fd=1 len=17`：提示符按默认加载样式**一次 `write`** 送出；
+- [x] `user: read fd=0 want=128 got=5`：注入的 `help`+Enter（4+1 字节）真的经键盘进了 `stdin`；
+- [x] `sh: builtins (v0.9 step 3):`：解析与分派生效（帮助文本列出内建命令与外部程序约定）；
+- [x] `user: open path=/etc/motd flags=0x0 fd=3` → `motd: hello from ramfs` →
+      `sh: cat /etc/motd bytes=23`：`cat` 走真实文件 syscall；
+- [x] `sh: bye` + `user: exit code=0` + `user: shell PASS`：退出路径；
+- [x] 页帧不泄漏：`user: frames free before=… after=…`（全部归还）。
+
+外部程序的单独验收见 3.7（`make test-proc`）。
+
+**已知限制（故意写清楚）**：
+
+1. `read(0)` 会在 3 秒无整行时返回 `-EAGAIN`，Shell 连续两次即自行退出
+   （日志 `sh: no input (2 idle windows), exiting …`）。这是**没有进程模型时的权宜之计**：
+   内核是在 syscall 里等用户程序，若 `stdin` 永久阻塞，任何无输入的启动都会停在 Shell 上，
+   `user: selftest PASS` 不再出现。注意 `wait4` 现在**真的会阻塞式地跑子进程**（3.7），
+   `stdin` 的 `-EAGAIN` 是仅剩的一处“不会被唤醒的等待”；
+2. 只有内建命令（`help`/`echo`/`cat`/`pid`/`exit`）+ 外部程序（`/bin/hello`）；
+   没有 `ls`/`cd`/管道/重定向（`ls` 会被解析到 `/bin/ls`，RAMFS 上没有该程序，
+   走的是「execve 失败 → exit(127)」这条**已验收**的路径）；
+3. `argv` 由 Shell 切分后交给 `execve`（见 3.7），但**没有**引号/环境变量/globbing；
+4. 回显是“cooked”（内核侧回显），且同一串口通道上还有 `KBIRQ ENTRY/EXIT` 标记 ——
+   可读性靠“一次击键一段标记”的约定，将来有终端抽象后再收敛。
+
+### 3.7 进程调用：`fork` / `execve` / `wait4` 与 `argc`/`argv`（v0.9 第三步，2026-10-11 落地）
+
+内核侧的完整设计（PCB 字段、状态机、每进程内核栈、两条踩坑）写在
+[docs/process.md](./process.md) 1.4；这里只记 syscall 层能看到的部分。
+
+| 项 | 实现位置 | 说明 |
+| ---- | ---- | ---- |
+| `fork` | `syscall/process.rs::sys_fork` | 复制地址空间（`UserSpace::clone_for_fork`）+ 克隆当前用户帧（`rax=0`）；进程表满 → `-EAGAIN`；失败**不改动进程表** |
+| `execve` | 同上 `sys_exec` | 参数是 `(path_ptr, path_len, argv_ptr, argc)`：路径与 `argv` 都用「指针 + 长度」并**先校验区间**再读；先读 ELF 再建新地址空间，**失败时当前映像不受影响**；成功后换 CR3 + `iretq` 到新入口（**不返回**） |
+| `wait4` | 同上 `sys_wait` | 只认**直接子进程**（`find_by_pid(want, Some(my_pid))`），否则 `-ECHILD`；子进程从未跑过→现在跑（“延迟调度”）；已是僵尸→直接取退出码；两种路径都 `reap()` 回收地址空间 |
+| `argv` 用户栈 | `syscall/process.rs::build_user_frame` | 从用户栈顶向下放参数字符串与指针数组（上限 `ARG_MAX_BYTES` = 1 KiB / 8 项 / 单项 256 字节），入口寄存器 `rdi = argc` / `rsi = argv` |
+| 用户态包装 | `libc/src/syscall.rs` + `libc/src/args.rs` | `fork()` / `execve(path, argv: &[&str])` / `wait4(pid)` 与 `argc()` / `arg(i)` / `arg_str(i)` |
+| 外部程序 | `user/hello-bin` → `/bin/hello` | 打印自己的 `pid`/`argc`/`argv` 后 `exit(1)` —— 它不关心自己是被谁跑起来的 |
+
+**PID 不能写死在验收里**：`syscall::user` 手测里 `/bin/sh` 固定是 PID 3，但 `fork` 出的子进程号
+取决于此前消耗了几个 PID（调度器自测会先取几个），所以 `make test-proc` 用**反向引用**
+断言 fork / execve / wait4 三处的 PID 是同一个值（`--expect-re` 新增自 `tests/test_keyboard.py`）。
+
+验收（`make test-proc`：注入 `hello world` / `ls` / `exit` 三个命令）：
+
+- [x] `user: fork parent=3 -> child pid=N image_pages=7`：子进程拿到**父进程映像的副本**（7 页 = Shell 的映像）；
+- [x] `user: run child pid=N name=fork-child`：子进程在父进程 `wait4` 时被恢复（单 CPU 的延迟调度）；
+- [x] `user: exec pid=N path=/bin/hello segments=4 image_pages=5 entry=0x8000000000`：映像被**换掉**且 PID 不变；
+- [x] `hello-bin: argc=2` + `argv[0]=hello` + `argv[1]=world`：内核写的 `argv` 用户栈被用户程序读出来（`libc::args`）；
+- [x] `user: exec /bin/ls -> ENOENT` + `sh: ls: exit code=127`：**路径不存在**也是完整链路（fork 成功 → execve 失败 → 子进程 `exit(127)` → 父进程拿到 127）；
+- [x] `sh: hello: exit code=1` + `user: reaped pid=N exit=1`：退出码沿 `wait4` 回到父进程；
+- [x] `user: frames free before=N after=N`：父进程 + 两个子进程的地址空间**全部归还**（无页帧泄漏）。
+
 ## 4. 调用链示例
 
 实际调用链（v0.7 + v0.9 用户堆）：
@@ -390,7 +490,8 @@ v0.9 的运行时前置条件按依赖顺序补：**先有可分配的用户内�
   → file::sys_read/sys_write/sys_open/sys_close
        └─ fs::file（fd 表）→ fs::vfs（挂载表路由）→ fs::ramfs
   → memory::sys_mmap / sys_munmap / sys_brk（用户堆：地址空间窗口 + 页帧分配）
-  → process::sys_exit / sys_getpid / sys_sleep
+  → process::sys_exit / sys_getpid / sys_sleep / sys_fork / sys_exec / sys_wait
+       └─ wait4 → trampoline::run（切到子进程的 CR3 / 内核栈 / 用户帧）→ 子进程 exit → 回收
   → sysretq 回到用户态（恢复 rdi/rsi/rdx/r10/r8/r9；exit 与 ring3 异常走 leave_user 回内核）
 ```
 
@@ -413,4 +514,6 @@ fd ≥ 3 一律经 VFS 抽象路由，syscall 层不认识具体后端。
 | 2026-10-10 | **v0.6 核心落地**：填入真实入口选型（`syscall`/`sysret`）、寄存器/错误码约定、GDT 布局约束、用户地址空间构造、ring3 异常终止语义、首批 4 个 syscall 与 `make test-user` 验收结果；补记实测坑（固件页表只读 → 惰性清 `USER` 位）与 v0.6 明确未做项 |
 | 2026-10-11 | **v0.6 用户态脚手架可用**：新增 2.11（`libc/` API、`user.ld` 链接约束、large 代码模型/`user-release` profile、构建期摊平与检查项）；2.8 改为「用户程序来源」并区分 `source=libc` 与 `source=asm`；2.4 更新为多代码页映射；验收项增至 19 项 |
 | 2026-10-11 | **v0.9 第一步：用户堆** —— 新增 `syscall/memory.rs`（`brk`/`mmap`/`munmap`，含 W^X、`MAP_*` 白名单、5 参数无 offset 的取舍说明与逐条错误码）+ `address_space.rs` 的堆窗口（256 KiB）与匿名 mmap 窗口（256 KiB，first-fit，含 `invlpg`）；`libc` 新增 `heap`（`#[global_allocator]`，bump over mmap）与 `brk/mmap/munmap` 封装；`user/hello` 加入堆自测（零页、模式读回、堆缓冲 `write`、6 个负例、`Vec`/`format!`）；`user.rs` 新增页帧泄漏检查（`frames free before/after` → `heap frame reclamation PASS`）；`make test-user` 断言由 32 项增至 **59 项**（`orchestrate.json` 的 `user` 场景同步），全量回归（`test-fs` 19 项 / `test-driver` 22 项 / `test-fat` 21 项 / `make go-test`）PASS |
+| 2026-10-11 | **v0.9 第二步：交互式 Shell 与 stdin** —— `driver/keyboard.rs` 加 128 字节行缓冲 + 行编辑，回显协议由 `KB <字符>` 改为终端式原样回显（`Enter` 打印 `kbd: line ready len=N`，`make test-keyboard` 断言同步）；`syscall/file.rs` 新增 `read_stdin`（`read(0)` 整行交付、3 秒超时返回 `-EAGAIN`）；`libc` 新增 `EAGAIN` 与 `fork`/`execve`/`wait4` 包装；新增 `user/shell`（提示符 `root@cerlesse C:>`、内建 `help`/`echo`/`cat`/`pid`/`exit`、外部命令真的调 `fork()`），`kernel/build.rs`/`fs::init`/`user.rs` 按“两个用户程序”改造（`/init` + `/bin/sh`）；`syscall/mod.rs` 对已命名未实现的号打印 `syscall: ENOSYS nr=… name=…`；新增 `make test-shell`（12 项）与编排 `shell` 场景，`make test-user` 增至 61 项（含非交互路径的 Shell 步骤），`test-fs` 根目录条目数改为 4；新增 3.6，更新 3.2/3.3/3.4 |
+| 2026-10-11 | **v0.9 第三步：`fork`/`execve`/`wait4` + `argc`/`argv`（外部程序真的能跑了）** —— 新增 3.7；`syscall/process.rs` 实现三号（fork 复制地址空间与当前用户帧、execve 换映像并重建 argv 用户栈、wait4 延迟调度 + 回收），`process/process.rs` 换成真正的 PCB（每进程 64 KiB 内核栈 + 栈底哨兵、`Ready/Running/Zombie`、`return_to`），`trampoline` 改为按进程切换（CR3/TSS.RSP0/栈顶/当前进程）；`libc` 去掉「已定号未实现」的说法，新增 `libc/src/args.rs`（`rdi`/`rsi` 入口 ABI）；新增 `user/hello-bin` → `/bin/hello` 作为外部程序；Shell 的 `cmd_external` 改走 `fork`+`execve`+`wait4`（`ls` 现在是“execve 失败 → exit(127)”）；`tests/test_keyboard.py` 新增 `--expect-re`（正则 + 反向引用，用于断言 PID 一致性）；新增 `make test-proc`（8 项 + 4 条正则）并加入 `test-all`，编排场景 11 → **12**（新增 `proc`）；`make test-shell` 12 → **11 项**（去掉两条 ENOSYS 依赖证据，改为断言外部程序路径）；`make test-user` 的 `shell PASS` 断言同步 |
 | 2026-10-11 | **v0.7 落地**：第 3 节从规划改为实现记录 —— ELF Loader（解析/按段权限逐页映射/入口取 `e_entry`）、用户地址布局（映像窗口 64 KiB + 栈 4 页）、段页对齐与 `.lbss` 孤儿段的实测坑、`make user` 的独立 ELF 检查（`tools/check_user_elf.py`）；2.7 填入 `read/open/write/close`（含 fd 表与两条硬规则）；2.10 标注 v0.7 已做项；4 节更新调用链；3.4 列出仍未做项（用户堆/`argc/argv`/`fork` 系/动态链接） |
