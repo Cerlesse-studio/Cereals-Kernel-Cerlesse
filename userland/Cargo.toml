@@ -18,6 +18,7 @@ members = [
     "user/cat",
     "user/echo",
     "user/ps",
+    "user/volumes",
 ]
 
 # 用户程序专用 profile：相对 dev 有两处必须调整

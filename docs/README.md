@@ -19,7 +19,7 @@
 | [lang-selection.md](./lang-selection.md) | 按功能领域汇总的性能最佳语言对照（辅助选型参考） | ✅ 新增（2026-10-07） |
 | [package-manager.md](./package-manager.md) | 面向内核/系统生态的高效、安全、轻量、灵活包管理器设计提案（H-06） | 🟡 提案 v1 + **P0a 已落地**：包容器后缀 **`.ckc`**（CKC = Cerlesse Kernel Container，64 字节头 + 确定性 ustar，身份 = payload 哈希），实现 `tools/pkgmgr/ckc.py`，验收 `make test-pkg` 37 项（含 `tar` 独立复核）；事务/catalog（P0b）与内核侧接入（P1）待做，见该文档 11.1 |
 | [ckm.md](./ckm.md) | **Cerlesse Kernel Manager（CKM）设计提案**：权限模型（单管理员 + 能力位 + 判定点）、内核接口（`kernel/src/ckm/` + 扩展号段 + 定长记录）、扩展生命周期与覆盖层、事务/恢复/安全模式、CKM-1…CKM-7 分期与故障验收 | 📋 提案 v1（规划，2026-10-11 新增；**尚未写代码**） |
-| [storage.md](./storage.md) | **Cerlesse Storage System（CSS）设计提案**：卷模型（设备→分区→卷→盘符/挂载点 + 稳定 `vol_id`）、Windows 式盘符与 Linux 式挂载双视图、VFS 收口（`FileSystem` 增量 + 挂载表带卷身份 + 错误语义改 errno）、与 CKM 的接口（2 个能力位 + 判定点 8–10 + 号段 261–266）、文件系统支持路线与第三方依赖政策、CSS-1…CSS-6 分期与 11 条验收 | 📋 提案 v1（规划，2026-10-11 新增；**尚未写代码**） |
+| [storage.md](./storage.md) | **Cerlesse Storage System（CSS）设计提案**：卷模型（设备→分区→卷→盘符/挂载点 + 稳定 `vol_id`）、Windows 式盘符与 Linux 式挂载双视图、VFS 收口（`FileSystem` 增量 + 挂载表带卷身份 + 错误语义改 errno）、与 CKM 的接口（2 个能力位 + 判定点 8–10 + 号段 261–266）、文件系统支持路线与第三方依赖政策、后端装载政策（第一版编译内置，6.8）、CSS-1…CSS-6 分期与 11 条验收 | 🟡 **CSS-1 已落地**（`kernel/src/storage/` + `storage_volumes`(261)/`storage_rescan`(265) + `mkfs` GPT/MBR 夹具 + `make test-storage`），其余 CSS-2…CSS-6 规划中 |
 | [project-structure.md](./project-structure.md) | 目录结构与模块职责划分 | ✅ 已完成 |
 | [../DEVELOPMENT.md](../DEVELOPMENT.md) | 主开发文档：需求、依赖、任务清单、测试、QEMU、Issue 规划 | ✅ 已完成 |
 | [api.md](./api.md) | **API 参考**：系统调用 ABI / errno / `libc` API / 内核内部 trait / 主机工具 CLI / Make 目标 | 🟡 持续更新（2026-10-11 新建） |
@@ -85,7 +85,12 @@
   写入语义五条、CSS-1…CSS-6 分期与 11 条验收（含宿主工具实测：有 `blkid`/`mtools`/`mkfs.ext2`，**没有** `sfdisk`/`parted`/`mkfs.exfat`）、
   非目标与 9 个开放问题；同步 ckm.md（能力位表扩到 6 位、判定点 8–10、事件 12–16、号段说明与 CKM-2 硬约束）、
   DEVELOPMENT.md（H-08 行 + 5.13）、roadmap（第十二阶段）、architecture 第 5 节、project-structure（规划目录）、
-  README（文档入口）、tools/README.md（`mkfs` 规划分区表生成）与 filesystem.md（交叉引用）。
+  README（文档入口）、tools/README.md（`mkfs` 规划分区表生成）与 filesystem.md（交叉引用）；
+  同日复核补：**6.8 文件系统后端装载政策**（第一版编译内置、不经 CKM 运行时装卸）、6.1 覆盖层/回滚/恢复归 CKM、
+  6.7「兼容性 = `fs=`+`ro=`+`health=` 完整展示」、第 11 节「不做写回修复」（`fsck` 只读检查）；
+  随后 **CSS-1 落地**：新建 `kernel/src/storage/`（GPT/MBR 只读扫描 + 卷记录 + 解析自测）、
+  `storage_volumes`(261)/`storage_rescan`(265)、`mkfs` GPT/MBR 夹具、`libc` 解析器与 `/bin/volumes`、
+  `make test-storage` 系列与编排场景 `storage`/`storage-mbr`（15 → 17 场景），见 storage.md 第 9/10 节。
 -  本次（2026-10-11，第十四轮）修订重点：**纯内核化执行阶段二/四/五（部分）** —— 新增
   `tools/check-boundary.py`（6 项边界门禁 + `--selftest`，并入 `make test-all`）；`libc/`+`user/` 移入
   `userland/` 独立 workspace（自带 `Cargo.toml`/`.cargo/config.toml`/`Makefile`/`README.md`，产出

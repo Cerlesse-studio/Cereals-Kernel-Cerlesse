@@ -147,6 +147,21 @@ impl VirtioBlk {
 /// v0.8 需要两块：启动盘（ESP，固件写的 FAT）与 `mkfs` 生成的测试盘。
 pub const MAX_DEVICES: usize = crate::driver::block::MAX_BLOCK_DEVICES;
 
+/// 实例名表（`BlockDevice::name` 要 `&'static str`，所以名字得来自静态表）。
+///
+/// CSS-1 起盘数上限就是 [`MAX_DEVICES`]：名字必须跟着实例号走 —— v0.8 只区分
+/// 「0 号」与「非 0 号」，第三块盘起会全部显示成 `virtio-blk1`（证据行/日志对不上设备）。
+static NAMES: [&str; MAX_DEVICES] = [
+    "virtio-blk0",
+    "virtio-blk1",
+    "virtio-blk2",
+    "virtio-blk3",
+    "virtio-blk4",
+    "virtio-blk5",
+    "virtio-blk6",
+    "virtio-blk7",
+];
+
 /// 驱动实例数组：`attach` 按顺序占用，槽位号就是块设备号。
 static mut DEVICES: [VirtioBlk; MAX_DEVICES] = [VirtioBlk::EMPTY; MAX_DEVICES];
 /// 已被 `attach` 占用的实例数。
@@ -293,7 +308,7 @@ fn attach(dev: &PciDevice) -> Result<(), &'static str> {
         }
         let table = &mut *(&raw mut DEVICES);
         let state = &mut table[used];
-        state.name = if used == 0 { "virtio-blk0" } else { "virtio-blk1" };
+        state.name = NAMES[used];
         state.base = base;
         state.queue = queue;
         state.num = num;
@@ -306,7 +321,7 @@ fn attach(dev: &PciDevice) -> Result<(), &'static str> {
     serial::print("virtio-blk: registered as block device ");
     serial::print_dec(index as u64);
     serial::print(" name=");
-    serial::println(if index == 0 { "virtio-blk0" } else { "virtio-blk1" });
+    serial::println(NAMES[slot]);
     Ok(())
 }
 

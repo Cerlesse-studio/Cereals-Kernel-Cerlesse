@@ -59,11 +59,17 @@ pub use crate::console::Writer;
 pub use crate::syscall::{
     brk, close, dirent_is_dir, dirent_name, dirent_size, execve, exit, fork, getdents, getpid,
     getprocs, mmap, mprotect, munmap, nanosleep, open, procinfo_name, procinfo_pid, procinfo_ppid,
-    procinfo_state, read, wait4, write, ARG_MAX, DIRENT_NAME_MAX, DIRENT_SIZE, EAGAIN, EBADF,
-    ECHILD, EFAULT, EISDIR, EINVAL, ENOENT, ENOMEM, ENOSPC, ENOSYS, MAP_ANONYMOUS, MAP_PRIVATE,
-    O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, PROCINFO_NAME_MAX, PROCINFO_SIZE, PROT_EXEC, PROT_NONE,
-    PROT_READ, PROT_WRITE, STDERR, STDIN, STDOUT,
+    procinfo_state, read, storage_rescan, storage_volumes, volume_disk, volume_free_bytes, volume_fs,
+    volume_health, volume_id, volume_label, volume_label_truncated, volume_mounts, volume_part,
+    volume_read_only, volume_total_bytes, wait4, write, ARG_MAX, DIRENT_NAME_MAX, DIRENT_SIZE,
+    EAGAIN, EBADF, ECHILD, EFAULT, EISDIR, EINVAL, ENOENT, ENOMEM, ENOSPC, ENOSYS, MAP_ANONYMOUS,
+    MAP_PRIVATE, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, PROCINFO_NAME_MAX, PROCINFO_SIZE, PROT_EXEC,
+    PROT_NONE, PROT_READ, PROT_WRITE, STDERR, STDIN, STDOUT, STORAGE_RESCAN_ALL, VOLUME_FREE_UNKNOWN,
+    VOLUME_LABEL_MAX, VOLUME_RECORD_SIZE,
 };
+
+/// 卷表缓冲的默认容量（内核 `storage::MAX_VOLUMES` = 16 条）。
+pub const MAX_VOLUMES: usize = 16;
 
 use core::arch::global_asm;
 

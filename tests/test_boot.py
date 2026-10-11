@@ -32,6 +32,13 @@ def parse_args() -> argparse.Namespace:
         help="第二块 virtio-blk 盘（v0.8 test-fat：mkfs 生成的 FAT 测试盘，内核挂到 /mnt/fat）",
     )
     parser.add_argument(
+        "--extra-disk",
+        action="append",
+        default=[],
+        help="再追加 virtio-blk 盘（可重复；CSS-1 的 GPT/MBR 夹具紧跟 --disk2 之后注册，"
+        "因此块设备号从 2 开始按给出顺序递增）",
+    )
+    parser.add_argument(
         "--expect",
         action="append",
         default=None,
@@ -61,6 +68,7 @@ def main() -> int:
     args = parse_args()
     disk = Path(args.disk)
     disk2 = Path(args.disk2) if args.disk2 else None
+    extra = [Path(p) for p in args.extra_disk]
     expects = [s.encode() for s in (args.expect or ["Kernel started!"])]
     serial_log = Path(args.serial_log) if args.serial_log else BUILD / "serial.log"
     timeout = args.timeout
@@ -74,6 +82,10 @@ def main() -> int:
     if disk2 is not None and not disk2.is_file():
         print(f"FAIL: second disk image not found: {disk2} (run `make fat-image` first)")
         return 2
+    for path in extra:
+        if not path.is_file():
+            print(f"FAIL: extra disk image not found: {path} (run `make storage-images` first)")
+            return 2
 
     BUILD.mkdir(parents=True, exist_ok=True)
     vars_copy = Path(args.ovmf_vars) if args.ovmf_vars else BUILD / "OVMF_VARS.fd"
@@ -106,6 +118,13 @@ def main() -> int:
         cmd[cmd.index("-serial"):cmd.index("-serial")] = [
             "-drive", f"if=none,id=blk1,format=raw,file={disk2},snapshot=on",
             "-device", "virtio-blk-pci,drive=blk1,disable-modern=on",
+        ]
+
+    # CSS-1：从 blk2 起的盘按给出顺序追加（块设备号 = 2、3、……），用于 GPT/MBR 夹具。
+    for index, path in enumerate(extra, start=2):
+        cmd[cmd.index("-serial"):cmd.index("-serial")] = [
+            "-drive", f"if=none,id=blk{index},format=raw,file={path},snapshot=on",
+            "-device", f"virtio-blk-pci,drive=blk{index},disable-modern=on",
         ]
 
     if args.nic:

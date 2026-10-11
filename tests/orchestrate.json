@@ -292,6 +292,74 @@
       "timeoutSec": 60
     },
     {
+      "name": "storage",
+      "cmd": [
+        "python3", "tests/test_boot.py",
+        "--disk", "build/disk.img",
+        "--disk2", "build/storage/gpt.img",
+        "--extra-disk", "build/storage/gpt-degraded.img",
+        "--extra-disk", "build/storage/gpt-primary-bad.img",
+        "--extra-disk", "build/storage/gpt-invalid.img",
+        "--serial-log", "build/orch/storage/serial.log",
+        "--ovmf-vars", "build/orch/storage/OVMF_VARS.fd",
+        "--timeout", "40",
+        "--expect", "Kernel started!",
+        "--expect", "storage: disk index=1 dev=virtio-blk1 sectors=57344 table=GPT partitions=7",
+        "--expect", "storage: gpt entries CRC mismatch on disk=2",
+        "--expect", "storage: disk index=2 dev=virtio-blk2 sectors=14336 table=GPT partitions=2 health=degraded",
+        "--expect", "storage: disk index=4 dev=virtio-blk4 sectors=14336 table=invalid partitions=1 health=degraded",
+        "--expect", "storage: vol conflict id=fs:34122620 at=1:6,1:7 (all marked degraded)",
+        "--expect", "storage: vol id=fs:111111112222 disk=1 part=2 fs=ext4 label=cerlesse-ex letter=- mounts=0 ro=ro-backend health=unsupported",
+        "--expect", "storage: vol id=raw:4 disk=4 part=0 fs=unsupported label=- letter=- mounts=0 ro=ro-backend health=unsupported",
+        "--expect", "storage: parse selftest PASS (cases=11 checks=45)",
+        "--expect", "storage: selftest PASS (checks=124)"
+      ],
+      "serialLog": "build/orch/storage/serial.log",
+      "expect": [
+        "Kernel started!",
+        "storage: disk index=1 dev=virtio-blk1 sectors=57344 table=GPT partitions=7",
+        "storage: gpt entries CRC mismatch on disk=2",
+        "storage: disk index=2 dev=virtio-blk2 sectors=14336 table=GPT partitions=2 health=degraded",
+        "storage: disk index=4 dev=virtio-blk4 sectors=14336 table=invalid partitions=1 health=degraded",
+        "storage: vol conflict id=fs:34122620 at=1:6,1:7 (all marked degraded)",
+        "storage: vol id=fs:111111112222 disk=1 part=2 fs=ext4 label=cerlesse-ex letter=- mounts=0 ro=ro-backend health=unsupported",
+        "storage: vol id=raw:4 disk=4 part=0 fs=unsupported label=- letter=- mounts=0 ro=ro-backend health=unsupported",
+        "storage: parse selftest PASS (cases=11 checks=45)",
+        "storage: selftest PASS (checks=124)"
+      ],
+      "timeoutSec": 70
+    },
+    {
+      "name": "storage-mbr",
+      "cmd": [
+        "python3", "tests/test_boot.py",
+        "--disk", "build/disk.img",
+        "--disk2", "build/storage/mbr.img",
+        "--extra-disk", "build/storage/mbr-broken.img",
+        "--serial-log", "build/orch/storage-mbr/serial.log",
+        "--ovmf-vars", "build/orch/storage-mbr/OVMF_VARS.fd",
+        "--timeout", "35",
+        "--expect", "Kernel started!",
+        "--expect", "storage: disk index=1 dev=virtio-blk1 sectors=20480 table=MBR partitions=3",
+        "--expect", "storage: part disk=1 index=5 table=MBR start_lba=10241 sectors=4096 type=ntfs/exfat",
+        "--expect", "storage: disk index=2 dev=virtio-blk2 sectors=10240 table=MBR partitions=2 health=degraded",
+        "--expect", "storage: vol id=fs:66602620 disk=1 part=1 fs=fat12 label=EFI-ESP letter=- mounts=0 ro=ro-backend health=ok",
+        "--expect", "storage: vol id=pt:1-6-14338 disk=1 part=6 fs=unsupported label=- letter=- mounts=0 ro=ro-backend health=unsupported",
+        "--expect", "storage: selftest PASS (checks=82)"
+      ],
+      "serialLog": "build/orch/storage-mbr/serial.log",
+      "expect": [
+        "Kernel started!",
+        "storage: disk index=1 dev=virtio-blk1 sectors=20480 table=MBR partitions=3",
+        "storage: part disk=1 index=5 table=MBR start_lba=10241 sectors=4096 type=ntfs/exfat",
+        "storage: disk index=2 dev=virtio-blk2 sectors=10240 table=MBR partitions=2 health=degraded",
+        "storage: vol id=fs:66602620 disk=1 part=1 fs=fat12 label=EFI-ESP letter=- mounts=0 ro=ro-backend health=ok",
+        "storage: vol id=pt:1-6-14338 disk=1 part=6 fs=unsupported label=- letter=- mounts=0 ro=ro-backend health=unsupported",
+        "storage: selftest PASS (checks=82)"
+      ],
+      "timeoutSec": 70
+    },
+    {
       "name": "keyboard",
       "cmd": [
         "python3", "tests/test_keyboard.py",
@@ -426,7 +494,7 @@
         "--expect", "ls: / entries=5",
         "--expect", "ls: entry name=init kind=file size=",
         "--expect", "ls: entry name=bin kind=dir size=0",
-        "--expect", "ls: /bin entries=7",
+        "--expect", "ls: /bin entries=8",
         "--expect", "user: getprocs count=2",
         "--expect", "ps: pid ppid state comm",
         "--expect", "ps: pid=3 ppid=0 state=RUNNING comm=sh",
@@ -450,7 +518,7 @@
         "ls: / entries=5",
         "ls: entry name=init kind=file size=",
         "ls: entry name=bin kind=dir size=0",
-        "ls: /bin entries=7",
+        "ls: /bin entries=8",
         "user: getprocs count=2",
         "ps: pid ppid state comm",
         "ps: pid=3 ppid=0 state=RUNNING comm=sh",

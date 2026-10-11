@@ -74,7 +74,7 @@ Cerlesse Kernel                  进程、内存、syscall、VFS、驱动、调�
 | 分区 / 卷 / 盘符 | **完全没有**：块设备按**整盘绝对 LBA** 寻址、挂载点写死在 `fs::mount_disks()`（`dev0→/disk`、`dev1→/mnt/fat`，且只挂 FAT）、Shell 提示符里的 `C:` 是常量字符串 | `driver/block.rs`、`fs/mod.rs`、`docs/storage.md` 第 2 节 | ✅ 归 **CSS**（存储管理）；CKM 只提供它的权限判定与状态持久化，不重复实现卷表 |
 | 扩展包格式 | `.ckc` 容器 + 确定性打包 + payload 哈希 + 打包期规则**已落地**（P0a，`make test-pkg` 37 项） | `docs/package-manager.md` 3.2 / 11.1 | ✅ 直接复用，**不重做**（见 2.2） |
 | `.ckc` 的事务/回执/目录 | **未做**（P0b：`cpm.py`、catalog 签名、事务日志、`rollback`/`recover`） | `docs/package-manager.md` 11.1 | ✅ = CKM 阶段 3 的交付物 |
-| syscall 扩展号段 | `0..=255` = Linux 语义，`>= 256` = Cerlesse 扩展；当前只用了 `getprocs = 256`，`SYS_MAX = 257` | `docs/syscall.md` 3.8、`syscall_table.rs` | ✅ CKM 从 257 起编号（4.3） |
+| syscall 扩展号段 | `0..=255` = Linux 语义，`>= 256` = Cerlesse 扩展；已用 `getprocs = 256` 与 CSS-1 的 `storage_volumes = 261`/`storage_rescan = 265`，**当前 `SYS_MAX = 267`**（CSS-1 后） | `docs/syscall.md` 3.8/3.11、`syscall_table.rs` | ✅ CKM 从 257 起编号（4.3） |
 | 内核/用户态边界 | 已有 `tools/check-boundary.py`（内核不得嵌套 cargo/内嵌用户态字节/依赖用户态包）与独立 workspace `userland/` | `docs/pure-kernel.md` 第 8 节、`make check-boundary` | ✅ CKM Core 留在内核，`ckmd`/`ckm` 必须进 `userland/` |
 | 审计 / 事件 | 无（只有串口日志） | `kernel/src/` 无 audit 模块 | ✅ 阶段 1 新增 |
 | 引导菜单 / 恢复镜像 | boot crate 只做「装载内核并移交」；无菜单、无恢复条目、无启动失败计数 | `docs/boot.md`、`boot/` | ✅ 阶段 6（依赖阶段 2 的持久化） |

@@ -142,17 +142,17 @@ CKM（内核级权限控制与扩展管理，见 [ckm.md](ckm.md)）预计新开
 ### 3.2 CSS 规划新增（第十二阶段，尚未创建）
 
 CSS（存储管理，见 [storage.md](storage.md)）预计新开/扩展以下目录；**当前都还不存在或未扩展**，
-按 CSS-1…CSS-6 分期创建并回填：
+按 CSS-1…CSS-6 分期创建并回填（**CSS-1 已落地**）：
 
 | 规划目录 | 职责 | 分期 |
 | ---- | ---- | ---- |
-| `kernel/src/storage/{mod,registry,partition,gpt,mbr,volume}.rs` | CSS：设备/分区/卷登记、GPT/MBR **只读**解析、稳定卷标识 `vol_id`、卷标/健康状态/只读原因 | CSS-1 |
-| `kernel/src/syscall/storage.rs` | CSS 的 syscall 入口（号 **261–266**：卷枚举/挂载/卸载/分配字母/重扫/格式化） | CSS-1 / CSS-3 |
+| `kernel/src/storage/{mod,registry,partition,gpt,mbr,volume,selftest}.rs` | CSS：设备/分区/卷登记、GPT/MBR **只读**解析、稳定卷标识 `vol_id`、卷标/健康状态/只读原因（✅ CSS-1 已落地） | CSS-1 |
+| `kernel/src/syscall/storage.rs` | CSS 的 syscall 入口（号 **261–266**：卷枚举/挂载/卸载/分配字母/重扫/格式化；✅ 261/265 已实现，其余桩） | CSS-1 / CSS-3 |
 | `kernel/src/fs/{vfs,mount,inode,file,ramfs,fat}.rs` | **现状保留**；CSS-2 只加 `caps`/`volume_info`/`probe`、挂载表带 `vol_id`/`options`、挂载错误改 errno、`stat` 输出 `vol=` | CSS-2 |
 | `kernel/src/fs/{exfat,ext2,ext4,ntfs,iso9660}/` | 新文件系统后端（各自实现 `FileSystem`，VFS 不变） | CSS-4 / CSS-6 |
 | `userland/libc` 的 path 模块 | Windows 式路径（`C:\x`）→ POSIX 路径重写（查 `storage_volumes`，不硬编码字母） | CSS-3 |
 | `userland/ckm/`（`ckm storage …`） | CSS Manager：列出磁盘/分区/卷、挂载/卸载、分配盘符、显示健康与只读原因 | CSS-5 |
-| `tools/mkfs/` | 现状：FAT 镜像；CSS-1 追加 **GPT/MBR 分区表镜像生成**（`make test-storage` 的夹具），并沿用「自己生成 + 宿主独立复核」的做法 | CSS-1 |
+| `tools/mkfs/` | ✅ **GPT/MBR 分区表镜像生成**（CSS-1 已落地，`make test-storage` 的夹具），沿用「自己生成 + 宿主独立复核」的做法 | CSS-1 |
 
 > 边界：**盘符不属于文件系统驱动**（`fs/*` 不认识 `C:`）；CSS 不重写 VFS（新格式 = 再实现一个
 > `FileSystem`）；第一版不写分区表（GPT/MBR 只读扫描）；权限判定走 CKM，界面在 `userland/`。

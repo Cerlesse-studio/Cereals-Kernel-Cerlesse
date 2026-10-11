@@ -2,10 +2,12 @@
 
 - 阶段：跨阶段 / 存储管理（磁盘 → 分区 → 卷 → 盘符/挂载点；执行上排在 v1.0 之后，与 CKM 同期）
 - 最后更新：2026-10-11
-- 状态：📋 **提案 v1（规划）** —— 三项规格已定稿：**卷模型（第 3 节）**、
+- 状态：🟡 **CSS-1 已落地，其余规划中** —— 三项规格已定稿：**卷模型（第 3 节）**、
   **路径/盘符/挂载（第 4 节）**、**VFS 收口与 CKM 接口（第 5–6 节）**；实现按第 9 节的
-  CSS-1 … CSS-6 分期推进，当前**尚未写任何存储管理代码**（`kernel/src/storage/` 不存在，
-  `fs/` 仍是 v0.8 的形态）
+  CSS-1 … CSS-6 分期推进。**CSS-1（底层识别）已落地**：`kernel/src/storage/`
+  （`mod`/`registry`/`partition`/`gpt`/`mbr`/`volume`/`selftest`）+ `BlockDevice` 注册表 2 → 8 +
+  `tools/mkfs/mkfs.py` 的 GPT/MBR 镜像生成 + `storage_volumes`(261)/`storage_rescan`(265) +
+  卷记录（64 字节）+ 内核解析自测；`fs/` 仍是 v0.8 的形态（挂载方式等 CSS-2 项未动）
 - 关联：[../DEVELOPMENT.md](../DEVELOPMENT.md)（H-08 需求行）· [docs/README.md](./README.md)（索引）·
   [docs/filesystem.md](./filesystem.md)（VFS/RAMFS/FAT 现状）· [docs/ckm.md](./ckm.md)（权限模型、能力位、判定点、号段）·
   [docs/drivers.md](./drivers.md)（块设备与 virtio-blk）· [docs/syscall.md](./syscall.md)（syscall ABI 与路径语义）·
@@ -65,8 +67,8 @@ Linux 兼容格式     ext2（规划：读写）、ext4（规划：只读）、X
 | 项 | 现状 | 证据 | CSS 需要它吗 |
 | ---- | ---- | ---- | ---- |
 | 块设备抽象 | ✅ 已有：`BlockDevice`（`name`/`sector_size`/`sectors`/`read`/`write`/`capacity_bytes`），扇区固定 512，`lba` 是**整盘绝对地址** | `kernel/src/driver/block.rs`（模块文档明写「v0.8 没有分区表解析」） | ✅ 下层不动，CSS-1 在它之上加分区分层 |
-| 设备注册表容量 | **硬编码 2 个**（`MAX_BLOCK_DEVICES = 2`），固定容量数组 | `driver/block.rs` | ⚠️ CSS-1 需扩到 ≥8 并保留「满了明确拒绝」的风格 |
-| 分区表 | **无**：`gpt.rs`/`mbr.rs`/`partition` 相关代码在 `kernel/src` 里不存在（全仓搜到的 `MBR`/`FAT 引导扇区` 只出现在注释与工具里） | `grep -rn "GPT\|MBR\|partition" kernel/src` 仅命中注释 | ✅ CSS-1 的核心交付物 |
+| 设备注册表容量 | **已扩到 8**（`MAX_BLOCK_DEVICES = 8`）；固定容量数组 + 满了明确拒绝 | `driver/block.rs` | ✅ CSS-1 已完成（2 → 8） |
+| 分区表 | ✅ **已有**：GPT（主/备表头 + 两份 CRC32 + 128 项表项）与 MBR（4 主分区 + EBR 链）**只读扫描**；主表头损坏回退备用表头并在证据行标出用的是哪张表 | `kernel/src/storage/{gpt,mbr,partition}.rs` + `make test-storage` | ✅ CSS-1 已交付（写表仍属非目标，见第 11 节） |
 | 挂载方式 | **写死在 `fs::mount_disks()` 里**：`dev(0)` → `/disk`、`dev(1)` → `/mnt/fat`，两个都走 `mount_fat()`（**只能挂 FAT**） | `kernel/src/fs/mod.rs::mount_disks`/`mount_fat` | ✅ CSS-2 改为按卷表挂载，并保留这两个默认挂载点作为兼容 |
 | 挂载错误语义 | 挂载失败返回 **`&'static str`**（如 `"fs: FAT mount failed (duplicate mount point or table full)"`），不是 errno | `fs/mod.rs::mount_fat`、`fs/mount.rs` | ✅ CSS-2 必须改成 errno（`EEXIST`/`ENOSPC`/`EUCLEAN`…），否则「拒绝理由」不可断言 |
 | 文件系统接入面 | ✅ `FileSystem` trait 已有 `name`/`stat`/`read`/`write`/`create`/`mkdir`/`list`，路径为挂载点内相对路径；挂载表**最长前缀路由**已实现并被双盘验证 | `kernel/src/fs/vfs.rs`、`fs/mount.rs`、`make test-fat`（`/disk` 与 `/mnt/fat` 同时挂载） | ✅ CSS 直接复用，不重写 |
@@ -74,9 +76,9 @@ Linux 兼容格式     ext2（规划：读写）、ext4（规划：只读）、X
 | path 语义 | **只支持绝对路径**；`.`/`..` 一律 `EINVAL`（没有 cwd）；`//` 与结尾 `/` 折叠 | `fs/vfs.rs` 模块文档 | ⚠️ 因此 Windows 式路径**不能**直接塞进内核 VFS（4.2 定了解析位置） |
 | errno 集合 | 内核侧已有：`ENOENT`/`ENOEXEC`/`EBADF`/`EINVAL`/`EEXIST`/`EISDIR`/`ENOTDIR`/`ENOSPC`/`EROFS`/`EIO`/`EUCLEAN`/`ENOMEM` | `fs/vfs.rs` 常量区 | ✅ CSS 只**追加**需要的（`ENODEV`/`ENOTSUP`，见 4.5） |
 | 卷对象 / 卷标 / 盘符 | **完全没有**：没有卷表、没有标签、没有字母 → 挂载点；Shell 提示符里的 `C:` 是**写死的字符串** | `userland/user/shell`（提示符 `root@cerlesse C:>`）与 `tests/orchestrate.json` 的断言 | ✅ CSS-3 的核心交付物 |
-| syscall 号段 | `0..=255` = Linux 语义、`>= 256` = Cerlesse 扩展；`256` = `getprocs`、当前 `SYS_MAX = 257`；`257–260` 由 CKM 提案预留（其计划 `SYS_MAX` → 260） | `kernel/src/syscall/syscall_table.rs`、`docs/ckm.md` 4.3 | ✅ CSS 从 **261** 起编号（6.3） |
+| syscall 号段 | `0..=255` = Linux 语义、`>= 256` = Cerlesse 扩展；`256` = `getprocs`；`257–260` 由 CKM 提案预留；**CSS-1 后 `SYS_MAX = 267`**（CSS 占 261–266） | `kernel/src/syscall/syscall_table.rs`、`docs/ckm.md` 4.3 | ✅ CSS 从 **261** 起编号（6.3） |
 | 可写持久化 | RAMFS 在内存、FAT 只读 ⇒ **没有可写落盘点**（字母表/卷标无处持久化） | `docs/filesystem.md`、`fs/fat.rs` | ⚠️ CSS-3 的字母持久化依赖 CKM-2 的可写区（6.6） |
-| 镜像工具 | `tools/mkfs/mkfs.py` 自己生成 FAT12/16/32 镜像（不调 `mformat`），正确性由 **mtools 独立复核**；`tools/image-builder` 组装 64 MiB FAT 启动盘 | `tools/mkfs/mkfs.py`、`tools/README.md`、`make fat-image` | ✅ CSS-1 要在同一文件里追加 **GPT/MBR 分区表**生成 |
+| 镜像工具 | `tools/mkfs/mkfs.py` 自己生成 FAT12/16/32 镜像（不调 `mformat`），正确性由 **mtools 独立复核**；`tools/image-builder` 组装 64 MiB FAT 启动盘；✅ CSS-1 已在同一文件里追加 **GPT/MBR 分区表 + FAT 卷**的夹具生成（GPT 两分区、MBR 双分区、主表头损坏、无分区表四类） | `tools/mkfs/mkfs.py`、`tools/README.md`、`make fat-image`/`make storage-images` | ✅ CSS-1 已完成 |
 | 宿主机复核工具（**实测**） | ✅ 有：`mtools`（`mdir`/`mtype`/`mformat`/`mlabel`）、`blkid`、`partx`、`mkfs.ext2`/`mkfs.ext4`/`dumpe2fs`/`debugfs`/`e2fsck`；❌ **没有**：`sfdisk`/`fdisk`/`parted`/`sgdisk`/`mkfs.fat`/`mkfs.exfat`/`ntfs-3g` | 本仓库当前开发环境实测（`command -v`）+ 手工 GPT/DOS 镜像实验（见下行） | ⚠️ 决定第 10 节的复核手段（下表） |
 | 分区表的独立复核能力（手工镜像实验） | `partx -s <img>` **能**枚举 DOS/MBR 分区（两分区镜像实测输出 NR/START/END/SECTORS）；`blkid -p <img>` 对镜像只报最外层类型（GPT 镜像 `PTTYPE="PMBR"`、DOS 镜像 `PTTYPE="dos"`）**不枚举**表项；手工构造的合规 GPT（主/备表头 + CRC 正确）在 `blkid`/`partx` 下同样**不被枚举**（无输出） | 本地实测：自写 GPT（含备表与两份 CRC）与 DOS 双分区镜像分别跑 `blkid -p`/`partx -s` | ⚠️ **GPT 在本机没有现成独立复核工具**（开放问题 4 与 10 节） |
 | 内核依赖门禁 | `tools/check-boundary.py` K4：`kernel/Cargo.toml` 依赖**只允许** `shared`/`abi` | `tools/check-boundary.py::ALLOWED_KERNEL_DEPS`、`make check-boundary` | ⚠️ 「引入第三方文件系统 crate」必须先改这条门禁（开放问题 1） |
@@ -87,6 +89,9 @@ Linux 兼容格式     ext2（规划：读写）、ext4（规划：只读）、X
 - 缺的是中间这层：**设备 → 分区 → 卷 → 挂载点/盘符** 的对象与登记（以及它需要的分区表解析、
   文件系统探测、稳定标识）；
 - 另一处必须修的现状：**挂载失败返回字符串**（`fs/mod.rs`），改成 errno 才能进验收。
+
+> CSS-1 之后：上表的「设备注册表容量」「分区表」「镜像工具」已由 CSS-1 补齐；
+> 中间层对象（卷表 / 卷标 / 盘符）与「挂载失败返回字符串」仍待 CSS-2/CSS-3。
 
 ## 3. 存储对象模型（定稿）
 
@@ -326,6 +331,7 @@ kernel/src/
 | 判定（谁能挂载/卸载/分配字母/格式化） | **CKM Core**（`kernel/src/ckm/policy.rs`） | CSS 的每个受控动作都是 CKM 的一个判定点（6.2） |
 | 界面（列出磁盘/卷、发起操作、显示健康与只读原因） | **CKM Manager（`ckm storage`，CSS-5）** | 用户态、无特权：所有写操作经 `ckmd`/能力校验 |
 | 持久化（字母表、卷标偏好） | **CKM 状态区**（CKM-2 的可写区） | CSS 不自己造持久化格式（6.6） |
+| 覆盖层 / 回滚 / 恢复 | **CKM**（[ckm.md](./ckm.md) 第 6–8 节：基线永不被写、覆盖表、事务回执、恢复镜像） | CSS 只提供可见性与只读状态；**覆盖层是 CKM 的注册表项，不是 CSS 挂载的文件系统**（ckm.md 6.2）——CSS 不实现第二套覆盖/回滚机制 |
 
 ### 6.2 CKM 侧必须同步的三处（本文不改 ckm.md 的既有条款，只**追加**；已在 ckm.md 同步）
 
@@ -390,7 +396,7 @@ kernel/src/
 
 两份布局与 6.3 的号段**必须**在 [docs/api.md](./api.md) 与 `userland/libc` 里镜像一次
 （与 `DIRENT_SIZE`/`PROCINFO_SIZE` 同样的做法：内核是唯一权威定义，用户态用
-`storage_volume_*`/`storage_part_*` 解析器，不自己算偏移）。
+`volume_*`（已落地）/`partition_*`（CSS-3）解析器，不自己算偏移）。
 
 ### 6.5 枚举顺序（必须确定性）
 
@@ -425,7 +431,20 @@ storage: selftest PASS (checks=N)
 - 每个受控动作**必须**打印一行（allow 与 deny 都打），deny 行沿用 CKM 的 4.5 格式；
 - 挂载行只在挂载/卸载时打印（不是每次查询），因此 `make test-storage` 能断言
   「谁在什么时候把哪个卷挂到了哪里」；
-- 枚举顺序与 6.5 一致：同一组设备两次启动的 `storage: vol` 行**逐行相同**。
+- 枚举顺序与 6.5 一致：同一组设备两次启动的 `storage: vol` 行**逐行相同**；
+- **兼容性必须完整展示**（CSS-5 界面同样受此约束）：卷行/记录里的 `fs=`（有没有后端）+ `ro=`（为什么只读）+
+  `health=`（结构可不可信）三个字段合起来才是答案，不得压成一个「可用/不可用」布尔 ——
+  用户必须能区分 `unsupported`（盘在、内核没后端）与 `ro-backend`（有后端、当前只读）。
+
+### 6.8 文件系统后端如何装载（必须）
+
+- 第一版**全部编译内置**：`fs/*` 后端随内核构建进映像（构建期决定开关），**不**通过 CKM 扩展体系
+  运行时装卸 —— 文件系统实现运行在内核空间，装载它等于装载内核代码，普通扩展的安装流程不适用；
+- CKM 的 `kind=4`（内核模块）在第一版**只登记状态、不装载**（[ckm.md](./ckm.md) 5.1 与第 11 节），
+  因此「像装扩展一样独立更新文件系统驱动」**不在第一版承诺内**；未来安全的可加载模块机制就绪后，
+  文件系统后端必须另行 ABI/签名/权限评审，不得因为「它只是文件系统」而绕过；
+- 对用户可见的结果：第一版「支持哪些格式」由**内核映像**决定（`fs_kind` 枚举 + `health=unsupported`），
+  升级格式支持 = 升级内核，而不是装一个扩展。
 
 ## 7. 文件系统支持路线与依赖政策
 
@@ -479,11 +498,11 @@ storage: selftest PASS (checks=N)
 
 | 期 | 交付物 | 依赖 | 验收出口 |
 | ---- | ---- | ---- | ---- |
-| **CSS-1 底层识别** | `kernel/src/storage/{mod,registry,partition,gpt,mbr,volume}.rs` + `BlockDevice` 注册表扩容到 8 + `mkfs.py` 增加 GPT/MBR 镜像生成 + `storage_volumes`(261)/`storage_rescan`(265) + 卷记录布局 + 串口证据 | 无（`BlockDevice` 与 `mkfs.py` 已有） | `make test-storage`：GPT 两分区镜像枚举确定性 + MBR 镜像 + **无分区表镜像仍识别为整盘一卷** + CRC 失败 → `degraded` |
+| **CSS-1 底层识别** ✅ | `kernel/src/storage/{mod,registry,partition,gpt,mbr,volume}.rs`（+ `selftest.rs`）+ `BlockDevice` 注册表扩容到 8 + `mkfs.py` 增加 GPT/MBR 镜像生成 + `storage_volumes`(261)/`storage_rescan`(265) + 卷记录布局 + 串口证据 | 无（`BlockDevice` 与 `mkfs.py` 已有） | ✅ 已过：`make test-storage`（26 项，GPT 两分区镜像枚举确定性 + MBR 镜像 + **无分区表镜像仍识别为整盘一卷**）、`make test-storage-fixtures`（夹具结构）、`make test-storage-mbr`（MBR 场景）、内核解析自测（11 例 / 45 断言，含**主表头损坏回退备用表头**） |
 | **CSS-2 VFS 收口** | `FileSystem::caps`/`volume_info`/`probe` + 挂载表带 `vol_id`/`options` + 挂载错误改 errno（`EEXIST`/`ENOSPC`/`EUCLEAN`/`ENOTSUP`）+ `stat` 输出 `vol=` | CSS-1 | `make test-storage`：同一卷多挂载点、卸载后路径消失、只读原因可读、`make test-fat`/`make test-fs` 断言不回归 |
 | **CSS-3 Windows 式卷管理** | 盘符表 + 卷标 + `/storage/{volumes,partitions,letters}` + `storage_mount`(262)/`storage_unmount`(263)/`storage_assign_letter`(264) + CKM 能力位/判定点/事件 + libc 的 `C:\` 重写 | CSS-2；字母持久化依赖 **CKM-2 可写区**（未就绪时用确定规则） | QEMU 场景 `storage`：两次启动字母相同；`C:\x` 与 `/volumes/x` 内容一致且同 `vol_id`；未授权进程挂载 → 拒绝三件套 |
 | **CSS-4 可写存储** | FAT 写（簇分配 + 目录项 + 原子替换）→ exFAT 读写 → ext2 读写；`ro-dirty` 检测 | CSS-2（**先**收口 VFS）+ 开放问题 3 定夺 | 写-重启-读回逐字节一致；宿主机 mtools/`dumpe2fs` 独立复核读到同一结果 |
-| **CSS-5 CSS 管理程序** | CLI `ckm storage list/vol/part/mount/umount/letter/fsck`（并入 CKM Manager）；随后 TUI | CSS-3/4 + CKM-4（CLI 骨架） | 场景断言 CLI 输出与 `storage_volumes` 记录逐字段一致（界面不是第二事实源） |
+| **CSS-5 CSS 管理程序** | CLI `ckm storage list/vol/part/mount/umount/letter/fsck`（`fsck` **只读检查**，写回修复见第 11 节；并入 CKM Manager）；随后 TUI | CSS-3/4 + CKM-4（CLI 骨架） | 场景断言 CLI 输出与 `storage_volumes` 记录逐字段一致（界面不是第二事实源） |
 | **CSS-6 兼容性扩展** | ext4 只读 → NTFS 只读 → ISO9660 只读；XFS/Btrfs 研究 | CSS-4（写路径先立） | 每格式一个夹具镜像 + 只读挂载 + 探测歧义负例（5.3） |
 
 顺序上的三条硬约束（必须）：
@@ -494,8 +513,9 @@ storage: selftest PASS (checks=N)
 
 ## 10. 第一版验收标准（可脚本断言）
 
-`make test-storage`（新增 QEMU 场景 `storage`，当前编排 15 个场景 → 16）+ 主机侧断言必须覆盖下表；
-每条都不依赖人工观察。
+`make test-storage`（新增 QEMU 场景 `storage`/`storage-mbr`，当前编排 17 个场景）+ 主机侧断言必须覆盖下表；
+每条都不依赖人工观察。第 1、2、3、6、7 条已随 CSS-1 落地（卷枚举 / 无分区表退化 / 确定性 /
+只读原因 / `degraded`），其余标注的期次在后续阶段补齐。
 
 | # | 测试 | 合格标准 | 断言方式（必须实现其中至少一条） |
 | ---- | ---- | ---- | ---- |
@@ -540,7 +560,9 @@ storage: selftest PASS (checks=N)
 5. **不做网络文件系统**（NFS/SMB）：网络栈现状只有 Ethernet/ARP/IPv4/UDP 的简化实现；
 6. **不做 GUI**：第一版只有 CLI（`ckm storage`），TUI 属 CSS-5 之后；
 7. **不替换 VFS**：`FileSystem` + 挂载表路由保留（第 0 节边界 2）；
-8. **不承诺 ext4/NTFS/Btrfs 的完整读写**（第 7 节只承诺只读优先）。
+8. **不承诺 ext4/NTFS/Btrfs 的完整读写**（第 7 节只承诺只读优先）；
+9. **不做写回修复**：`fsck` 只做**只读检查**（复算结构、报 `health`/证据，不改盘）；修复（写回元数据、
+   重建结构）与写入同级风险，依赖 CSS-4 的写路径与开放问题 3 的掉电一致性定夺，第一版明确不做。
 
 ## 12. 风险与开放问题（需要定夺，未定不进实现）
 
@@ -573,3 +595,5 @@ storage: selftest PASS (checks=N)
 | 日期 | 变更 |
 | ---- | ---- |
 | 2026-10-11 | 创建本文档：定稿**卷模型**（四层：设备→分区→卷→挂载点/盘符；`Volume` 记录；`vol_id` 三条确定性生成规则；只读原因与健康状态各成枚举；`vol_id` 冲突必须报出）、**路径/盘符/挂载**（双视图、`C:\` 由用户态库重写而内核只认 POSIX 路径、默认/可移动挂载点与重名规则、大小写按后端能力位、错误语义追加 `ENODEV`/`ENOTSUP`）、**VFS 收口与 CKM 接口**（`FileSystem` 只加 `caps`/`volume_info`/`probe` 三个只读方法、挂载表带 `vol_id`/`options`、挂载错误从 `&'static str` 改 errno、`kernel/src/storage/` 模块划分、探测顺序与歧义处理；CKM 侧 2 个能力位 + 3 个判定点 + 5 个事件 + 号段 261–266 与 `SYS_MAX` 267 + 卷 64 字节/分区 48 字节定长记录 + `/storage/**` 状态树 + 串口证据格式）；另含文件系统支持路线（FAT→exFAT→ext2 优先，ext4/NTFS 只读优先）与第三方依赖政策、写入语义五条、CSS-1…CSS-6 分期与 11 条验收（含宿主工具**实测**：`mtools`/`partx`/`blkid`/`mkfs.ext2`/`dumpe2fs` 可用，**没有** `sfdisk`/`parted`/`sgdisk`/`mkfs.fat`/`mkfs.exfat`；并用手工 GPT/DOS 镜像实测出「`partx` 能枚举 MBR 分区但不枚举 GPT、`blkid` 只报最外层 `PTTYPE`」，因此 GPT 在本机没有独立复核工具 —— 已记入开放问题 4）、非目标与 9 个开放问题；同步 ckm.md（能力位表、判定点表、事件枚举、号段说明）、docs/README.md、DEVELOPMENT.md（H-08 行 + 5.13）、roadmap.md、architecture.md 第 5 节、project-structure.md（规划目录）、README.md、tools/README.md、filesystem.md |
+| 2026-10-11 | 按「Windows 式管理 + Linux 式文件系统」评审补四处边界：**6.1** 增「覆盖层/回滚/恢复归 CKM」行（CSS 不实现第二套覆盖机制）；新增 **6.8 文件系统后端装载政策**（第一版编译内置、不经 CKM 运行时装卸、可独立更新驱动不在第一版承诺内）；**6.7** 明确 `fs=`/`ro=`/`health=` 即「兼容性」的完整展示、不得压成布尔；**第 9 节** 的 `fsck` 标注只读检查、**第 11 节** 增第 9 条「不做写回修复」 |
+| 2026-10-11 | **CSS-1 落地** —— 新建 `kernel/src/storage/{mod,registry,partition,gpt,mbr,volume,selftest}.rs`：GPT（主/备表头 + CRC32 + 128 项）与 MBR（4 主分区 + EBR 链）只读扫描，无分区表退化为整盘一卷，探测识别 FAT；`driver/block.rs` 注册表 2 → 8；`syscall/storage.rs` 新增 `storage_volumes`(261)/`storage_rescan`(265)（定长 64 字节卷记录、只读、确定性顺序、`storage_volumes` 无能力位要求）；`tools/mkfs/mkfs.py` 增 GPT/MBR/主表损坏/无表四类夹具；`libc` 增 `storage_volumes` 解析器，新增用户程序 `/bin/volumes`；新增 `make storage-images`/`test-storage-fixtures`/`test-storage`/`test-storage-mbr` 与编排场景 `storage`、`storage-mbr`（15 → **17 场景**）；内核解析自测 11 例 / 45 断言（含主表头损坏回退备用表头、CRC 失败 → `degraded`）；本文档第 2/9/10 节同步标注现状 |

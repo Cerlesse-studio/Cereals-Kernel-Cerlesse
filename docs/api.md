@@ -30,7 +30,8 @@
 ### 1.2 调用号总表
 
 编号沿用 **Linux x86_64** 语义，便于将来直接运行现成用户态程序。
-号段上限 `SYS_MAX = 256`；**号越界**与**号合法但未实现**是两种可区分的失败
+`0..=255` 沿用 Linux 语义，`256..` 是 Cerlesse 扩展号段（256 = `getprocs`，257–260 由 CKM 预留，
+261–266 由 CSS 使用）；号段上限 `SYS_MAX = 267`；**号越界**与**号合法但未实现**是两种可区分的失败
 （前者 `parse` 返回 `None`，后者落在公共 ENOSYS 桩，均返回 `-ENOSYS`）。
 
 | 号 | 名称 | 状态 | 说明 |
@@ -49,6 +50,12 @@
 | 59 | `execve` | ✅ | 换映像（成功后不返回） |
 | 60 | `exit` | ✅ | 结束进程并交回退出码 |
 | 61 | `wait4` | ✅ | 运行/回收直接子进程，返回退出码 |
+| 78 | `getdents` | ✅ | 目录枚举，定长 88 字节记录（v0.9 第五步） |
+| 256 | `getprocs` | ✅ | 进程表快照，定长 40 字节记录（v0.9 第五步，扩展号段） |
+| 261 | `storage_volumes` | ✅ | 卷表快照，定长 64 字节记录（CSS-1，只读、无需能力位） |
+| 262–264 | `storage_mount`/`unmount`/`assign_letter` | ENOSYS | CSS-3 待实现（扩展号段） |
+| 265 | `storage_rescan` | ✅ | 重扫设备的分区与文件系统（CSS-1；设备不存在 `-ENODEV`） |
+| 266 | `storage_format` | ENOSYS | CSS-4 待实现（扩展号段） |
 | 其他 | — | ENOSYS | 号合法但未实现：查表命中 ENOSYS 桩；常见者会打印 `syscall: ENOSYS nr=… name=…` |
 
 ## 2. 系统调用逐条说明
@@ -247,6 +254,10 @@ isize wait4(i64 pid)   // libc: wait4(pid: i64) -> isize
 | `fork` | `fn fork() -> isize` | 父 = 子 PID，子 = 0 |
 | `execve` | `fn execve(path: &str, argv: &[&str]) -> isize` | 成功不返回 |
 | `wait4` | `fn wait4(pid: i64) -> isize` | 返回退出码或 `ECHILD` |
+| `getdents` | `fn getdents(path: &str, buf: &mut [u8]) -> isize` | 定长 88 字节记录（`dirent_*` 解析器） |
+| `getprocs` | `fn getprocs(buf: &mut [u8]) -> isize` | 定长 40 字节记录（`procinfo_*` 解析器） |
+| `storage_volumes` | `fn storage_volumes(buf: &mut [u8], out_count: Option<&mut u64>) -> isize` | 定长 64 字节记录（CSS-1，`volume_*` 解析器） |
+| `storage_rescan` | `fn storage_rescan(disk_index: u32) -> isize` | `u32::MAX` = 全部（CSS-1） |
 | `exit` | `fn exit(code: i32) -> !` | |
 
 ### 4.2 常量
@@ -381,7 +392,7 @@ pub trait BlockDevice {
 | ---- | ---- | ---- |
 | 镜像构建 | `tools/image-builder/`（`make image`） | 组装 boot + kernel + 64 MiB FAT 磁盘镜像 |
 | ELF 检查 | `python3 tools/check_user_elf.py <file.elf>` | 段布局/基址/页对齐/`W^X`/窗口/重定位（不启 QEMU） |
-| mkfs | `python3 tools/mkfs/mkfs.py --out <img> --from <dir>` | 生成 FAT12/16/32 镜像；mtools 独立复核 |
+| mkfs | `python3 tools/mkfs/mkfs.py --out <img> --from <dir>` | 生成 FAT12/16/32 镜像；mtools 独立复核（CSS-1 起还生成 GPT/MBR 分区表夹具，`make storage-images`） |
 | CKC 打包 | `python3 tools/pkgmgr/ckc.py pack <tree> -o <out.ckc> [--print-rev]` | 生成 `.ckc` 容器（确定性 ustar + 64 字节头） |
 | CKC 校验 | `python3 tools/pkgmgr/ckc.py verify <file.ckc>` | 校验头字段与 payload 哈希 |
 | CKC 信息 | `python3 tools/pkgmgr/ckc.py info <file.ckc>` | 打印头与条目信息 |
@@ -421,7 +432,11 @@ make clean
 | `test-user` | ELF 装载 + 文件 syscall + 用户堆 + `mprotect`（`PROT_NONE`/`RX` 转换）+ 隔离 + Shell + 动态链接 | 91 |
 | `test-shell` | 交互式 Shell（注入按键） | 11 |
 | `test-proc` | fork/execve/wait4 全链路 + PID 一致性 | 8 + 4 正则 |
-| `test-programs` | getdents/getprocs + 四个基础用户程序真的被 exec | 17 + 5 正则 |
+| `test-programs` | getdents/getprocs + 基础用户程序（含 `/bin/volumes`）真的被 exec | 23 + 6 正则 |
+| `storage-images` | 生成 GPT/MBR/主表损坏/无表四类夹具镜像（不启 QEMU） | — |
+| `test-storage-fixtures` | 夹具结构断言（GPT 主/备表头 + CRC、MBR 四主分区 + EBR 链） | — |
+| `test-storage` | 卷枚举确定性 + 无分区表退化 + 只读原因 + `degraded`（GPT 场景） | 26 |
+| `test-storage-mbr` | MBR 场景：EBR 链 + 未识别文件系统仍可见 | 13 |
 | `test-network` | virtio-net → Ethernet/ARP/IPv4/UDP（DHCP 往返） | 13 |
 | `test-dyn` | PT_INTERP + DT_NEEDED + RELATIVE/JUMP_SLOT（内核侧最小动态链接） | 10 |
 | `test-driver` | PCI 枚举 + 驱动挂接 + 扇区读写/负例 | 22 |
@@ -436,3 +451,4 @@ make clean
 内核内部 trait（`FileSystem`/`Driver`/`BlockDevice`）、主机侧工具 CLI 与 Makefile 目标 |
 | 2026-10-11 | 补记 v0.9 第六步（最小动态链接）：5.5 构建期接口新增 `as`+`ld` 夹具说明；第 7 节新增 `test-dyn`（10 项）与 `dyn-hostcheck`、补上漏记的 `test-programs`/`test-network` 行，`test-fs` 20 → 21 |
 | 2026-10-11 | **v1.0 第一步：`mprotect`** —— 号表第 10 行由 ⛔ 改为 ✅；新增 2.5/2.6 的 `PROT_NONE` 语义与 `mprotect` 逐条说明（2.6 之后的节号顺移一位）；4.1 新增 `mprotect` 封装、4.2 新增 `PROT_NONE`；errno 表 `-38` 行改写；第 7 节 `test-user` 61 → **91** 项 |
+| 2026-10-11 | **CSS-1：存储枚举** —— `SYS_MAX` 256 → **267**（号段说明补 256/257–260/261–266 划分）；号表新增 `getdents`(78)/`getprocs`(256)/`storage_volumes`(261)/`storage_rescan`(265) 与 262–264/266 的 ENOSYS 行；第 7 节新增 `storage-images`/`test-storage-fixtures`/`test-storage`/`test-storage-mbr` 并把 `test-programs` 更新为 23 + 6 正则 |

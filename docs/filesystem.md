@@ -136,10 +136,10 @@ fs: mkdir /etc
 fs: create /etc/motd
 fs: write /etc/motd bytes=23
 fs: mkdir /tmp
-fs: ramfs files=11 bytes=<总计>    （init + 7 个程序 + motd + /lib 的 2 个对象；目录不计入文件数）
+fs: ramfs files=12 bytes=<总计>    （init + 8 个程序 + motd + /lib 的 2 个对象；目录不计入文件数）
 ```
 
-（ELF 字节数随构建变化，断言只写前缀；`files=11` 是**清单长度**的后果 —— 加一个程序/库就要同步
+（ELF 字节数随构建变化，断言只写前缀；`files=12` 是**清单长度**的后果 —— 加一个程序/库就要同步
 `syscall/user.rs::PROGRAM_IMAGES`/`LIBRARY_IMAGES`、`kernel/build.rs` 的构建清单与这里。）
 
 ### 2.6 fd 表与 syscall 对接

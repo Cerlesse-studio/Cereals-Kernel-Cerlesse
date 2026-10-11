@@ -15,7 +15,7 @@
 
 ## 这是什么
 
-Cerlesse 是一个**从零实现**的 x86_64 宏内核（monolithic kernel，`no_std` Rust、不依赖任何第三方 crate）：UEFI 引导、4 级页表与物理帧分配器、中断与时钟、进程与 Round Robin 调度、`syscall`/`sysret` 快速路径与 ring3 隔离、VFS + RAMFS + FAT12/16/32、PCI 枚举与 legacy virtio 驱动、用户态 Shell 与基础工具、Ethernet/ARP/IPv4/UDP 网络栈、内核侧动态链接 —— 每一层都是自己写的。
+Cerlesse 是一个**从零实现**的 x86_64 宏内核（monolithic kernel，`no_std` Rust、不依赖任何第三方 crate）：UEFI 引导、4 级页表与物理帧分配器、中断与时钟、进程与 Round Robin 调度、`syscall`/`sysret` 快速路径与 ring3 隔离、VFS + RAMFS + FAT12/16/32、PCI 枚举与 legacy virtio 驱动、用户态 Shell 与基础工具、Ethernet/ARP/IPv4/UDP 网络栈、内核侧动态链接、GPT/MBR 分区与卷识别 —— 每一层都是自己写的。
 
 它不是 Linux 的替代品，也不是只会打印一行字的骨架：`make run` 之后，QEMU 串口（也就是你的终端）会给出一个**真能用的 Shell** —— `ls` / `ps` / `cat` / `echo` 都是独立用户程序，由 Shell 的 `fork` + `execve` 起来，`wait4` 回收退出码。
 
@@ -40,7 +40,7 @@ make run     # QEMU + OVMF 启动，串口输出到终端
 
 ```text
 root@cerlesse C:> ls /bin
-ls: /bin entries=7
+ls: /bin entries=8
 root@cerlesse C:> cat /etc/motd
 motd: hello from ramfs
 root@cerlesse C:> hello world
@@ -84,7 +84,7 @@ fs: mount point=/disk fs=fat
 user: program=/bin/sh source=elf
 IRQ0_heartbeat tick=100
 root@cerlesse C:> ls /bin
-ls: /bin entries=7
+ls: /bin entries=8
 root@cerlesse C:> ps
 ps: pid=3 ppid=0 state=RUNNING comm=sh
 root@cerlesse C:> hello world
@@ -95,7 +95,7 @@ root@cerlesse C:>
 ```
 
 - **一条命令进入可用系统**：`make run` 构建引导器 + 内核 + 磁盘镜像并启动 QEMU，串口就是控制台。
-- **每一层都有可复现的验收入口**：`make test-all` 跑 17 个集成测试目标加边界门禁，覆盖引导 / 异常 / 内存 / 中断 / 调度 / IPC / 文件系统 / 驱动 / 网络 / 用户态；`make test-orch` 再用 Go 编排器并行跑 15 个场景并二次复核串口日志。
+- **每一层都有可复现的验收入口**：`make test-all` 跑 20 个集成测试目标加边界门禁，覆盖引导 / 异常 / 内存 / 中断 / 调度 / IPC / 文件系统 / 存储（分区/卷/盘符） / 驱动 / 网络 / 用户态；`make test-orch` 再用 Go 编排器并行跑 17 个场景并二次复核串口日志。
 - **机制与功能分层，而且边界有门禁**：内核只提供机制，Shell、`init`、`libc`、coreutils 位于独立 workspace [`userland/`](userland/README.md)。把 `userland/` 整个移出 checkout，`make image-kernel` 仍能产出可启动镜像（`make test-kernel-only` 通过），`make check-boundary` 会挡住把依赖加回来的提交。
 - **可读的设计与踩坑记录**：每个子系统一份规格文档（含「为什么这样做」和真实故障复盘），入口见 [文档索引](docs/README.md)。
 
@@ -111,12 +111,13 @@ root@cerlesse C:>
 | `make test-all` | 全部集成测试 + 边界门禁 |
 | `make test-user` | 用户态全链路：ELF 装载 + 文件 syscall + 用户堆 + 隔离 + Shell |
 | `make test-shell` / `make test-proc` | 注入真实按键跑交互式 Shell / `fork` + `execve` + `wait4` |
-| `make test-programs` | 从 Shell 跑 `/bin/{ls,cat,echo,ps}`（`getdents` 列目录、`getprocs` 列进程） |
+| `make test-programs` | 从 Shell 跑 `/bin/{ls,cat,echo,ps,volumes}`（`getdents` 列目录、`getprocs` 列进程、`storage_volumes` 列卷） |
 | `make test-fs` / `make test-fat` | VFS + RAMFS / FAT12/16/32 只读后端（双盘启动） |
 | `make test-driver` / `make test-network` | PCI 枚举 + virtio-blk / virtio-net + ARP + DHCP |
 | `make test-dyn` / `make dyn-hostcheck` | 内核侧最小动态链接 / 同一批夹具交给宿主机 glibc `ld.so` 复核 |
+| `make test-storage` / `make test-storage-mbr` | GPT / MBR 分区镜像的卷枚举（`storage_volumes`）+ 主机侧夹具复核 |
 | `make check` / `make check-boundary` | 主机侧门禁（边界 + Go 单测）/ 内核不得依赖用户态 |
-| `make test-orch` / `make test-pkg` | 15 个场景并行编排 / CKC 包容器 `.ckc`（主机侧，不启 QEMU） |
+| `make test-orch` / `make test-pkg` | 17 个场景并行编排 / CKC 包容器 `.ckc`（主机侧，不启 QEMU） |
 
 其余目标（`image-kernel`、`userland-images`、`fat-image`、`go-test` 等）及其输出含义见 [DEVELOPMENT.md](DEVELOPMENT.md) 与 [docs/api.md](docs/api.md)。
 

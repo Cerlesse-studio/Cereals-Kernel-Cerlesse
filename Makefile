@@ -27,7 +27,7 @@ KERNEL_ELF := target/x86_64-unknown-none/debug/kernel
 USERLAND        := userland
 USERLAND_IMAGES := $(BUILD)/userland/images
 
-.PHONY: help build boot kernel kernel-nouserland image image-kernel image-exception image-pagefault fat-image run test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn dyn-hostcheck test-scheduler test-ipc test-fs test-user test-driver test-fat test-network test-all user userland-images test-pkg go-test test-orch check-boundary check clean
+.PHONY: help build boot kernel kernel-nouserland image image-kernel image-exception image-pagefault fat-image storage-images run test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn dyn-hostcheck test-scheduler test-ipc test-fs test-user test-driver test-fat test-storage-fixtures test-storage test-storage-mbr test-network test-all user userland-images test-pkg go-test test-orch check-boundary check clean
 
 help:
 	@echo "targets:"
@@ -50,6 +50,10 @@ help:
 	@echo "  test-driver - v0.8: assert PCI enumeration + driver probe + virtio-blk sector read/write"
 	@echo "  fat-image - v0.8: build the FAT test volume (tools/mkfs/mkfs.py from tests/fatroot/data)"
 	@echo "  test-fat - v0.8: assert FAT16/32 on disk mounted in VFS: read/ls/LFN/multi-cluster/EROFS"
+	@echo "  storage-images - CSS-1: build GPT/MBR fixtures (mkfs.py; ext4 payload from host mkfs.ext4)"
+	@echo "  test-storage-fixtures - CSS-1: host-side fixture gate (our 2nd parser + partx/mtools/dumpe2fs)"
+	@echo "  test-storage - CSS-1: GPT family — partitions, fs probing, vol_id/label/health, clone conflict"
+	@echo "  test-storage-mbr - CSS-1: MBR family — primary table + EBR chain (logical 5/6) + broken chain"
 	@echo "  test-network - v0.9: assert virtio-net + Ethernet/ARP/IPv4/UDP (ARP gateway + DHCP UDP round-trip)"
 	@echo "  userland-images - build the userland (independent workspace): programs + dyn fixtures + manifest"
 	@echo "  user   - alias of userland-images"
@@ -61,7 +65,7 @@ help:
 	@echo "  test-all - run every integration test"
 
 	@echo "  go-test  - v0.4 H-04/H-05: Go unit tests for tools-go (host side)"
-	@echo "  test-orch - v0.4 H-04: run all 14 scenarios in parallel via Go orchestrator"
+	@echo "  test-orch - v0.4 H-04: run all 17 scenarios in parallel via Go orchestrator"
 	@echo "  clean  - remove build artifacts"
 
 build: image
@@ -163,7 +167,7 @@ test-pagefault: image-pagefault
 
 # 全量回归：先跑主机侧边界门禁（内核不得依赖用户态），再跑全部 QEMU 场景 ——
 # 包含 test-kernel-only（没有用户态镜像时内核照样启动 + 进入可诊断状态）。
-test-all: check-boundary test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn test-scheduler test-ipc test-fs test-user test-driver test-fat test-network
+test-all: check-boundary test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn test-scheduler test-ipc test-fs test-user test-driver test-fat test-storage-fixtures test-storage test-storage-mbr test-network
 
 # v0.5 验收：≥3 个内核任务在 PIT 时间片驱动下轮转（Round Robin）
 test-scheduler: image
@@ -461,6 +465,128 @@ test-fat: image fat-image
 		--expect "fs: disk negative cases PASS (ENOENT/ENOTDIR/EISDIR/EROFS)" \
 		--expect "fs: disk selftest PASS"
 
+# ---- CSS-1 存储识别验收（docs/storage.md 第 9 节）------------------------------------------------
+#
+# 夹具分三组，**可独立复核程度不同**（tools/README.md 的工具表）：
+#   - FAT 载荷（`mkfs.py` 自己写）→ mtools（`mdir -i img@@offset`）；
+#   - GPT/MBR 分区表（`mkfs.py` 自己写）→ `partx -s`（第三方实现，实测能枚举 GPT）；
+#   - ext4 载荷（宿主 `mkfs.ext4` 生成）→ `dumpe2fs`。
+#
+# 脏变体（`--corrupt`）在**宿主侧**由 `tests/test_storage.py` 用另一套解析器断言「它真的是坏的」，
+# 引导到内核时要断言的则是**内核看到的结果** —— 两者不是一回事：实测 OVMF 会在设备扫描阶段
+# **自愈 GPT**（主表头坏、备表头好时把备份写回主位置），所以带坏主表头的盘进内核时已经好了
+#（`docs/storage.md` 12.9 记了这条兼容性事实）。“用备表头”这条内核路径因此由内存盘自测覆盖
+#（`storage: parse selftest`，不经过固件）。
+STORAGE        := $(BUILD)/storage
+STORAGE_FIXTURES := $(STORAGE)/ext4-root.img $(STORAGE)/gpt.img $(STORAGE)/gpt-degraded.img \
+	$(STORAGE)/gpt-primary-bad.img $(STORAGE)/gpt-invalid.img $(STORAGE)/mbr.img $(STORAGE)/mbr-broken.img
+
+storage-images:
+	@mkdir -p $(STORAGE)
+	@command -v mkfs.ext4 >/dev/null 2>&1 || { \
+		echo "storage-images: 需要 mkfs.ext4（e2fsprogs）生成 ext4 载荷"; exit 1; }
+	mkfs.ext4 -q -F -b 1024 -L cerlesse-ext4-long -U 11111111-2222-3333-4444-555555555555 \
+		$(STORAGE)/ext4-root.img 8M
+	$(PYTHON) tools/mkfs/mkfs.py --out $(STORAGE)/gpt.img --table gpt --from tests/fatroot/data \
+		--part efi-esp:8M:fat16:efi --part root:8M:ext4:linux --part probe-exfat:4M:exfat:ms-data \
+		--part probe-iso:1M:iso9660:unknown --part gpt-blank:1M \
+		--part clone-a:2M:fat12:ms-data:serial=0x20261234 \
+		--part clone-b:2M:fat12:ms-data:serial=0x20261234 \
+		--payload root=$(STORAGE)/ext4-root.img
+	$(PYTHON) tools/mkfs/mkfs.py --out $(STORAGE)/gpt-degraded.img --table gpt \
+		--part dg-esp:4M:fat16:efi --part dg-exfat:1M:exfat:ms-data --corrupt gpt-entries-crc
+	$(PYTHON) tools/mkfs/mkfs.py --out $(STORAGE)/gpt-primary-bad.img --table gpt \
+		--part bk-esp:4M:fat16:efi --part bk-exfat:1M:exfat:ms-data --corrupt gpt-primary-crc
+	$(PYTHON) tools/mkfs/mkfs.py --out $(STORAGE)/gpt-invalid.img --table gpt \
+		--part iv-esp:4M:fat16:efi --part iv-exfat:1M:exfat:ms-data --corrupt gpt-both-headers
+	$(PYTHON) tools/mkfs/mkfs.py --out $(STORAGE)/mbr.img --table mbr --from tests/fatroot/data \
+		--part efi-esp:4M:fat12:fat12 --part ext:auto:extended \
+		--logical probe-ntfs:2M:ntfs --logical mbr-blank:1M
+	$(PYTHON) tools/mkfs/mkfs.py --out $(STORAGE)/mbr-broken.img --table mbr \
+		--part ext:auto:extended --logical a1:1M:ntfs --logical a2:1M:exfat --corrupt ebr-broken
+
+# CSS-1 宿主侧夹具门禁（不启 QEMU）：用**第二套解析器**（zlib + 直读字节）断言每个夹具
+# 就是它声称的东西，并与 `partx`（GPT/MBR）、`mtools`（FAT 载荷）、`dumpe2fs`（ext4）互查。
+test-storage-fixtures: storage-images
+	$(PYTHON) tests/test_storage.py
+
+# CSS-1 验收（GPT 系）：卷表的身份/健康/冲突 + 每个分区的文件系统探测。
+#
+#   - `disk index=1 ... sectors=57344 table=GPT partitions=7`：GPT 表被完整解出来；
+#   - `disk index=2 ... health=degraded` + `gpt entries CRC mismatch`：表项 CRC 不过仍然解析，
+#     但降级（**原因**也要打出来，不只是一个 degraded）；
+#   - `disk index=4 ... table=invalid partitions=1 health=degraded`：主/备表头都坏 → 整盘一卷，
+#     **不**回退去把保护表当 MBR 解析；
+#   - `vol id=fs:66602620 ... fs=fat16 label=EFI-ESP ... health=ok`：`vol_id` 用 FAT 序列号（可复现），
+#     卷标来自 BPB 并被规范化为 `[A-Za-z0-9._-]`；
+#   - `fs=111111112222`（ext4 UUID 前 6 字节）/ `label=cerlesse-ex`（16 字符卷标被截到 11 位）：
+#     非 FAT 卷被认出来但没有后端 → `health=unsupported`（不是 `ok`，也不是漏掉）；
+#   - `pt:1-4-43008`：没有 UUID 的分区用「磁盘-分区-起始 LBA」当身份；
+#   - `vol conflict id=fs:34122620 at=1:6,1:7 (all marked degraded)`：克隆卷必须**报出来**，
+#     且冲突之后才打卷证据行（否则会先打一行自相矛盾的 health=ok）；
+#   - `storage: parse selftest PASS` + `storage: selftest PASS`：解析分支与记录布局/确定性。
+test-storage: image storage-images
+	$(PYTHON) tests/test_boot.py \
+		--disk $(BUILD)/disk.img \
+		--disk2 $(STORAGE)/gpt.img \
+		--extra-disk $(STORAGE)/gpt-degraded.img \
+		--extra-disk $(STORAGE)/gpt-primary-bad.img \
+		--extra-disk $(STORAGE)/gpt-invalid.img \
+		--serial-log $(BUILD)/serial-storage.log \
+		--expect "storage: init MAX_VOLUMES=16 MAX_MOUNTS_PER_VOL=2 max_devices=8" \
+		--expect "storage: disk index=0 dev=virtio-blk0 sectors=131072 table=none partitions=1" \
+		--expect "storage: disk index=1 dev=virtio-blk1 sectors=57344 table=GPT partitions=7" \
+		--expect "storage: part disk=1 index=1 table=GPT start_lba=2048 sectors=16384 type=efi" \
+		--expect "storage: part disk=1 index=2 table=GPT start_lba=18432 sectors=16384 type=linux-fs" \
+		--expect "storage: part disk=1 index=4 table=GPT start_lba=43008 sectors=2048 type=unknown" \
+		--expect "storage: part disk=1 index=5 table=GPT start_lba=45056 sectors=2048 type=unknown" \
+		--expect "storage: part disk=1 index=7 table=GPT start_lba=51200 sectors=4096 type=ms-data" \
+		--expect "storage: gpt entries CRC mismatch on disk=2" \
+		--expect "storage: disk index=2 dev=virtio-blk2 sectors=14336 table=GPT partitions=2 health=degraded" \
+		--expect "storage: disk index=3 dev=virtio-blk3 sectors=14336 table=GPT partitions=2" \
+		--expect "storage: disk index=4 dev=virtio-blk4 sectors=14336 table=invalid partitions=1 health=degraded" \
+		--expect "storage: vol conflict id=fs:34122620 at=1:6,1:7 (all marked degraded)" \
+		--expect "storage: vol id=fs:66602620 disk=1 part=1 fs=fat16 label=EFI-ESP letter=- mounts=0 ro=ro-backend health=ok" \
+		--expect "storage: vol id=fs:111111112222 disk=1 part=2 fs=ext4 label=cerlesse-ex letter=- mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=fs:bc022620 disk=1 part=3 fs=exfat label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=pt:1-4-43008 disk=1 part=4 fs=iso9660 label=PROBE-ISO letter=- mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=pt:1-5-45056 disk=1 part=5 fs=unsupported label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=fs:34122620 disk=1 part=6 fs=fat12 label=CLONE-A letter=- mounts=0 ro=ro-backend health=degraded" \
+		--expect "storage: vol id=fs:34122620 disk=1 part=7 fs=fat12 label=CLONE-B letter=- mounts=0 ro=ro-backend health=degraded" \
+		--expect "storage: vol id=fs:93622620 disk=2 part=1 fs=fat16 label=DG-ESP letter=- mounts=0 ro=ro-backend health=degraded" \
+		--expect "storage: vol id=fs:b43d2620 disk=2 part=2 fs=exfat label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=fs:8f6c2620 disk=3 part=1 fs=fat16 label=BK-ESP letter=- mounts=0 ro=ro-backend health=ok" \
+		--expect "storage: vol id=raw:4 disk=4 part=0 fs=unsupported label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: parse selftest PASS (cases=11 checks=45)" \
+		--expect "storage: selftest PASS (checks=124)"
+
+# CSS-1 验收（MBR 系）：4 个主表项 + 扩展链（EBR）里的逻辑分区 5/6，以及断链的处理。
+#
+#   - `index=5 / index=6`：逻辑分区号从 5 起算（主分区 1..4），起始 LBA 是**绝对**的；
+#   - `type=fat` / `type=ntfs/exfat` / `type=linux-fs`：MBR 类型字节 → 短名；
+#   - `table=MBR partitions=2 health=degraded`（坏链夹具）：下一层 EBR 指到盘外时**停下来并降级**，
+#     不越界读、不转圈（超深链的上限由 parse selftest 覆盖 —— 那种盘固件自己就不肯引导）；
+#   - `pt:1-6-14338`：扩展分区里的空白逻辑分区按位置拿身份。
+test-storage-mbr: image storage-images
+	$(PYTHON) tests/test_boot.py \
+		--disk $(BUILD)/disk.img \
+		--disk2 $(STORAGE)/mbr.img \
+		--extra-disk $(STORAGE)/mbr-broken.img \
+		--serial-log $(BUILD)/serial-storage-mbr.log \
+		--expect "storage: disk index=1 dev=virtio-blk1 sectors=20480 table=MBR partitions=3" \
+		--expect "storage: part disk=1 index=1 table=MBR start_lba=2048 sectors=8192 type=fat" \
+		--expect "storage: part disk=1 index=5 table=MBR start_lba=10241 sectors=4096 type=ntfs/exfat" \
+		--expect "storage: part disk=1 index=6 table=MBR start_lba=14338 sectors=2048 type=linux-fs" \
+		--expect "storage: disk index=2 dev=virtio-blk2 sectors=10240 table=MBR partitions=2 health=degraded" \
+		--expect "storage: part disk=2 index=5 table=MBR start_lba=2049 sectors=2048 type=ntfs/exfat" \
+		--expect "storage: vol id=fs:66602620 disk=1 part=1 fs=fat12 label=EFI-ESP letter=- mounts=0 ro=ro-backend health=ok" \
+		--expect "storage: vol id=fs:21302620 disk=1 part=5 fs=ntfs label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=pt:1-6-14338 disk=1 part=6 fs=unsupported label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=fs:23482620 disk=2 part=5 fs=ntfs label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=fs:99192620 disk=2 part=6 fs=exfat label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: parse selftest PASS (cases=11 checks=45)" \
+		--expect "storage: selftest PASS (checks=82)"
+
 # v0.5 验收：IPC（pipe 骨架）创建/写入/读取串口摘要日志 + 自测，随 Round Robin 巡回后执行
 test-ipc: image
 	$(PYTHON) tests/test_boot.py \
@@ -561,13 +687,18 @@ test-proc: image
 		--expect-re "user: run child pid=([0-9]+) name=fork-child.*?user: exec /bin/foo -> ENOENT \(no such program\).*?user: reaped pid=\1 exit=127" \
 		--expect-re "user: frames free before=([0-9]+) after=\1"
 
-# v0.9 第五步验收：**基础用户程序**（`/bin/ls`、`/bin/ps`、`/bin/cat`、`/bin/echo`）——
+# v0.9 第五步验收（CSS-1 追加 `/bin/volumes`）：**基础用户程序**
+# （`/bin/ls`、`/bin/ps`、`/bin/cat`、`/bin/echo`、`/bin/volumes`）——
 # 全部从 Shell 交互触发，走 `fork` + `execve` + `wait4`，断言的是程序**自己产出的内容**
 # 与「它们各自用到的内核能力真的通了」：
 #   - `user: getdents path=/ entries=5 returned=5` + `ls: / entries=5`：
 #     `ls` 读的是 **VFS 的目录项**（v0.7 起只有内核自测用过 `list()`）；
-#   - `ls: /bin entries=7`：`/bin` 里恰好是这次构建写进去的 7 个程序
-#     （sh / hello / ls / cat / echo / ps / dynhello）—— 同时证明 `fs::init` 的清单是完整的；
+#   - `ls: /bin entries=8`：`/bin` 里恰好是这次构建写进去的 8 个程序
+#     （sh / hello / ls / cat / echo / ps / volumes / dynhello）—— 同时证明 `fs::init` 的清单是完整的；
+#   - `user: storage_volumes count=1 total=1` + `volumes: fs:… disk=0 part=0 fs=fat16 …`：
+#     `volumes` 读的是**内核卷表**（CSS-1 新增的 `storage_volumes`，号 261）；单盘启动
+#     恰好 1 个卷（启动盘的 ESP），且 libc 按 64 字节记录解析出的字段与内核一致 ——
+#     这条断言的作用是「记录布局这个 ABI 真的被消费者读对了」，而不只是内核自验；
 #   - `user: getprocs count=2` + `ps: pid=3 ppid=0 state=RUNNING comm=sh`：
 #     `ps` 读的是**内核进程表**（本轮新增的 `getprocs`）：表里恰好是 Shell 与 ps 自己，
 #     且 `ppid` 指回 Shell —— 这正是 `fork` 建出来的父子关系；
@@ -586,6 +717,7 @@ test-programs: image
 		--key l --key s --key ret \
 		--key l --key s --key spc --key slash --key b --key i --key n --key ret \
 		--key p --key s --key ret \
+		--key v --key o --key l --key u --key m --key e --key s --key ret \
 		--key slash --key b --key i --key n --key slash --key e --key c --key h --key o \
 		--key spc --key e --key c --key h --key o --key spc --key p --key r --key o \
 		--key g --key r --key a --key m --key spc --key w --key o --key r --key k --key s \
@@ -598,23 +730,30 @@ test-programs: image
 		--expect "ls: / entries=5" \
 		--expect "ls: entry name=init kind=file size=" \
 		--expect "ls: entry name=bin kind=dir size=0" \
-		--expect "ls: /bin entries=7" \
+		--expect "ls: /bin entries=8" \
 		--expect "ls: entry name=ls kind=file size=" \
+		--expect "ls: entry name=volumes kind=file size=" \
 		--expect "user: getprocs count=2" \
 		--expect "ps: pid ppid state comm" \
 		--expect "ps: pid=3 ppid=0 state=RUNNING comm=sh" \
 		--expect "ps: 2 process(es)" \
+		--expect "user: storage_volumes count=1 total=1" \
+		--expect "volumes: id disk part fs label label_trunc ro health bytes free_known free mounts" \
+		--expect "disk=0 part=0 fs=fat16 label=NO_NAME label_trunc=0 ro=ro-backend health=ok bytes=67108864 free_known=0 free=0 mounts=0" \
+		--expect "volumes: 1 volume(s) (total=1)" \
 		--expect "cat: /etc/motd bytes=23" \
 		--expect "echo program works" \
 		--expect "sh: ls: exit code=0" \
 		--expect "sh: ps: exit code=0" \
+		--expect "sh: volumes: exit code=0" \
 		--expect "sh: /bin/echo: exit code=0" \
 		--expect "sh: /bin/cat: exit code=0" \
 		--expect-re "user: exec pid=([0-9]+) path=/bin/ls segments=[0-9]+ image_pages=[0-9]+ entry=0x8000000000" \
 		--expect-re "user: exec pid=([0-9]+) path=/bin/ps segments=[0-9]+ image_pages=[0-9]+ entry=0x8000000000" \
 		--expect-re "user: exec pid=([0-9]+) path=/bin/echo segments=[0-9]+ image_pages=[0-9]+ entry=0x8000000000.*?echo program works" \
 		--expect-re "user: exec pid=([0-9]+) path=/bin/cat segments=[0-9]+ image_pages=[0-9]+ entry=0x8000000000.*?motd: hello from ramfs.*?cat: /etc/motd bytes=23" \
-		--expect-re "user: getprocs count=2.*?ps: pid=([0-9]+) ppid=3 state=RUNNING comm=ps"
+		--expect-re "user: getprocs count=2.*?ps: pid=([0-9]+) ppid=3 state=RUNNING comm=ps" \
+		--expect-re "user: exec pid=([0-9]+) path=/bin/volumes segments=[0-9]+ image_pages=[0-9]+ entry=0x8000000000.*?volumes: fs:[0-9a-f]+ disk=0 part=0"
 
 # v0.9 动态链接验收：**内核侧最小动态链接器**（`kernel/src/syscall/dynamic.rs`）。
 #
@@ -687,10 +826,10 @@ check: check-boundary go-test
 go-test:
 	cd tools-go && $(GO) vet ./... && $(GO) test ./...
 
-# v0.4 H-04 验收：Go 编排器并行跑全部 14 个集成测试场景 + 串口日志二次复核。
+# v0.4 H-04 验收：Go 编排器并行跑全部 17 个集成测试场景 + 串口日志二次复核。
 # 磁盘镜像先构建（默认/异常注入/页错误 + FAT 测试盘），随后场景并行执行；
 # 每个场景独占 OVMF_VARS 副本、串口日志与 monitor socket（见 tests/orchestrate.json）。
-test-orch: image image-exception image-pagefault fat-image
+test-orch: image image-exception image-pagefault fat-image storage-images
 	cd tools-go && $(GO) run ./cmd/testorch -config ../tests/orchestrate.json -root ..
 
 clean:

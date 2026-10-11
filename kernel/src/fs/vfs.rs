@@ -49,6 +49,8 @@ pub const EROFS: i64 = -30;
 pub const EIO: i64 = -5;
 /// `-EUCLEAN`：磁盘上的结构损坏（簇链断/越界、目录项非法）。
 pub const EUCLEAN: i64 = -117;
+/// `-ENODEV`：设备不存在 / 已消失（CSS 追加；让「拔盘」与「坏盘」可区分）。
+pub const ENODEV: i64 = -19;
 
 /// 后端文件系统必须实现的操作。
 ///

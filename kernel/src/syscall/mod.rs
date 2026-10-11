@@ -24,6 +24,7 @@ pub mod elf;
 pub mod file;
 pub mod memory;
 pub mod process;
+pub mod storage;
 pub mod syscall_table;
 pub mod trampoline;
 pub mod user;
@@ -52,8 +53,9 @@ pub unsafe extern "C" fn syscall_dispatch(
     // 这是一条**依赖关系证据**，不是诊断噪声：调用未实现的号时串口上会出现
     // `syscall: ENOSYS nr=57 name=fork`（v0.9 第三步之前），而不是只靠一句
     // 「还没实现」的说明（见 docs/syscall.md 3.4）。
-    // v1.0 第一步实现 `mprotect` 之后 `UNIMPLEMENTED` 是空表：这条分支暂时不会
-    // 命中，但机制保留给下一个「号先定义、实现后补」的调用。
+    // CSS-1 起 `UNIMPLEMENTED` 里重新有号（262/263/264/266 的存储类调用）：
+    // 命中时串口会打出 `syscall: ENOSYS nr=262 name=storage_mount`，
+    // 与「号越界」区分开。
     if let Some(name) = syscall_table::unimplemented_name(nid) {
         serial::print("syscall: ENOSYS nr=");
         serial::print_dec(nid);

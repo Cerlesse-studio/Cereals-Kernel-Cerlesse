@@ -9,6 +9,8 @@
 //! （`ps` 走 `/proc`），而本内核的 VFS 还没有虚拟文件，所以 v0.9 第五步在
 //! 0..255 之外开了 `getprocs=256`。号段边界与 [`SYS_MAX`] 一致：
 //! `0..=255` 保持 Linux 语义，`>= 256` 明确是 Cerlesse 自己的 ABI。
+//! CSS-1 在 CKM 提案预留的 `257..=260` 之后开出存储号段 `261..=266`
+//! （`docs/storage.md` 6.3）：261/265 已实现，其余落 [`UNIMPLEMENTED`] 桩。
 //!
 //! 表按 `SYS_MAX` 排满：未单独实现的号落在公共 ENOSYS 桩上，
 //! 因此「号合法但未实现」与「号越界」是两种可区分的失败
@@ -40,10 +42,25 @@ pub const SYS_WAIT: u64 = 61;
 pub const SYS_GETDENTS: u64 = 78;
 /// 进程表快照（v0.9 第五步）。**Cerlesse 扩展号**：Linux x86_64 不使用 256。
 pub const SYS_GETPROCS: u64 = 256;
+/// 存储卷快照（**CSS-1**，H-08）：按确定性顺序导出 64 字节卷记录。
+/// 号段接在 CKM 提案预留的 257–260 之后（见 `docs/storage.md` 6.3）。
+pub const SYS_STORAGE_VOLUMES: u64 = 261;
+/// 存储重扫（CSS-1）：`disk_index == u32::MAX` 表示全部设备。
+pub const SYS_STORAGE_RESCAN: u64 = 265;
+/// CSS 的其余预留号：262/263/264 属 CSS-3、266 属 CSS-4（见 [`UNIMPLEMENTED`]）。
+pub const SYS_STORAGE_MOUNT: u64 = 262;
+/// 卸载卷（CSS-3 实现）。
+pub const SYS_STORAGE_UNMOUNT: u64 = 263;
+/// 分配/取消盘符（CSS-3 实现）。
+pub const SYS_STORAGE_ASSIGN_LETTER: u64 = 264;
+/// 创建/格式化文件系统（CSS-4 实现）。
+pub const SYS_STORAGE_FORMAT: u64 = 266;
 /// 系统调用号上限（不含），用于边界检查。
 ///
-/// `0..=255` 是 Linux x86_64 号段，`256..` 是 Cerlesse 扩展号段（见模块头）。
-pub const SYS_MAX: u64 = 257;
+/// `0..=255` 是 Linux x86_64 号段，`256..` 是 Cerlesse 扩展号段（见模块头）：
+/// `256` = `getprocs`，`257..=260` 由 CKM 提案预留，`261..=266` 由 CSS 使用
+/// （261/265 已在 CSS-1 实现，其余落 [`UNIMPLEMENTED`] 桩）。
+pub const SYS_MAX: u64 = 267;
 
 /// 已定义但尚未实现的系统调用号（逐个补齐）：`(号, 名字)`。
 ///
@@ -52,11 +69,15 @@ pub const SYS_MAX: u64 = 257;
 /// v0.7 已把 `read/open/close` 从这张表里摘掉；用户堆（`mmap/munmap/brk`）
 /// 见下方 [`SYS_TABLE`]。
 ///
-/// **v1.0 第一步实现 `mprotect` 之后这张表空了**（历史上它装着
-/// `read/open/close`、`fork/execve/wait4`，最后一个是 W^X 转换要用的
-/// `mprotect`）。表结构保留：下一个「号先定义、实现后补」的调用继续往这里放，
+/// **CSS-1 起这张表重新有内容**：CSS 的 262/263/264（挂载/卸载/字母，CSS-3）
+/// 与 266（格式化，CSS-4）先定义号并落 ENOSYS 桩，实现后从表里摘掉；
 /// 串口上的 `syscall: ENOSYS nr=… name=…` 依然能区分「未实现」与「号越界」。
-const UNIMPLEMENTED: [(u64, &str); 0] = [];
+const UNIMPLEMENTED: [(u64, &str); 4] = [
+    (SYS_STORAGE_MOUNT, "storage_mount"),
+    (SYS_STORAGE_UNMOUNT, "storage_unmount"),
+    (SYS_STORAGE_ASSIGN_LETTER, "storage_assign_letter"),
+    (SYS_STORAGE_FORMAT, "storage_format"),
+];
 
 /// 查「已命名但未实现」的号对应的名字（[`UNIMPLEMENTED`] 的查询接口）。
 ///
@@ -113,5 +134,8 @@ pub const SYS_TABLE: [SyscallHandler; SYS_MAX as usize] = {
     // v0.9 第五步：用户态可枚举目录（`ls`）与进程表（`ps`）
     table[SYS_GETDENTS as usize] = crate::syscall::dir::sys_getdents;
     table[SYS_GETPROCS as usize] = crate::syscall::process::sys_getprocs;
+    // CSS-1（H-08）：卷表快照与重扫（其余 CSS 号落 UNIMPLEMENTED 桩）
+    table[SYS_STORAGE_VOLUMES as usize] = crate::syscall::storage::sys_storage_volumes;
+    table[SYS_STORAGE_RESCAN as usize] = crate::syscall::storage::sys_storage_rescan;
     table
 };

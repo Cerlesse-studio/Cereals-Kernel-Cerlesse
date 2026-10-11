@@ -26,7 +26,7 @@ TRIPLE  := x86_64-unknown-none
 PROFILE := user-release
 OUT     := $(TARGET)/$(TRIPLE)/$(PROFILE)
 
-PROGRAMS := user-hello user-shell user-hello-bin user-ls user-cat user-echo user-ps
+PROGRAMS := user-hello user-shell user-hello-bin user-ls user-cat user-echo user-ps user-volumes
 CARGO_PROGRAMS := $(addprefix -p ,$(PROGRAMS))
 
 # manifest.txt 是「用户态 → 内核」的**唯一接口**：每行 `<P|L> <RAMFS 路径> <文件名>`，
@@ -61,6 +61,7 @@ $(MANIFEST): $(SOURCES) Makefile Cargo.toml
 	@cp $(OUT)/user-cat       $(IMAGES)/user_cat.elf
 	@cp $(OUT)/user-echo      $(IMAGES)/user_echo.elf
 	@cp $(OUT)/user-ps        $(IMAGES)/user_ps.elf
+	@cp $(OUT)/user-volumes   $(IMAGES)/user_volumes.elf
 	@$(MAKE) --no-print-directory dyn
 	@$(PYTHON) $(CURDIR)/tools/check_dyn_fixture.py $(IMAGES)/dynhello
 	@printf '%s\n' \
@@ -71,6 +72,7 @@ $(MANIFEST): $(SOURCES) Makefile Cargo.toml
 		'P /bin/cat user_cat.elf' \
 		'P /bin/echo user_echo.elf' \
 		'P /bin/ps user_ps.elf' \
+		'P /bin/volumes user_volumes.elf' \
 		'P /bin/dynhello dynhello' \
 		'L /lib/ld.so ld.so' \
 		'L /lib/libgreet.so libgreet.so' > $(MANIFEST)

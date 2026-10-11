@@ -16,8 +16,10 @@
   `libc/`+`user/*` 迁往独立 Cerlesse Userland，内核提供机制/用户态提供功能，见 [pure-kernel.md](pure-kernel.md)；
   同日再加 **「CKM 设计提案」（v1.0 之后，规划）**：内核级强制权限控制 + 特权用户态服务 + 可插拔扩展系统
   + 独立恢复环境（分层借鉴 KernelSU，但不照搬 Android root 机制），见 [ckm.md](ckm.md)；
-  同日再加 **「CSS 存储管理系统」（v1.0 之后，规划；与 CKM 同期）**：磁盘→分区→卷→盘符/挂载点，
-  Windows 式盘符 + Linux 式统一 VFS，见 [storage.md](storage.md)）
+  同日再加 **「CSS 存储管理系统」（v1.0 之后，与 CKM 同期）**：磁盘→分区→卷→盘符/挂载点，
+  Windows 式盘符 + Linux 式统一 VFS，见 [storage.md](storage.md)；
+  **同日 CSS-1（底层识别）已落地**（GPT/MBR 只读扫描 + `storage_volumes`/`storage_rescan` +
+  `make test-storage`），余下 CSS-2…CSS-6 规划中）
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
 
@@ -80,7 +82,7 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 > → CKM Manager（`ckm` CLI）→ 覆盖层 → 恢复环境；分 CKM-1…CKM-7 七期，第一版不做动态内核模块装载与 GUI，
 > 依赖关系：CKM-1 依赖 v1.0 的凭证/权限，CKM-2 依赖可写持久化；与桌面路线互不阻塞，见 [ckm.md](ckm.md)。
 >
-> **v1.0 之后（规划，与 CKM 同期）**：**CSS（Cerlesse Storage System）存储管理** ——
+> **v1.0 之后（与 CKM 同期）**：**CSS（Cerlesse Storage System）存储管理** ——
 > 磁盘/分区识别（GPT/MBR **只读**扫描）→ 卷与稳定标识（`vol_id`：文件系统 UUID > 分区位置 > 整盘）→
 > Windows 式盘符（`C:`/`D:`）与 Linux 式挂载（`/volumes/<label>`、`/media/<label>`）双视图 →
 > 可写文件系统（FAT → exFAT → ext2；ext4/NTFS 先只读）→ `ckm storage` 管理程序；分 CSS-1…CSS-6，
@@ -119,9 +121,12 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 11. **第十一阶段（v1.0 之后，规划）**：CKM 内核级权限控制与扩展管理 —— CKM Core（内核）/
     CKM Service（`ckmd`）/ CKM Manager（`ckm`）/ 覆盖层 / 恢复环境，分 CKM-1…CKM-7；
     第一版不做动态内核模块装载与 GUI，见 [ckm.md](ckm.md)。
-12. **第十二阶段（v1.0 之后，规划；与第十一阶段同期）**：CSS 存储管理 —— 分区扫描 / 卷与稳定标识 /
-    盘符与多挂载点 / 可写文件系统 / `ckm storage` 界面，分 CSS-1…CSS-6；第一版不写分区表，
-    见 [storage.md](storage.md)。
+12. **第十二阶段（v1.0 之后，进行中；与第十一阶段同期）**：CSS 存储管理 —— 分区扫描 / 卷与稳定标识 /
+    盘符与多挂载点 / 可写文件系统 / `ckm storage` 界面，分 CSS-1…CSS-6；第一版不写分区表、
+    **文件系统后端编译内置**（不经 CKM 运行时装卸），见 [storage.md](storage.md)。
+    **CSS-1（底层识别）已于 2026-10-11 落地**：`kernel/src/storage/`（GPT/MBR 只读扫描 + 卷记录 +
+    解析自测）、`storage_volumes`(261)/`storage_rescan`(265)、`mkfs` 的 GPT/MBR 夹具、`libc` 解析器
+    与 `/bin/volumes`、`make test-storage` 系列。
 
 ## 5. 修订记录
 
@@ -152,3 +157,5 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 | 2026-10-11 | **纯内核化执行（阶段二/四/五部分）**：`libc/`+`user/` 迁入 `userland/` 独立 workspace，内核构建改为「按 `manifest.txt` 内嵌」（无用户态也能构建 + 启动到串口诊断模式），新增 `tools/check-boundary.py` 边界门禁与 `image-kernel`/`test-kernel-only`/`userland-images` 目标；第十阶段由「规划」改为「进行中」，详见 pure-kernel.md 第 8 节 |
 | 2026-10-11 | **新增「纯内核化改造规划」（v0.9 之后，规划）**：新建 docs/pure-kernel.md —— 现状审计 C1–C9（内核构建期嵌套 cargo 构建用户程序、10 处 `include_bytes!` 把 203,280 字节（≈199 KiB）用户态内嵌进内核映像、`fs::init` 硬编码 `/bin`/`/lib`、启动末尾跑用户态自测、ABI 两处镜像、workspace 与测试责任混杂），实测删掉 `libc/`+`user/` 后 `cargo build -p kernel` 退出码 **101**；逐文件迁移清单（内核 83 文件仅 9 个要改；`user/` 33 + `libc/` 7 + `tools`/`tools-go`/`tests` 逐项去向）；六阶段与七条验收标准对照；同步 docs/README、DEVELOPMENT（5.11）、project-structure（第 4 节）与 README |
 | 2026-10-11 | **新增「桌面环境兼容路线」（v1.0 之后，规划）**：新建 docs/desktop.md —— 现状审计（显示/输入/ioctl/设备模型/`/proc`/futex/音频/ACPI 等逐项有据）、用户态与内核侧归属纠正（logind/D-Bus/PipeWire 是用户态，KVM 与桌面前置无关）、被遗漏的地基清单、D0–D5 分层与 QEMU 可断言验收（monitor `sendkey`/`screendump` 实测可用）、里程碑 v1.1–v1.6；同步 roadmap（第九阶段 + 「禁止提前做」项修正）、DEVELOPMENT（5.10）、architecture 第 5 节、project-structure（规划新增目录）与 README |
+| 2026-10-11 | **CSS 提案评审补边界**：[storage.md](storage.md) 增 6.8「文件系统后端装载政策」（第一版全部编译内置、不经 CKM 运行时装卸）、6.1「覆盖层/回滚/恢复归 CKM」、6.7「兼容性完整展示」、第 11 节「不做写回修复」（`fsck` 只读检查）；第十二阶段段落同步 |
+| 2026-10-11 | **CSS-1 落地**：`kernel/src/storage/`（GPT 主/备表头 + CRC32、MBR + EBR 链只读扫描，无分区表退化为整盘一卷，FAT 探测）、块设备注册表 2 → 8、`storage_volumes`(261)/`storage_rescan`(265)（64 字节定长卷记录、确定性枚举）、`mkfs.py` 的 GPT/MBR/主表受损/无表四类夹具、`libc` 解析器 + 用户程序 `/bin/volumes`、`make storage-images`/`test-storage-fixtures`/`test-storage`/`test-storage-mbr` 与编排场景 `storage`/`storage-mbr`（15 → **17 场景**）、内核解析自测 11 例 / 45 断言；第十二阶段由「规划」改「进行中」；同步 [storage.md](storage.md) 第 2/9/10 节、docs/README.md、DEVELOPMENT.md 5.13 |

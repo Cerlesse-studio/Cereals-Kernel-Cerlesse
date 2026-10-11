@@ -122,6 +122,11 @@ pub fn init(
 /// - `blk1`（`mkfs` 生成的测试盘，只有测试时才挂第二块盘）→ `/mnt/fat`。
 ///   `/mnt/fat` 挂在 `/mnt`（自测用的 RAMFS）下面，因此顺带验证了挂载表的**最长前缀路由**。
 ///
+/// 第二块盘**不一定是 FAT**：`make test-storage` 用 GPT/MBR 夹具盘，它上面没有可挂的
+/// 文件系统（`docs/storage.md` §6.8 的分区识别与文件系统后端是两件事）。因此 dev1 的
+/// 探测失败只留一行证据后跳过，不 halt —— 启动盘（dev0）仍然严格：它的 FAT 挂不上
+/// 就等于没有根文件系统，必须停。
+///
 /// 返回挂载成功的卷数。
 pub fn mount_disks() -> Result<usize, &'static str> {
     if crate::driver::block::count() == 0 {
@@ -133,8 +138,13 @@ pub fn mount_disks() -> Result<usize, &'static str> {
         mounted += 1;
     }
     if let Some(dev) = crate::driver::block::get(1) {
-        mount_fat(dev, "/mnt/fat")?;
-        mounted += 1;
+        match mount_fat(dev, "/mnt/fat") {
+            Ok(()) => mounted += 1,
+            Err(err) => {
+                serial::print("fs: skip /mnt/fat: ");
+                serial::println(err);
+            }
+        }
     }
     Ok(mounted)
 }

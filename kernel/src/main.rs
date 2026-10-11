@@ -24,6 +24,7 @@ mod memory;
 mod network;
 mod process;
 mod scheduler;
+mod storage;
 mod time;
 
 type KernelTaskEntry = extern "C" fn() -> !;
@@ -249,6 +250,19 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
             driver::serial::println(err);
             halt();
         }
+    }
+
+    // CSS-1（H-08）：块设备之上的分区/卷只读识别 —— 先看清「有哪些卷」，再谈挂载。
+    // 位置在块设备验收之后、`fs::mount_disks` 之前：扫描是只读的，失败不会残留在盘上。
+    if let Err(err) = storage::init() {
+        driver::serial::print("storage: FAIL: ");
+        driver::serial::println(err);
+        halt();
+    }
+    if let Err(err) = storage::selftest() {
+        driver::serial::print("storage: FAIL: ");
+        driver::serial::println(err);
+        halt();
     }
 
     // v0.8：把块设备上的 FAT 卷挂进 VFS（`/disk` = 启动盘、`/mnt/fat` = mkfs 生成的测试盘），
