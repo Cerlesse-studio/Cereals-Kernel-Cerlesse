@@ -19,6 +19,8 @@
 | [package-manager.md](./package-manager.md) | 面向内核/系统生态的高效、安全、轻量、灵活包管理器设计提案（H-06） | 🟡 提案 v1 + **P0a 已落地**：包容器后缀 **`.ckc`**（CKC = Cerlesse Kernel Container，64 字节头 + 确定性 ustar，身份 = payload 哈希），实现 `tools/pkgmgr/ckc.py`，验收 `make test-pkg` 37 项（含 `tar` 独立复核）；事务/catalog（P0b）与内核侧接入（P1）待做，见该文档 11.1 |
 | [project-structure.md](./project-structure.md) | 目录结构与模块职责划分 | ✅ 已完成 |
 | [../DEVELOPMENT.md](../DEVELOPMENT.md) | 主开发文档：需求、依赖、任务清单、测试、QEMU、Issue 规划 | ✅ 已完成 |
+| [api.md](./api.md) | **API 参考**：系统调用 ABI / errno / `libc` API / 内核内部 trait / 主机工具 CLI / Make 目标 | 🟡 持续更新（2026-10-11 新建） |
+| [software-development.md](./software-development.md) | **软件开发文档**：环境与工具链、构建/测试/调试、代码与文档规范、协作流程、质量门禁、扩展步骤 | 🟡 持续更新（2026-10-11 新建） |
 | [boot.md](./boot.md) | 阶段：Bootloader / UEFI / Kernel Entry / GDT / IDT | ✅ v0.1 + v0.2 已完成 |
 | [memory.md](./memory.md) | 阶段：物理/虚拟内存 / Heap / Allocator | ✅ v0.3 已完成 |
 | [drivers.md](./drivers.md) | 阶段：驱动框架 / PCI / 磁盘（含 v0.4 中断/时钟/键盘/上下文切换） | ✅ v0.8 已完成（驱动注册框架 + PCI 枚举 + 块设备抽象 + **legacy virtio-blk**，`make test-driver` 22 项 PASS；启动盘已改为 virtio-blk）；v0.4（PIC + PIT 100Hz + PS/2 键盘 + 上下文切换原语）已完成；v0.9 键盘加**行缓冲 + 终端式回显**（`make test-keyboard` 断言同步） |
@@ -46,6 +48,7 @@
   网络仍为占位。
 - **后续**：每进入一个新阶段就编写/修订对应的主题文档；阶段内已落地部分也要及时补记当前状态（例如 v0.4 中断控制器）。
 - 本套文档**会在开发过程中被反复修改**——修改前请在对应文档顶部记录修订日期与变更点。
+-  本次（2026-10-11，第八轮）修订重点：**文档重构（本轮）** —— README 改为项目入口页；DEVELOPMENT.md 按「需求/依赖/workspace/目录/版本任务/缺陷汇总/测试/QEMU/Issue/文档约定/修订」重组并新增 v0.6–v0.9 任务清单与 B-01…B-17 汇总；**新增 [api.md](./api.md)（系统调用 ABI / `libc` API / 内核 trait / 工具 CLI / Make 目标）与 [software-development.md](./software-development.md)（环境 / 构建测试调试 / 规范 / 协作 / 质量门禁 / 扩展步骤）**；同步 docs/README 索引。
 -  本次（2026-10-11，第八轮）修订重点：**v0.9 第三步（进程对象 + `fork`/`execve`/`wait4`）落地** ——
   进程表从「最小登记」换成真正的 PCB（每进程地址空间 + 每进程 64 KiB 内核栈 + 栈底哨兵
   + 停在 syscall 里的完整用户帧）、新增 `syscall/process.rs`（fork 复制地址空间与当前帧、
