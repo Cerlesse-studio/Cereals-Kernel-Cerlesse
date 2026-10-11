@@ -45,6 +45,8 @@ const ECHILD: i64 = -10;
 const EAGAIN: i64 = -11;
 /// `execve` 路径长度上限。
 const PATH_MAX: u64 = 256;
+/// `getprocs` 的记录尺寸（`libc::PROCINFO_SIZE` 必须与它一致）。
+pub const PROCINFO_SIZE: usize = 40;
 /// `execve` 的 `argv` 项数上限。
 const ARG_MAX: u64 = 8;
 /// 单个 `argv` 参数长度上限。
@@ -97,6 +99,66 @@ pub unsafe fn sys_getpid(_args: &[u64; 5], _space: *const UserSpace) -> i64 {
     serial::print_dec(pid);
     serial::println("");
     pid as i64
+}
+
+/// 系统调用 `getprocs(buf_ptr, buf_len)`：把进程表快照写进用户缓冲。
+///
+/// v0.9 第五步新增（`user/ps` 的落点）。Linux 没有这个调用（`ps` 读 `/proc`），
+/// 而本内核的 VFS 还没有虚拟文件 / `/proc`，所以这里直接把进程表交出去 ——
+/// 记录格式见下，**改它就是改 ABI**（`libc::PROCINFO_SIZE` 必须一致）：
+///
+/// ```text
+/// 偏移  长度  字段        说明
+/// 0     8     pid         LE u64
+/// 8     8     ppid        LE u64（0 = 内核启动上下文）
+/// 16    1     state       0 = READY，1 = RUNNING，2 = ZOMBIE
+/// 17    7     reserved    内核写 0
+/// 24    16    comm        `Process::comm`（定长，补 0；无终止符语义）
+/// ```
+///
+/// 返回写入的记录数（`0` = 进程表为空），缓冲装不下时截断；负数 = `-errno`。
+/// 枚举的是**槽位顺序**（不是 PID 顺序）：`ps` 因此不需要排序逻辑，内核也不承诺
+/// 排序 —— 这就是「进程表长什么样」的如实转发。
+pub unsafe fn sys_getprocs(args: &[u64; 5], space: *const UserSpace) -> i64 {
+    let (buf_ptr, buf_len) = (args[0], args[1]);
+    if (buf_len as usize) < PROCINFO_SIZE {
+        return -22; // -EINVAL
+    }
+    let out = match unsafe {
+        crate::syscall::file::user_bytes_mut(space, buf_ptr, buf_len, "getprocs")
+    } {
+        Ok(out) => out,
+        Err(errno) => return errno,
+    };
+
+    let cap = out.len() / PROCINFO_SIZE;
+    let mut count = 0usize;
+    for slot in 0..process::MAX_PROC {
+        let ptr = process::process_ptr(slot);
+        if ptr.is_null() {
+            continue;
+        }
+        if count == cap {
+            break;
+        }
+        let p = unsafe { &*ptr };
+        let rec = &mut out[count * PROCINFO_SIZE..(count + 1) * PROCINFO_SIZE];
+        rec.fill(0);
+        rec[0..8].copy_from_slice(&p.pid.to_le_bytes());
+        rec[8..16].copy_from_slice(&p.parent_pid.to_le_bytes());
+        rec[16] = match p.state {
+            ProcState::Ready => 0,
+            ProcState::Running => 1,
+            ProcState::Zombie => 2,
+        };
+        rec[24..24 + process::PROC_COMM_LEN].copy_from_slice(&p.comm);
+        count += 1;
+    }
+
+    serial::print("user: getprocs count=");
+    serial::print_dec(count as u64);
+    serial::println("");
+    count as i64
 }
 
 /// 系统调用 `fork`：复制当前进程。
@@ -239,6 +301,9 @@ pub unsafe fn sys_exec(args: &[u64; 5], space: *const UserSpace) -> i64 {
         let p = process::process_mut(slot).expect("当前进程存在");
         p.frame = frame;
         p.name = "exec";
+        // `ps` 看到的是程序名（`ls`），不是 `"exec"` —— `comm` 是定长字段，
+        // 因此这里能安全地指向用户给的路径（不需要把 String 泄漏成 `&'static str`）。
+        p.set_comm(path.rsplit('/').next().unwrap_or(&path));
         old_space = p.space.replace(new_space);
     }
     unsafe { cpu::write_cr3(new_root) };

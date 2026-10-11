@@ -2,7 +2,13 @@
 //!
 //! 编号沿用 **Linux x86_64** 语义，便于以后直接跑现成的用户态程序：
 //! `read=0, write=1, open=2, close=3, mmap=9, mprotect=10, munmap=11, brk=12,
-//! getpid=39, nanosleep=35, fork=57, execve=59, exit=60, wait4=61`。
+//! getpid=39, nanosleep=35, fork=57, execve=59, exit=60, wait4=61`，
+//! 目录列举 `getdents=78`（Linux 同名号，记录格式见下）。
+//!
+//! **Cerlesse 扩展号段（`>= 256`）**：Linux x86_64 没有「列举进程」的系统调用
+//! （`ps` 走 `/proc`），而本内核的 VFS 还没有虚拟文件，所以 v0.9 第五步在
+//! 0..255 之外开了 `getprocs=256`。号段边界与 [`SYS_MAX`] 一致：
+//! `0..=255` 保持 Linux 语义，`>= 256` 明确是 Cerlesse 自己的 ABI。
 //!
 //! 表按 `SYS_MAX` 排满：未单独实现的号落在公共 ENOSYS 桩上，
 //! 因此「号合法但未实现」与「号越界」是两种可区分的失败
@@ -28,8 +34,16 @@ pub const SYS_FORK: u64 = 57;
 pub const SYS_EXEC: u64 = 59;
 pub const SYS_EXIT: u64 = 60;
 pub const SYS_WAIT: u64 = 61;
+/// 目录列举（v0.9 第五步）。Linux 也有这个号，但**记录格式不同**（定长 88 字节，
+/// 见 `syscall/dir.rs` 模块文档）：本内核的 VFS 没有 inode 号/可变长目录项，
+/// 因此不编造 `linux_dirent64` 里那些字段。
+pub const SYS_GETDENTS: u64 = 78;
+/// 进程表快照（v0.9 第五步）。**Cerlesse 扩展号**：Linux x86_64 不使用 256。
+pub const SYS_GETPROCS: u64 = 256;
 /// 系统调用号上限（不含），用于边界检查。
-pub const SYS_MAX: u64 = 256;
+///
+/// `0..=255` 是 Linux x86_64 号段，`256..` 是 Cerlesse 扩展号段（见模块头）。
+pub const SYS_MAX: u64 = 257;
 
 /// 已定义但尚未实现的系统调用号（逐个补齐）：`(号, 名字)`。
 ///
@@ -96,5 +110,8 @@ pub const SYS_TABLE: [SyscallHandler; SYS_MAX as usize] = {
     table[SYS_FORK as usize] = crate::syscall::process::sys_fork;
     table[SYS_EXEC as usize] = crate::syscall::process::sys_exec;
     table[SYS_WAIT as usize] = crate::syscall::process::sys_wait;
+    // v0.9 第五步：用户态可枚举目录（`ls`）与进程表（`ps`）
+    table[SYS_GETDENTS as usize] = crate::syscall::dir::sys_getdents;
+    table[SYS_GETPROCS as usize] = crate::syscall::process::sys_getprocs;
     table
 };

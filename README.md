@@ -6,6 +6,29 @@
 
 ## 当前进度
 
+**🧰 基础用户程序已可用（2026-10-11，v0.9 第五步：`ls` / `cat` / `echo` / `ps`）**：`/bin` 里不再只有一个 `hello`。
+四个命令行程序都是**普通用户程序**（Rust + libc，由 Shell 的 `fork`+`execve` 起来），各自只需要一条内核能力：
+`ls` → 新增的 **`getdents`**（把 VFS 的目录项写成定长 88 字节记录）、`ps` → 新增的 **`getprocs`**
+（定长 40 字节的进程表快照；Linux 没有这个调用，所以放在 **256** 起的 Cerlesse 扩展号段，
+`syscall_table.rs` 因此写明「`0..=255` = Linux 语义、`>= 256` = Cerlesse 扩展」）、
+`cat` → 文件 syscall、`echo` → `argc`/`argv` + 一次 `write`。
+`ps` 于是能读出 `pid=3 ppid=0 state=RUNNING comm=sh` 与 `pid=7 ppid=3 … comm=ps` —— 这正是 `fork` 建出的父子关系
+（`Process::comm` 是新增的定长 16 字节字段，`execve` 成功后改写为程序名）。
+验收：`make test-programs`（**17 项 + 5 条正则**，QEMU monitor 注入 `ls` / `ls /bin` / `ps` / `/bin/echo …` / `/bin/cat /etc/motd`）——
+其中 `ls: /bin entries=6` 说明 RAMFS 上恰好是本次构建的 6 个程序，`cat: /etc/motd bytes=23` 说明程序端真的读到了内核提供的文件。
+规格见 docs/syscall.md 3.8。注：内建命令会**遮蔽**同名程序（与真实 shell 一致），所以 `cat`/`echo` 要走程序得写 `/bin/cat` / `/bin/echo`；
+`make test-proc` 的“找不到的程序”负例已从 `ls` 改为 `foo`。
+
+**🌐 简化网络栈已打通（2026-10-11，v0.9 第四步）**：内核第一次真的收发了网络报文。
+QEMU 里加一块 legacy `virtio-net-pci`（`-netdev user` = slirp，自带 DHCP 服务器与虚拟网关），启动后内核：
+① 从**设备配置空间**读到 MAC（协商了 `VIRTIO_NET_F_MAC`；驱动的兜底地址刻意不同，因此日志里的
+`52:54:00:12:34:56` 只可能是真读到的）；② ARP 广播请求解析网关 → `10.0.2.2 -> 52:55:0a:00:02:02`；
+③ DHCP DISCOVER（UDP 68→67 广播）→ OFFER（UDP 67→68）往返，解析出 `yiaddr`/server/mask/router。
+代码：`kernel/src/driver/net.rs` + `driver/virtio_net.rs`（RX/TX 双队列、10 字节 virtio-net 头、同步轮询）
+与 `kernel/src/network/{ethernet,arp,ipv4,udp,dhcp}.rs`（Ethernet II → ARP → IPv4 → UDP，含校验和）。
+验收：`make test-network`（**13 项**串口断言，**主机侧不需要跑任何服务**）。
+TCP/ICMP 与面向用户态的 socket 仍是占位（见 docs/drivers.md 1.8）。
+
 **H-06 包管理器 P0a 已落地（2026-10-11）**：内核包有了**独有后缀 `.ckc`**
 （**CKC** = Cerlesse Kernel Container）—— 64 字节头（magic `CKC\x01` / 版本 / 头长 / flags /
 payload_len / payload_off / 32 字节 payload_sha256 / 保留位，小端）+ **确定性 ustar** payload
@@ -21,10 +44,11 @@ Shell 里的 `hello world` 现在会：`fork()`（复制 Shell 的地址空间�
 （恢复子进程运行、回收它的地址空间、拿走退出码）。
 关键不是这三个号“有实现”，而是它们背后终于有了**进程对象**：每进程一棵页表 +
 **每进程 64 KiB 内核栈**（栈底有哨兵 `KERNEL STACK OVERFLOW` 告警）+ 停在 `syscall` 里的完整用户帧。
-验收：`make test-proc`（**8 项断言 + 4 条正则**，QEMU monitor 注入 `hello world` / `ls` / `exit`）——
+验收：`make test-proc`（**8 项断言 + 4 条正则**，QEMU monitor 注入 `hello world` / `foo` / `exit`）——
 用**反向引用**把 fork / execve / wait4 三处的 PID 断言为**同一个值**（PID 数值依赖启动顺序，写常数会碎），
 并断言 `user: frames free before=N after=N`：父子进程的地址空间**全部归还**。
-找不到的程序（`ls` → `/bin/ls`）也是完整链路：execve 返回 `-ENOENT`，子进程 `exit(127)`，父进程拿到 127。
+找不到的程序（`foo` → `/bin/foo`；v0.9 第五步起 `/bin/ls` 已存在，不能再当负例）也是完整链路：
+execve 返回 `-ENOENT`，子进程 `exit(127)`，父进程拿到 127。
 设计、状态机与两条实测踩坑（debug 构建下 16 KiB 内核栈静默溢出踩坏 `.bss` 帧分配器；退出时必须先恢复 CR3 再 Drop 地址空间）见 docs/process.md 1.4 与 docs/syscall.md 3.7。
 
 **🐚 交互式 Shell 已可用（2026-10-11，v0.9 第二步）**：`/bin/sh` 不再是占位。
@@ -64,7 +88,8 @@ set 1 解码（字母/数字/Shift/扩展前缀）→ 串口回显（v0.9 起为
 `make test-memory`（堆/帧/页表 + 上下文切换自测）PASS；`make test-pagefault`（#PF 诊断 + CR2）PASS；
 `make test-keyboard`（经 QEMU monitor 注入真实按键，断言 `KBIRQ ENTRY` / `kbd: line ready len=3` / `KBIRQ EXIT` / 心跳）PASS；
 `make test-shell`（注入 `help`/`cat /etc/motd`/`exit`，断言提示符、`read fd=0`、`sh: cat /etc/motd bytes=23` 与 `user: shell PASS`）PASS；
-`make test-proc`（注入 `hello world`/`ls`/`exit`，断言 fork/execve/wait4 全链路与 PID 一致性、`user: selftest PASS`）PASS。
+`make test-proc`（注入 `hello world`/`foo`/`exit`，断言 fork/execve/wait4 全链路与 PID 一致性、`user: selftest PASS`）PASS；
+`make test-programs`（注入 `ls`/`ls /bin`/`ps`/`/bin/echo`/`/bin/cat /etc/motd`，断言 `getdents`/`getprocs` 与四个程序真的被 exec 起来，17 项 + 5 正则）PASS。
 
 **v0.5 已完成（2026-10-08）**：内核线程 + Round Robin 时间片调度 + IPC（pipe 骨架）。
 线程控制块与状态机（`process/thread.rs`）→ PID 分配（`process/pid.rs`）→ 定长环形就绪队列（`scheduler/queue.rs`）
@@ -219,12 +244,14 @@ make test-fs         # v0.7：断言 VFS 挂载路由 + RAMFS 读/写/ls + 负�
 make test-user       # v0.7/v0.9：ELF 从 RAMFS 装载 + 文件 syscall + 用户堆 + 隔离 + Shell（61 项）
 make test-shell      # v0.9：注入按键跑交互式 Shell（help / cat /etc/motd / exit，11 项）
 make test-proc       # v0.9：fork/execve/wait4 全链路（外部程序 /bin/hello + argv + 退出码回收，8 项 + 4 正则）
+make test-programs   # v0.9：从 Shell 跑 /bin/{ls,cat,echo,ps}（getdents 列目录 + getprocs 列进程，17 项 + 5 正则）
 make test-driver     # v0.8：断言 PCI 枚举 + 驱动挂接 + virtio-blk 扇区读/写/负例
 make fat-image       # v0.8：用 tools/mkfs/mkfs.py 生成 FAT32 测试盘（内容见 tests/fatroot/）
 make test-fat        # v0.8：双盘启动，断言 FAT16/32 挂到 VFS 后的读/ls/LFN/跨簇/偏移读/EROFS
-make user            # v0.7/v0.9：单独构建并校验三个用户程序（hello/shell/hello-bin → 段页对齐的 ELF）
+make test-network    # v0.9：virtio-net + Ethernet/ARP/IPv4/UDP（ARP 网关解析 + DHCP UDP 往返，13 项）
+make user            # v0.7/v0.9：单独构建并校验七个用户程序（hello/shell/hello-bin/ls/cat/echo/ps → 段页对齐的 ELF）
 make test-pkg        # H-06 P0a：CKC 包容器（.ckc）与打包/校验规则（主机侧，不启 QEMU）
 make test-all        # 全部集成测试
 make go-test         # v0.4 H-04/H-05：Go 单元测试（串口分析 + 并行编排器）
-make test-orch       # v0.4 H-04：Go 编排器并行跑 12 个集成测试场景（tests/orchestrate.json）
+make test-orch       # v0.4 H-04：Go 编排器并行跑 14 个集成测试场景（tests/orchestrate.json）
 ```

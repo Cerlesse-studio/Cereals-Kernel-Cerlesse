@@ -37,13 +37,16 @@ const IO_MAX: u64 = 4096;
 const PATH_MAX: u64 = 256;
 
 /// `-EFAULT`：用户传了不属于自己的地址区间。
-const EFAULT: i64 = -14;
+///
+/// v0.9 第五步起对 `syscall` 其它模块可见：目录类 syscall（`dir.rs`）与
+/// 进程类 syscall（`process.rs` 的 `getprocs`）都要做同样的指针校验。
+pub const EFAULT: i64 = -14;
 
 /// 校验用户缓冲区间并要求**可读**，转成切片。
 ///
 /// # Safety
 /// `buf` 必须来自 ring3，且 `space` 必须是当前生效的用户地址空间。
-unsafe fn user_bytes<'a>(
+pub unsafe fn user_bytes<'a>(
     space: *const UserSpace,
     buf: u64,
     count: u64,
@@ -63,7 +66,7 @@ unsafe fn user_bytes<'a>(
 ///
 /// # Safety
 /// 同 [`user_bytes`]。
-unsafe fn user_bytes_mut<'a>(
+pub unsafe fn user_bytes_mut<'a>(
     space: *const UserSpace,
     buf: u64,
     count: u64,

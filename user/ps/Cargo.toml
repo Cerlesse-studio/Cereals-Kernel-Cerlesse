@@ -1,0 +1,12 @@
+[package]
+name = "user-ps"
+version = "0.1.0"
+edition = "2021"
+description = "v0.9 第四步基础用户程序（/bin/ps）：getprocs 打印进程表"
+
+[dependencies]
+libc = { path = "../../libc" }
+
+[[bin]]
+name = "user-ps"
+path = "src/main.rs"

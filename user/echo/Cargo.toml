@@ -1,0 +1,12 @@
+[package]
+name = "user-echo"
+version = "0.1.0"
+edition = "2021"
+description = "v0.9 第四步基础用户程序（/bin/echo）：argc/argv + 一次 write"
+
+[dependencies]
+libc = { path = "../../libc" }
+
+[[bin]]
+name = "user-echo"
+path = "src/main.rs"

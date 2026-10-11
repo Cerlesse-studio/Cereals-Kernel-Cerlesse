@@ -1,8 +1,8 @@
 # 设备驱动 / PCI / 磁盘（阶段文档）
 
-- 阶段：第八阶段（v0.8 驱动框架 / PCI / 块设备；v0.4 中断控制时钟键盘已完成）
+- 阶段：第八阶段（v0.8 驱动框架 / PCI / 块设备；v0.9 网络栈；v0.4 中断控制时钟键盘已完成）
 - 最后更新：2026-10-11
-- 状态：✅ v0.8 已完成（**驱动注册框架 + PCI 枚举 + 块设备抽象 + virtio-blk（legacy）**，`make test-driver` 22 项 PASS；**磁盘文件系统 FAT12/16/32 已挂到 VFS**，`make test-fat` 21 项 PASS）；v0.4（中断控制器 + PIT + PS/2 键盘 + 上下文切换原语 + H-04/H-05 Go 工具）已完成
+- 状态：✅ v0.8 已完成（**驱动注册框架 + PCI 枚举 + 块设备抽象 + virtio-blk（legacy）**，`make test-driver` 22 项 PASS；**磁盘文件系统 FAT12/16/32 已挂到 VFS**，`make test-fat` 21 项 PASS）；**v0.9 简化网络栈已落地**（**virtio-net（legacy）+ Ethernet → ARP → IPv4 → UDP**，`make test-network` 13 项 PASS；TCP / socket 仍为占位，见 1.8）；v0.4（中断控制器 + PIT + PS/2 键盘 + 上下文切换原语 + H-04/H-05 Go 工具）已完成
 - 依赖：interrupt（IRQ 分发）、memory（连续物理帧 → DMA / virtqueue）、arch::port（端口 I/O）
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
@@ -114,7 +114,8 @@ block: selftest PASS
   详情与限制清单见 [filesystem.md](./filesystem.md) 3.1。
 - **不分配/重定位 BAR**：直接使用固件分配的地址。真实平台上若出现未分配窗口（全 0）会打日志而不是猜测
   （v0.8 的实现里 `read_bar` 对全 0 返回「未实现」）。
-- **不解析 capability 链、不配置中断**：MSI-X/INTx、设备特定能力结构都留给 v0.9 与网络驱动一起做。
+- **不解析 capability 链、不配置中断**：MSI-X/INTx 与设备特定能力结构仍未做；v0.9 的网络驱动同样走
+  **同步轮询**（不配置 MSI-X/INTx），因此这条限制对块设备与网卡都成立（见 1.8）。
 - **最多两块 virtio-blk 盘**（`block` 注册表容量 2，每块盘各自的队列状态在实例里、请求缓冲共用）：
   启动盘 + 测试盘刚好够用，更多盘位留给后续版本。
 - **不实现 modern（virtio 1.0）接口**：见 1.2；遇到 modern 设备时明确报错。
@@ -161,6 +162,44 @@ IMAGE UNCHANGED (write test restored the scratch sector)
 - 回显在**中断上下文直接打印**（cooked 模式）：同一串口通道上还有 `KBIRQ ENTRY/EXIT` 标记，
   可读性靠「一次击键一段标记」的约定，终端抽象尚未引入。
 
+### 1.8 v0.9 已落地：简化网络栈（virtio-net → Ethernet → ARP → IPv4 → UDP）
+
+代码位置与职责：
+
+| 文件 | 职责 |
+| ---- | ---- |
+| `kernel/src/driver/net.rs` | 网络设备抽象 `NetworkDevice`（以太网帧收发）+ 注册表 + MAC 打印 |
+| `kernel/src/driver/virtio_net.rs` | legacy virtio-net 0.9.5：两个 virtqueue（0 = 接收 / 1 = 发送）、10 字节 virtio-net 头、MAC 读自设备配置空间、同步轮询 |
+| `kernel/src/network/ethernet.rs` | Ethernet II 组帧 / 解析（纯函数，不依赖设备） |
+| `kernel/src/network/arp.rs` | ARP 请求 / 应答 + 固定容量 IP→MAC 缓存 |
+| `kernel/src/network/ipv4.rs` | IPv4 地址、头组帧 / 解析、互联网校验和（`sum16` / `finish`） |
+| `kernel/src/network/udp.rs` | UDP 组帧 / 解析（发送算 IPv4 伪头校验和；接收校验非零校验和） |
+| `kernel/src/network/dhcp.rs` | DHCP DISCOVER 组包 + OFFER 解析（UDP 往返的验收载体） |
+| `kernel/src/network/mod.rs` | `Stack`（设备 + 地址 + ARP 缓存）+ `selftest` 验收编排 |
+
+启动顺序（挂载磁盘文件系统之后、调度器/用户态之前）：
+
+```text
+net::count()/first()      → 只有总线上挂了网卡才跑（无网卡时打印一行并跳过 —— 不把「没有网卡」当失败）
+net::report()             → 打印设备名与 MAC
+network::selftest(dev)    → ARP 解析网关 + DHCP DISCOVER → OFFER
+```
+
+**验收（`make test-network`，13 项串口断言）** —— QEMU 加一块 legacy virtio-net-pci，
+`-netdev user`（slirp）自带 DHCP 服务器与虚拟网关，**不需要主机侧跑任何服务**：
+
+- `vendor=0x1af4 device_id=0x1000`：legacy 网卡被 PCI 枚举到（modern 0x1041 明确拒绝）；
+- `virtio-net: mac=52:54:00:12:34:56`：MAC **从设备配置空间读到**（驱动协商了 `VIRTIO_NET_F_MAC`；
+  兜底地址是 `02:00:00:00:00:01`，因此看到 QEMU 的默认值就只可能是「真的读了配置空间」）；
+- `net: arp 10.0.2.2 -> 52:55:0a:00:02:02 (reply)`：ARP 广播请求 → 单播应答，MAC 正是 slirp 网关；
+- `net: dhcp offer yiaddr=10.0.2.15 server=10.0.2.2 mask=255.255.255.0 router=10.0.2.2`：
+  UDP 68→67 的 DISCOVER → OFFER 往返，报文里的地址 / 掩码 / 网关都被解析出来
+  —— 这是 Ethernet → IPv4 → UDP 收发两条路径都通了的证据。
+
+**边界（与 `docs/architecture.md` 第 5 节一致，别读成已完成）**：不做 TCP（`network/tcp.rs` 仍是占位）、
+不做重传 / 窗口；不做 IP 分片重组（收到 `MF` 置位或 offset ≠ 0 的 IPv4 报文直接丢弃）；
+`network/socket.rs`（面向用户态的 socket）仍为占位。中断仍不配置 —— 与块设备一样走同步轮询。
+
 ## 2. 开发路线
 
 ### 2.1 v0.8（Driver Manager → PCI → 块设备 → 磁盘 FS 挂载）
@@ -180,13 +219,15 @@ IMAGE UNCHANGED (write test restored the scratch sector)
 
 ### 2.2 v0.9（网络栈顺序 + Socket syscall 最小集）
 
-1. Network Driver（例如 virtio-net，可复用 v0.8 的 `Driver` 框架与 PCI 枚举）
-2. Ethernet → ARP → IPv4 → ICMP → UDP → TCP（尽力） → Socket API
+1. [x] Network Driver：`virtio-net`（legacy，复用 v0.8 的 `Driver` 框架与 PCI 枚举）—— `driver/virtio_net.rs`
+2. [x] Ethernet → ARP → IPv4 → UDP（`network/{ethernet,arp,ipv4,udp,dhcp}.rs`，验收见 1.8）
+3. [ ] ICMP → TCP（尽力） → Socket API（仍为占位）
 
 验收（v0.9）：
 
-- [ ] Shell 交互可用
-- [ ] ping/HTTP 简例可跑
+- [x] Shell 交互可用（`make test-shell`，v0.9 第二步）
+- [x] 网络最小闭环：ARP 解析网关 + DHCP 的 UDP 往返（`make test-network`）
+- [ ] ping/HTTP 简例（ICMP/TCP 落地后再做）
 
 ## 3. 驱动列表
 
@@ -199,11 +240,12 @@ IMAGE UNCHANGED (write test restored the scratch sector)
 | Timer（PIT） | v0.4 | 100Hz tick：调度时间片与块 I/O 超时基准 |
 | PCI | v0.8 | 枚举与 BAR 探测（配置机制 #1） |
 | Disk（virtio-blk legacy） | v0.8 | 块设备：`BlockDevice` trait 的实现者 |
+| Net（virtio-net legacy） | v0.9 | 网卡：`NetworkDevice` trait 的实现者（RX/TX 双队列） |
 | Disk FS（FAT12/16/32） | v0.8 | 不是 PCI 驱动，而是 `FileSystem` 后端（`fs/fat.rs`）：消费 `BlockDevice` 提供的扇区 |
 
 ### 3.2 后续（按需补）
 
-- virtio-net（v0.9，网络栈的底座）、AHCI/NVMe、USB、Audio、GPU、Framebuffer（视需要）。
+- AHCI/NVMe、USB、Audio、GPU、Framebuffer（视需要）。
 
 ## 4. 非目标 / 后续
 
@@ -224,3 +266,4 @@ IMAGE UNCHANGED (write test restored the scratch sector)
 | 2026-10-11 | **v0.9 输入侧**：键盘驱动加行缓冲（行编辑 + 整行交付 + `kbd: line ready len=N`），回显由 `KB <字符>` 改为终端式原样回显；1.6 补记、1.7 限制项由「无环形缓冲」改为「单行缓冲 + cooked 回显」；`make test-keyboard` 断言同步 |
 | 2026-10-11 | **v0.8 收官**：磁盘文件系统 FAT12/16/32（`fs/fat.rs`，只读）挂到 VFS，`fs::mount_disks` 接入启动链（`/disk` + `/mnt/fat`）；H-03 `tools/mkfs/mkfs.py` 落地（mtools 独立复核）；新增 `make test-fat`（21 项，双盘）与编排场景 `fat`（10 场景）；状态行改为「v0.8 已完成」，限制项从「FAT32 未做」改为「FAT 只读、无扇区缓存」 |
 | 2026-10-11 | **v0.8 前半落地**：新增 `driver/pci.rs`（机制 #1 + BAR 探测 + 窗口大小）、`driver/driver.rs`（注册框架 + `probe_all`）、`driver/block.rs`（按扇区读写 + 验收自测）、`driver/virtio_blk.rs`（legacy virtio 0.9.5，同步轮询 + bounce buffer）、`arch/x86_64/port.rs`（端口 I/O）、`frame::allocate_contiguous`；启动盘改为 virtio-blk（Makefile / `tests/test_boot.py` / `tests/test_keyboard.py`，`disable-modern=on`）；新增 `make test-driver`（22 项）与编排场景 `driver`（9 场景）；修 B-16（BAR 大小 32→64 位宽错误）、B-17（LBA 溢出未拦）；状态行由「v0.8 尚未编写」改为「v0.8 前半完成，FAT32 待做」 |
+| 2026-10-11 | **v0.9 简化网络栈落地**：新增 `driver/net.rs`（`NetworkDevice` trait + 注册表）、`driver/virtio_net.rs`（legacy virtio-net 0.9.5：RX/TX 双队列、10 字节 virtio-net 头、MAC 读自设备配置空间、同步轮询）、`network/{ethernet,arp,ipv4,udp,dhcp}.rs` 与 `network/mod.rs`（`Stack` + `selftest`）；`network/{tcp,socket}.rs` 占位说明更新；`driver/driver.rs::register_builtin` 追加 virtio-net；`main.rs` 在磁盘验收后跑网络自测（无网卡时跳过）；新增 `make test-network`（13 项，QEMU 加 legacy virtio-net-pci + `-netdev user`）与编排场景 `network`（12 → **13 场景**）；`tests/test_boot.py` 增 `--nic`；新增 1.8 节与状态行、驱动列表更新 |

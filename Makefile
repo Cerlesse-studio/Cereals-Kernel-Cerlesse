@@ -31,8 +31,13 @@ USER_ELF       := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-hello
 USER_SHELL_ELF := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-shell
 # v0.9 第三步：外部程序（RAMFS 上落在 /bin/hello，由 Shell fork+execve 起来）。
 USER_HELLO_BIN_ELF := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-hello-bin
+# v0.9 第五步：基础用户程序（RAMFS 上落在 /bin/{ls,cat,echo,ps}，同样由 Shell 起来）。
+USER_LS_ELF   := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-ls
+USER_CAT_ELF  := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-cat
+USER_ECHO_ELF := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-echo
+USER_PS_ELF   := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-ps
 
-.PHONY: help build boot kernel image image-exception image-pagefault fat-image run test test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-scheduler test-ipc test-fs test-user test-driver test-fat test-all user test-pkg go-test test-orch clean
+.PHONY: help build boot kernel image image-exception image-pagefault fat-image run test test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-scheduler test-ipc test-fs test-user test-driver test-fat test-network test-all user test-pkg go-test test-orch clean
 
 help:
 	@echo "targets:"
@@ -45,6 +50,7 @@ help:
 	@echo "  test-keyboard - v0.4/v0.9: inject keys via QEMU monitor, assert IRQ1 markers + line buffer + PIT heartbeat"
 	@echo "  test-shell - v0.9: inject keys into the interactive shell (help / cat /etc/motd / exit) via QEMU monitor"
 	@echo "  test-proc - v0.9: fork/execve/wait4 through the shell: external program + argv + missing program + reap"
+	@echo "  test-programs - v0.9: run /bin/{ls,cat,echo,ps} from the shell (getdents + getprocs + file syscalls)"
 	@echo "  test-scheduler - v0.5: assert >=3 kernel tasks rotate under PIT time slices"
 	@echo "  test-ipc - v0.5: assert pipe create/write/read summary logs + selftest"
 	@echo "  test-fs - v0.7: assert VFS mount routing + RAMFS read/write/ls + negative errno cases"
@@ -52,12 +58,13 @@ help:
 	@echo "  test-driver - v0.8: assert PCI enumeration + driver probe + virtio-blk sector read/write"
 	@echo "  fat-image - v0.8: build the FAT test volume (tools/mkfs/mkfs.py from tests/fatroot/data)"
 	@echo "  test-fat - v0.8: assert FAT16/32 on disk mounted in VFS: read/ls/LFN/multi-cluster/EROFS"
+	@echo "  test-network - v0.9: assert virtio-net + Ethernet/ARP/IPv4/UDP (ARP gateway + DHCP UDP round-trip)"
 	@echo "  user   - v0.7/v0.9: build+validate the user-space scaffold alone (libc + user/hello + user/shell + user/hello-bin)"
 	@echo "  test-pkg - H-06: assert the .ckc package container (CKC) format + packaging rules (host-side)"
 	@echo "  test-all - run every integration test"
 
 	@echo "  go-test  - v0.4 H-04/H-05: Go unit tests for tools-go (host side)"
-	@echo "  test-orch - v0.4 H-04: run all 12 scenarios in parallel via Go orchestrator"
+	@echo "  test-orch - v0.4 H-04: run all 14 scenarios in parallel via Go orchestrator"
 	@echo "  clean  - remove build artifacts"
 
 build: image
@@ -127,7 +134,7 @@ test-pagefault: image-pagefault
 		--expect "CR2=0x500000000000" \
 		--expect "KERNEL PANIC: unhandled exception"
 
-test-all: test test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-scheduler test-ipc test-fs test-user test-driver test-fat
+test-all: test test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-scheduler test-ipc test-fs test-user test-driver test-fat test-network
 
 # v0.5 验收：≥3 个内核任务在 PIT 时间片驱动下轮转（Round Robin）
 test-scheduler: image
@@ -302,6 +309,34 @@ test-driver: image
 		--expect "block: negative cases PASS" \
 		--expect "block: selftest PASS"
 
+# v0.9 验收：简化网络栈（virtio-net → Ethernet → ARP → IPv4 → UDP）。
+#
+# QEMU 加一块 legacy virtio-net-pci（`-netdev user` = slirp），断言的是网络上
+# **回来的真实内容**而不是日志措辞：
+#   - `net: device=virtio-net0 mac=`：驱动从设备配置空间读到了 MAC 并注册成功；
+#   - `net: arp 10.0.2.2 -> 52:55:0a:00:02:02 (reply)`：ARP 请求（广播）→ 应答（单播）
+#     往返，且 MAC 正是 slirp 网关的固定地址；
+#   - `net: dhcp offer yiaddr=10.0.2.15 ...`：DHCP DISCOVER（UDP 68→67 广播）→
+#     OFFER（UDP 67→68）往返，报文里的 yiaddr / server-id / mask / router 都被解析出来
+#     —— 这是 Ethernet → IPv4 → UDP 收发两条路径都通了的证据。
+test-network: image
+	$(PYTHON) tests/test_boot.py \
+		--nic \
+		--serial-log $(BUILD)/serial-network.log \
+		--expect "Kernel started!" \
+		--expect "pci: enumerated devices=" \
+		--expect "vendor=0x1af4 device_id=0x1000" \
+		--expect "driver: registered index=1 name=virtio-net-pci" \
+		--expect "-> virtio-net-pci" \
+		--expect "virtio-net: mac=" \
+		--expect "net: device=virtio-net0 mac=" \
+		--expect "net: stack mac=" \
+		--expect "net: arp 10.0.2.2 -> 52:55:0a:00:02:02 (reply)" \
+		--expect "net: arp PASS" \
+		--expect "net: dhcp offer yiaddr=10.0.2.15" \
+		--expect "net: dhcp PASS" \
+		--expect "net: selftest PASS"
+
 # v0.8 H-03 验收：用 tools/mkfs/mkfs.py 生成「带已知文件集」的 FAT32 测试盘（64 MiB）。
 #
 # 内容取自 tests/fatroot/data（见该目录的 README：每个文件对应一类断言）。
@@ -421,8 +456,9 @@ test-shell: image
 #   - `user: run child pid=N name=fork-child`：子进程在父进程 wait4 时被恢复（单 CPU 的延迟调度）；
 #   - `user: exec pid=N path=/bin/hello ... segments=4 image_pages=5`：映像被换掉，**PID 不变**；
 #   - `hello-bin: argc=2` / `argv[0]=hello` / `argv[1]=world`：内核把 argv 写进了新进程的用户栈；
-#   - `user: exec /bin/ls -> ENOENT` + `sh: ls: exit code=127`：
+#   - `user: exec /bin/foo -> ENOENT` + `sh: foo: exit code=127`：
 #     **找不到的程序**也是完整路径（fork 成功 → exec 失败 → 子进程 exit(127) → 父进程拿到退出码）；
+#     （v0.9 第五步起不能再用 `ls` 当负例 —— `/bin/ls` 已经存在，这里改用 `foo`）
 #   - `user: frames free before=… after=…`：父进程 + 所有子进程的帧**全部归还**（没有地址空间泄漏）。
 #
 # 注意 PID 用**反向引用**断言而不是常数：syscall 手测里 `/bin/sh` 固定是 PID 3，但 fork
@@ -435,29 +471,89 @@ test-proc: image
 		--ready-marker "user: program=/bin/sh" \
 		--key h --key e --key l --key l --key o --key spc \
 		--key w --key o --key r --key l --key d --key ret \
-		--key l --key s --key ret \
+		--key f --key o --key o --key ret \
 		--key e --key x --key i --key t --key ret \
 		--expect "user: program=/bin/sh source=elf" \
 		--expect "hello-bin: Hello from an external program!" \
-		--expect "sh: exec /bin/ls failed errno=-2" \
+		--expect "sh: exec /bin/foo failed errno=-2" \
 		--expect "sh: hello: exit code=1" \
-		--expect "sh: ls: exit code=127" \
+		--expect "sh: foo: exit code=127" \
 		--expect "sh: bye" \
 		--expect "user: heap frame reclamation PASS" \
 		--expect "user: selftest PASS" \
 		--expect-re "user: fork parent=3 -> child pid=([0-9]+) image_pages=7.*?user: run child pid=\1 name=fork-child.*?sh: child pid=\1 exec /bin/hello \(argc=2\).*?user: exec pid=\1 path=/bin/hello segments=4 image_pages=5 entry=0x8000000000.*?hello-bin: pid=\1.*?user: reaped pid=\1 exit=1" \
 		--expect-re "hello-bin: argc=2.*?hello-bin: argv\[0\]=hello.*?hello-bin: argv\[1\]=world" \
-		--expect-re "user: run child pid=([0-9]+) name=fork-child.*?user: exec /bin/ls -> ENOENT \(no such program\).*?user: reaped pid=\1 exit=127" \
+		--expect-re "user: run child pid=([0-9]+) name=fork-child.*?user: exec /bin/foo -> ENOENT \(no such program\).*?user: reaped pid=\1 exit=127" \
 		--expect-re "user: frames free before=([0-9]+) after=\1"
 
-# v0.7 用户态脚手架：单独构建 libc + user/hello（内核构建时会自动重建同一程序，
+# v0.9 第五步验收：**基础用户程序**（`/bin/ls`、`/bin/ps`、`/bin/cat`、`/bin/echo`）——
+# 全部从 Shell 交互触发，走 `fork` + `execve` + `wait4`，断言的是程序**自己产出的内容**
+# 与「它们各自用到的内核能力真的通了」：
+#   - `user: getdents path=/ entries=4 returned=4` + `ls: / entries=4`：
+#     `ls` 读的是 **VFS 的目录项**（v0.7 起只有内核自测用过 `list()`）；
+#   - `ls: /bin entries=6`：`/bin` 里恰好是这次构建写进去的 6 个程序
+#     （sh / hello / ls / cat / echo / ps）—— 同时证明 `fs::init` 的清单是完整的；
+#   - `user: getprocs count=2` + `ps: pid=3 ppid=0 state=RUNNING comm=sh`：
+#     `ps` 读的是**内核进程表**（本轮新增的 `getprocs`）：表里恰好是 Shell 与 ps 自己，
+#     且 `ppid` 指回 Shell —— 这正是 `fork` 建出来的父子关系；
+#   - `user: exec pid=N path=/bin/{ls,ps,echo,cat}`：四个程序都是真的被 `execve` 起来的；
+#   - `cat: /etc/motd bytes=23`：`/bin/cat` 走 open/read/write/close 读到内核提供的文件；
+#   - `echo program works` + `sh: /bin/echo: exit code=0`：`argv` 经内核写入新进程用户栈，
+#     程序原样打印（`/bin/echo` 是程序，裸 `echo` 是内建命令 —— 见 user/shell 的帮助）。
+#
+# 注意 `cat`/`echo` 用的是**绝对路径**：内建命令会遮蔽裸命令名（与真实 shell 一致），
+# 因此要跑程序本身必须写 `/bin/<name>`（而 `ls`/`ps` 没有内建版本，裸名字就是程序）。
+test-programs: image
+	$(PYTHON) tests/test_keyboard.py \
+		--disk $(BUILD)/disk.img \
+		--serial-log $(BUILD)/serial-programs.log \
+		--ready-marker "user: program=/bin/sh" \
+		--key l --key s --key ret \
+		--key l --key s --key spc --key slash --key b --key i --key n --key ret \
+		--key p --key s --key ret \
+		--key slash --key b --key i --key n --key slash --key e --key c --key h --key o \
+		--key spc --key e --key c --key h --key o --key spc --key p --key r --key o \
+		--key g --key r --key a --key m --key spc --key w --key o --key r --key k --key s \
+		--key ret \
+		--key slash --key b --key i --key n --key slash --key c --key a --key t \
+		--key spc --key slash --key e --key t --key c --key slash --key m --key o \
+		--key t --key d --key ret \
+		--expect "user: program=/bin/sh source=elf" \
+		--expect "user: getdents path=/ entries=4 returned=4" \
+		--expect "ls: / entries=4" \
+		--expect "ls: entry name=init kind=file size=" \
+		--expect "ls: entry name=bin kind=dir size=0" \
+		--expect "ls: /bin entries=6" \
+		--expect "ls: entry name=ls kind=file size=" \
+		--expect "user: getprocs count=2" \
+		--expect "ps: pid ppid state comm" \
+		--expect "ps: pid=3 ppid=0 state=RUNNING comm=sh" \
+		--expect "ps: 2 process(es)" \
+		--expect "cat: /etc/motd bytes=23" \
+		--expect "echo program works" \
+		--expect "sh: ls: exit code=0" \
+		--expect "sh: ps: exit code=0" \
+		--expect "sh: /bin/echo: exit code=0" \
+		--expect "sh: /bin/cat: exit code=0" \
+		--expect-re "user: exec pid=([0-9]+) path=/bin/ls segments=[0-9]+ image_pages=[0-9]+ entry=0x8000000000" \
+		--expect-re "user: exec pid=([0-9]+) path=/bin/ps segments=[0-9]+ image_pages=[0-9]+ entry=0x8000000000" \
+		--expect-re "user: exec pid=([0-9]+) path=/bin/echo segments=[0-9]+ image_pages=[0-9]+ entry=0x8000000000.*?echo program works" \
+		--expect-re "user: exec pid=([0-9]+) path=/bin/cat segments=[0-9]+ image_pages=[0-9]+ entry=0x8000000000.*?motd: hello from ramfs.*?cat: /etc/motd bytes=23" \
+		--expect-re "user: getprocs count=2.*?ps: pid=([0-9]+) ppid=3 state=RUNNING comm=ps"
+
+# v0.7 用户态脚手架：单独构建 libc + user/*（内核构建时会自动重建同一批程序，
 # 这个目标用于在不启动 QEMU 的情况下验证脚手架可编译、可链接、**段布局合法**）。
 user:
 	RUSTFLAGS="$(USER_RUSTFLAGS)" $(CARGO) build -p user-hello -p user-shell -p user-hello-bin \
+		-p user-ls -p user-cat -p user-echo -p user-ps \
 		--target x86_64-unknown-none --profile $(USER_PROFILE) --target-dir $(BUILD)/user
 	@$(PYTHON) tools/check_user_elf.py $(USER_ELF)
 	@$(PYTHON) tools/check_user_elf.py $(USER_SHELL_ELF)
 	@$(PYTHON) tools/check_user_elf.py $(USER_HELLO_BIN_ELF)
+	@$(PYTHON) tools/check_user_elf.py $(USER_LS_ELF)
+	@$(PYTHON) tools/check_user_elf.py $(USER_CAT_ELF)
+	@$(PYTHON) tools/check_user_elf.py $(USER_ECHO_ELF)
+	@$(PYTHON) tools/check_user_elf.py $(USER_PS_ELF)
 
 # H-06 P0a 验收：CKC 包容器（后缀 `.ckc`）。**主机侧、不启 QEMU、纯标准库**：
 #
@@ -475,7 +571,7 @@ test-pkg:
 go-test:
 	cd tools-go && $(GO) vet ./... && $(GO) test ./...
 
-# v0.4 H-04 验收：Go 编排器并行跑全部 10 个集成测试场景 + 串口日志二次复核。
+# v0.4 H-04 验收：Go 编排器并行跑全部 14 个集成测试场景 + 串口日志二次复核。
 # 磁盘镜像先构建（默认/异常注入/页错误 + FAT 测试盘），随后场景并行执行；
 # 每个场景独占 OVMF_VARS 副本、串口日志与 monitor socket（见 tests/orchestrate.json）。
 test-orch: image image-exception image-pagefault fat-image

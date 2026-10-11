@@ -22,7 +22,11 @@
   同日**第三步：进程对象 + `fork`/`execve`/`wait4`** —— 每进程地址空间 + 每进程 64 KiB 内核栈
   （栈底哨兵）+ 停在 syscall 里的完整用户帧；Shell 的外部命令真的跑起来了
   （`/bin/hello`，新增 `make test-proc`，8 项 + 4 条正则）；
-  `make test-user` 由 32 项增至 **61 项**；`argc/argv` 一并可用；动态链接/网络仍为占位
+  `make test-user` 由 32 项增至 **61 项**；`argc/argv` 一并可用；
+  同日**第四步：简化网络栈**（virtio-net + Ethernet → ARP → IPv4 → UDP，ARP 解析网关 + DHCP 往返，
+  `make test-network` 13 项）；同日**第五步：基础用户程序（`ls`/`cat`/`echo`/`ps`）** —— 新增
+  `getdents`（目录枚举）与 `getprocs`（进程表快照，Cerlesse 扩展号段 256），`/bin` 下四个程序全部可跑
+  （`make test-programs`，17 项 + 5 条正则）；动态链接仍为占位
 - 关联文档：[docs/architecture.md](docs/architecture.md) · [docs/roadmap.md](docs/roadmap.md) · [docs/project-structure.md](docs/project-structure.md) · [docs/drivers.md](docs/drivers.md) · [docs/syscall.md](docs/syscall.md) · [docs/filesystem.md](docs/filesystem.md) · [docs/process.md](docs/process.md)
 
 ---
@@ -117,8 +121,9 @@ lto = false
 - `boot`：UEFI 引导 crate，目标 `x86_64-unknown-uefi`；与内核边界调用必须 `extern "sysv64"`（ADR-006）。
 - `libc`：最小用户态运行时（syscall 封装 + `_start` + `print!/println!`，v0.6 起加入 workspace）。
 - `user/*`：`no_std` 用户态程序，产出静态 ELF（v0.6 起加入 workspace）；
-  当前 `user/hello`（→ RAMFS `/init`）与 `user/shell`（→ RAMFS `/bin/sh`）为可运行的真实程序，
-  `init/ls/cat/echo/ps` 仍是 v0.9 占位（`cat` 先以 Shell 内建命令形式落地）。
+  当前 `user/hello`（→ RAMFS `/init`）、`user/shell`（→ `/bin/sh`）、`user/hello-bin`（→ `/bin/hello`）
+  与 `user/{ls,cat,echo,ps}`（→ `/bin/*`，v0.9 第五步）均为可运行的真实程序；
+  `user/init` 仍是占位（内核实际跑的 `/init` 是 `user/hello` 的构建产物）。
 - `tools/`（Python）与 `tools-go/`（Go）**不进 Cargo workspace**，各自独立管理。
 - 交叉编译在 Linux 与 Windows 主机上均通过 `rustup target add` 相同目标完成（见 docs/boot.md）。
 
@@ -398,11 +403,36 @@ v0.6 踩坑记录（已修复，建议保留）：
     - [x] 验收：新增 `make test-proc`（**8 项 + 4 条正则**；`--expect-re` 用反向引用断言
           fork/execve/wait4 三处 PID 相同、并断言 `frames free before=N after=N` 无页帧泄漏）；
           编排新增 `proc` 场景（11 → **12 场景**）；`make test-shell` 12 → 11 项
+- [x] **运行时前置条件第四步：简化网络栈**（2026-10-11 落地）
+    - [x] `driver/net.rs`：网络设备抽象 `NetworkDevice`（以太网帧收发）+ 注册表
+    - [x] `driver/virtio_net.rs`：legacy virtio-net 0.9.5（RX/TX 双队列、10 字节 virtio-net 头、
+          MAC 读自设备配置空间、同步轮询；modern 明确拒绝）
+    - [x] `network/{ethernet,arp,ipv4,udp,dhcp}.rs`：Ethernet II → ARP（带 IP→MAC 缓存）→
+          IPv4（互联网校验和）→ UDP（伪头校验和）的纯函数组帧/解析
+    - [x] `network/mod.rs`：`Stack`（设备 + 地址 + ARP 缓存）+ `selftest`（ARP 解析网关 + DHCP DISCOVER → OFFER）
+    - [x] `main.rs`：磁盘验收后跑网络自测，**无网卡时打印一行并跳过**（不把「没有网卡」当失败）
+    - [x] 验收：新增 `make test-network`（**13 项**，QEMU 加 legacy virtio-net-pci + `-netdev user`）；
+          编排新增 `network` 场景（12 → **13 场景**）；`tests/test_boot.py` 增 `--nic`
+- [x] **运行时前置条件第五步：基础用户程序（`ls`/`cat`/`echo`/`ps`）**（2026-10-11 落地）
+    - [x] `syscall/dir.rs`：`getdents`（号 78）—— VFS `list()` → 定长 88 字节记录（`kind`/`size`/`name_len`/`name`）
+          写进用户缓冲；装不下就**截断**（每条完整），缓冲小于一条记录返回 `-EINVAL`
+    - [x] `syscall/process.rs::sys_getprocs`（号 **256**）—— 定长 40 字节记录（`pid`/`ppid`/`state`/`comm`），
+          按**槽位顺序**枚举；`syscall_table.rs` 由此确立「`0..=255` Linux 语义 / `>= 256` Cerlesse 扩展」并改 `SYS_MAX` 257
+    - [x] `process/process.rs`：新增定长 `comm: [u8; 16]`（`create` 填充调试名，`execve` 成功后改写为程序名 ——
+          否则 `ps` 看到的永远是 `"exec"`）；顶层程序运行前置为 `RUNNING`
+    - [x] `libc`：`getdents`/`getprocs` 封装 + `dirent_name`/`dirent_is_dir`/`dirent_size` 与
+          `procinfo_pid`/`procinfo_ppid`/`procinfo_state`/`procinfo_name` 解析器（偏移只有内核侧一个权威定义）
+    - [x] `user/{ls,cat,echo,ps}` → RAMFS `/bin/*`（`kernel/build.rs`、workspace、`fs::init` 清单 3 → 7）；
+          Shell 帮助文本同步，并说明「内建命令遮蔽同名程序」（`cat`/`echo` 要走程序得写 `/bin/...`）
+    - [x] 验收：新增 `make test-programs`（**17 项 + 5 条正则**，QEMU monitor 注入
+          `ls` / `ls /bin` / `ps` / `/bin/echo …` / `/bin/cat /etc/motd`）；编排新增 `programs` 场景（13 → **14 场景**）；
+          `make test-proc` 的“找不到的程序”负例由 `ls` 改为 `foo`
 - [ ] 动态链接（`PT_INTERP`/`ld.so`）与 `mprotect`（W^X 转换）；文件映射（`mmap` 加 offset）
-- [ ] 其余用户程序（ls/cp/mv/rm/mkdir/ps/kill）与 Shell 增强（`cd`、管道、重定向）
-- [ ] 简化网络：virtio-net → Ethernet → ARP → IPv4 → UDP（TCP 尽力）
-- [ ] Socket syscall 最小集
-- [x] 验收：Shell 能启动外部程序（`make test-proc`，2026-10-11）；ping/HTTP 简例仍待网络落地
+- [ ] 其余用户程序（cp/mv/rm/mkdir/kill）与 Shell 增强（`cd`、管道、重定向）
+      （`ls`/`ps`/`cat`/`echo` 已于 2026-10-11 落地，见上）
+- [ ] TCP（尽力）/ ICMP 与 Socket syscall 最小集（`network/{tcp,socket}.rs` 仍为占位）
+- [x] 验收：Shell 能启动外部程序（`make test-proc`，2026-10-11）；基础用户程序可跑（`make test-programs`，2026-10-11）；
+     网络最小闭环（`make test-network`，2026-10-11）；动态链接与 ping/HTTP 简例仍待落地
 
 ### v1.0 — 完整可启动类 Linux 小型 OS
 - [ ] 用户/组/权限（`-rwxr-xr-x`、UID/GID）
@@ -494,6 +524,8 @@ qemu-system-x86_64 -machine q35 -m 512M -serial stdio -display none \
 | 2026-10-11 | **v0.8 前半落地（驱动框架 + PCI + 块设备）**：新增 `driver/driver.rs`（`Driver` trait + 注册表 + `probe_all` + `ProbeStats`）、`driver/pci.rs`（配置机制 #1 + BAR 探测/窗口大小）、`driver/block.rs`（`BlockDevice` + 注册表 + 验收自测）、`driver/virtio_blk.rs`（legacy virtio 0.9.5：virtqueue/描述符链/轮询/bounce buffer）、`arch/x86_64/port.rs`（端口 I/O 32 位入口）、`frame::allocate_contiguous`（DMA/virtqueue 前置）；启动盘改为 **virtio-blk（`disable-modern=on`）**，`main.rs` 在 `Kernel started!` 后接入「枚举 → 注册 → 探测/挂接 → 块设备自测」；新增 `make test-driver`（22 项）与编排场景 `driver`（**9 场景**，127.2s 全 PASS），全量回归 PASS（含非 snapshot 启动后镜像 md5 不变，验证写测试真的还原了扇区）；修 B-16（BAR 大小 32→64 位宽错误 → I/O BAR 尺寸报错）、B-17（`lba + sectors` 环绕 → 越界请求漏拦）；同步 docs/drivers.md（v0.8 实现记录 + 设计取舍 + 限制） |
 | 2026-10-11 | **v0.8 收官（磁盘文件系统 + `mkfs`）**：`fs/fat.rs`（FAT12/16/32 只读：BPB 按簇数定类型、固定根目录区/簇链目录、8.3 + NT 标志 + LFN 校验和、偏移读、`EROFS`/`EUCLEAN`）挂到 VFS（`fs::mount_disks` → `/disk` 启动盘、`/mnt/fat` 测试盘，验证最长前缀路由）；`FileSystem` trait 改为 `&mut self` + `read_all -> Vec<u8>`；新增 `vfs::is_mount_point` 并修「单盘启动误判 `/mnt/fat` 已挂 → 启动被 halt」；`tools/mkfs/mkfs.py`（H-03）自己生成 FAT12/16/32 镜像并由 mtools 独立复核，`tests/fatroot/` 提供测试盘内容与复核说明；`tests/test_boot.py` 新增 `--disk2`；新增 `make fat-image` / `make test-fat`（**21 项**，双盘启动）与编排场景 `fat`（**10 场景**，150.7s 全 PASS）；全量回归 PASS（`test-driver` 22 项 / `test-fs` 19 项 / `test-user` 32 项 / `make go-test`）；同步 filesystem.md（第 3 节由计划改写为实现记录）、drivers.md、roadmap/README/project-structure/tools README |
 | 2026-10-11 | **H-06 P0a 落地：`.ckc` 包容器（CKC）** —— 内核包后缀定为 **`.ckc`**（Cerlesse Kernel Container），64 字节头 + 确定性 ustar payload（身份 = payload 的 SHA-256）；新增 `tools/pkgmgr/ckc.py`（纯标准库 `pack`/`verify`/`info`，含 `PKG.toml` 子集解析、scope 白名单、setuid/hooks/超长路径等打包期规则）与验收 `tests/test_ckc.py`（新增 `make test-pkg`，**37 项**，含系统 `tar` 独立复核）；docs/package-manager.md 3.2 由「`.cpk` 裸 tar 设想」改写为容器规格，11.1 拆成 P0a（已落地）/P0b（事务/catalog/receipt）；同步 docs/README.md 索引、tools/README.md、project-structure.md、README.md |
+| 2026-10-11 | **v0.9 第四步：简化网络栈（virtio-net → Ethernet → ARP → IPv4 → UDP）** —— 新增 `driver/net.rs`（`NetworkDevice` + 注册表）、`driver/virtio_net.rs`（legacy virtio-net 0.9.5：RX/TX 双队列、10 字节 virtio-net 头、MAC 读自设备配置空间、同步轮询）、`network/{ethernet,arp,ipv4,udp,dhcp}.rs` 与 `network/mod.rs`（`Stack` + `selftest`）；`network/{tcp,socket}.rs` 占位说明更新；`driver::register_builtin` 追加 virtio-net、`main.rs` 在磁盘验收后接入网络自测（**无网卡时跳过**）；新增 `make test-network`（**13 项**，QEMU 加 legacy virtio-net-pci + `-netdev user` = slirp，主机侧不用跑任何服务）与编排场景 `network`（12 → **13 场景**）；`tests/test_boot.py` 增 `--nic`；全量回归 PASS（boot/ memory/ driver 22/ fs 20/ user 61/ shell 11/ proc 8+4/ scheduler/ ipc/ keyboard/ fat 21/ exception/ pagefault 均通过）；同步 docs/drivers.md（新增 1.8 节 + 驱动列表/限制/状态行）、docs/roadmap.md、README.md |
+| 2026-10-11 | **v0.9 第五步：基础用户程序（`ls`/`cat`/`echo`/`ps`）与目录/进程枚举** —— 新增 `syscall/dir.rs`（`getdents`：VFS `list()` → 定长 88 字节记录；号 78 沿用 Linux 但格式不同；截断语义）与 `syscall/process.rs::sys_getprocs`（定长 40 字节记录；号 **256**）；`syscall_table.rs` 确立「`0..=255` Linux 语义 / `>= 256` Cerlesse 扩展」并改 `SYS_MAX` 256 → 257；`process/process.rs` 新增定长 `comm`（`execve` 改写为程序名）；`libc` 新增 `getdents`/`getprocs` + `dirent_*`/`procinfo_*` 解析器；新增 `user/{ls,cat,echo,ps}` → RAMFS `/bin/*`（`kernel/build.rs`/workspace/`fs::init` 清单 3 → 7），Shell 帮助文本同步；新增 `make test-programs`（**17 项 + 5 条正则**）与编排场景 `programs`（13 → **14 场景**）；`make test-proc` 的负例由 `ls` 改 `foo`；`make user` 改为构建/校验 7 个用户程序；全量回归 PASS（test / fs 20 / user 61 / shell 11 / proc 8+4 / programs 17+5 / memory / keyboard / scheduler / ipc / driver 22 / fat 21 / network 13 / exception / pagefault / `make test-pkg` 37 / `make go-test`） |
 | 2026-10-11 | **v0.9 第三步：进程对象 + `fork`/`execve`/`wait4`** —— `process/process.rs` 换成真正的 PCB（地址空间 / 用户帧 / 每进程 64 KiB 内核栈 + 栈底哨兵 / `return_to` / `Ready\|Running\|Zombie`）；新增 `kernel/src/syscall/process.rs`（fork 复制地址空间与当前帧、execve 换映像并重建 argv 用户栈、wait4 延迟调度 + 回收）；`trampoline` 改为按进程切 CR3/`TSS.RSP0`/syscall 栈顶/当前进程下标； `libc` 新增 `args`（入口寄存器 ABI）并去掉 `fork`/`execve`/`wait4` 的 ENOSYS 说法；新增外部程序 `user/hello-bin` → RAMFS `/bin/hello`，Shell 的 `cmd_external` 改走 `fork`+`execve`+`wait4`；`tests/test_keyboard.py` 新增 `--expect-re`（正则 + 反向引用）；新增 `make test-proc`（8 项 + 4 正则）并加入 `test-all`，编排场景 11 → **12**（新增 `proc`）；`make test-shell` 12 → 11 项；记录两条踩坑（debug 构建下 16 KiB 内核栈静默溢出踩坏 `.bss` 帧分配器；子进程退出时必须先恢复父进程 CR3 再 Drop 地址空间）；同步 syscall/process/libc-README/project-structure/roadmap/README |
 | 2026-10-11 | **v0.9 第二步：交互式 Shell 与 `stdin`** —— 键盘行缓冲（128 字节 + 行编辑，回显由 `KB <字符>` 改为终端式原样回显，`kbd: line ready len=N`）、`read(0)` 行缓冲语义（3 秒 `-EAGAIN`）、新增 `user/shell`（提示符 `root@cerlesse C:>`、内建 `help`/`echo`/`cat`/`pid`/`exit`、外部命令真调 `fork()`）、`kernel/build.rs` 改为多用户程序构建（`/init` + `/bin/sh`）、`syscall/mod.rs` 对已命名未实现的号打印 `syscall: ENOSYS nr=… name=…`；新增 `make test-shell`（12 项）与编排 `shell` 场景（11 场景）；`make test-user` 59 → **61 项**，`test-fs` 根目录 3 → 4；同步 syscall/drivers/process/project-structure/roadmap/README |
 | 2026-10-11 | **v0.9 第一步：用户堆**（运行时前置条件）—— 新增 `kernel/src/syscall/memory.rs`（`mmap`/`munmap`/`brk`：W^X、`MAP_*`/`PROT_*` 白名单、5 参数无 offset 的取舍、逐条错误码）、`address_space.rs` 新增 brk 窗口（256 KiB）与匿名 mmap 窗口（256 KiB，first-fit，清页表项时 `invlpg`）、`libc/heap.rs`（`#[global_allocator]`，bump over mmap）与 `brk/mmap/munmap` 封装、`user/hello` 堆自测、`user.rs` 页帧泄漏检查；`make test-user` 断言 32 → **59 项**，`orchestrate.json` 的 `user` 场景同步；全量回归 PASS（`test-fs` 19 / `test-driver` 22 / `test-fat` 21 / `make go-test` / `make test-orch` 10 场景） |

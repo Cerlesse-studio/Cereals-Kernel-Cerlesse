@@ -220,3 +220,40 @@ for i in 0..argc() {
 **与 Linux 的调度差异**（刻意，且对调用方透明）：单 CPU、用户态无抢占，`fork` 之后
 子进程**不会立刻运行**，它要等父进程 `wait4` 时才被恢复 —— 也就是「父进程在等的时候，
 子进程在跑」。因此 `fork`/`execve`/`wait4` 的标准写法不需要为这个内核改写。
+
+## 8. 目录与进程表枚举（v0.9 第五步）
+
+两个「读内核表」的调用。它们都往**调用方提供的缓冲**里写**定长记录**，并返回写入的
+记录数（装不下就截断，每条都完整）；偏移不要自己算 —— 本层提供解析器，
+权威定义在内核侧（`syscall/dir.rs` 与 `syscall/process.rs` 的模块文档）。
+
+| 调用 | 记录 | 解析器 |
+| ---- | ---- | ---- |
+| `getdents(path, buf) -> isize` | 88 字节：`kind`(1) + 保留(7) + `size`(u64) + `name_len`(u16) + 保留(6) + `name`(64) | `dirent_name(buf, i)` / `dirent_is_dir(buf, i)` / `dirent_size(buf, i)` |
+| `getprocs(buf) -> isize` | 40 字节：`pid`(u64) + `ppid`(u64) + `state`(1) + 保留(7) + `comm`(16) | `procinfo_pid(buf, i)` / `procinfo_ppid(buf, i)` / `procinfo_state(buf, i)` / `procinfo_name(buf, i)` |
+
+参考实现是 [user/ls](../user/ls)（列目录）与 [user/ps](../user/ps)（列进程）：
+
+```rust
+use libc::{dirent_is_dir, dirent_name, dirent_size, getdents, println, DIRENT_SIZE};
+
+let mut buf = [0u8; 1024];
+let n = getdents("/", &mut buf);
+if n < 0 {
+    println!("ls: errno {}", n);
+} else {
+    for i in 0..n as usize {
+        let kind = if dirent_is_dir(&buf, i) { "dir" } else { "file" };
+        println!("{} {} {}", dirent_name(&buf, i), kind, dirent_size(&buf, i));
+    }
+}
+let _ = DIRENT_SIZE;
+```
+
+注意两件事：
+
+1. 缓冲至少要有**一条记录**那么大，否则内核返回 `-EINVAL`（而不是静默返回 0 ——
+   那会让「缓冲太小」与「空目录」混为一谈）；
+2. `getprocs` 枚举的是**进程表槽位顺序**，不承诺按 PID 排序（`user/ps` 因此不做排序）。
+   `getprocs` 是 **Cerlesse 扩展号段（编号 256）** 的调用：Linux x86_64 没有它
+   （它的 `ps` 读 `/proc`，而本内核的 VFS 还没有虚拟文件）。
