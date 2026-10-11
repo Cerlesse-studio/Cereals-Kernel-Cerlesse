@@ -74,7 +74,13 @@ def main() -> int:
         "-drive", f"if=pflash,format=raw,file={vars_copy}",
         # snapshot=on：磁盘以临时写时复制方式打开，不占用镜像写锁，
         # 多个并行场景可共享同一磁盘镜像（H-04 编排器），且不污染原始镜像。
-        "-drive", f"format=raw,file={disk},snapshot=on",
+        #
+        # v0.8：启动盘挂在 **virtio-blk（legacy）** 上，因为内核里的块驱动就驱动它
+        #（kernel/src/driver/virtio_blk.rs）——「镜像能启动」与「驱动能读写这块盘」
+        # 因此是同一台设备上的同一条路径。disable-modern=on 强制设备暴露 legacy
+        # 接口（vendor 1af4 / device 0x1001 / BAR0 是 I/O 窗口）。
+        "-drive", f"if=none,id=blk0,format=raw,file={disk},snapshot=on",
+        "-device", "virtio-blk-pci,drive=blk0,disable-modern=on",
         "-serial", "stdio",
         "-display", "none",
         "-no-reboot",

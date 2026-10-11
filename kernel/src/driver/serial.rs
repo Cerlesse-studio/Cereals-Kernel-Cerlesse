@@ -57,6 +57,17 @@ pub fn putc(c: u8) {
     }
 }
 
+/// 批量输出 `buf` 的前 `count` 字节，返回实际写出的字节数。
+/// 供 `syscall::file::sys_write` 等需要按长度写出的调用方复用。
+pub fn put_bytes(buf: &[u8], count: usize) -> usize {
+    let mut written = 0;
+    for b in buf.iter().take(count) {
+        putc(*b);
+        written += 1;
+    }
+    written
+}
+
 pub fn print(s: &str) {
     for b in s.bytes() {
         putc(b);
@@ -85,6 +96,19 @@ pub fn print_dec(val: u64) {
     while len > 0 {
         len -= 1;
         putc(buf[len]);
+    }
+}
+
+/// 输出固定位数的十六进制（**无 `0x` 前缀**，高位补 0）。
+///
+/// 用于把 PCI 的 bus/dev/func 打成人类可读的 `00:05.0` 形式：
+/// `print_hex_pad(bus, 2)` / `print_hex_pad(dev, 2)`。`digits` 最大 16
+/// （超过时按 16 处理，与 `u64` 位宽一致）。
+pub fn print_hex_pad(val: u64, digits: usize) {
+    let digits = digits.clamp(1, 16);
+    for i in (0..digits).rev() {
+        let nib = ((val >> (i * 4)) & 0xF) as u8;
+        putc(if nib < 10 { b'0' + nib } else { b'a' + nib - 10 });
     }
 }
 

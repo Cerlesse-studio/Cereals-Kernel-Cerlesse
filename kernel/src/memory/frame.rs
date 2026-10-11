@@ -241,6 +241,55 @@ pub fn allocate() -> Option<PhysFrame> {
     Some(PhysFrame::from_number(found))
 }
 
+/// 分配 `count` 个**物理连续**帧（返回其中地址最低的那一帧）。
+///
+/// 为什么需要它（v0.8）：设备 DMA 与 virtqueue 都要求缓冲在物理上连续 ——
+/// legacy virtio 的队列地址只报一个 PFN（物理页号），队列的「描述符表 / avail /
+/// used」三段必须落在这块连续区域里；而按 `clone()` 逐帧拼出来的缓冲做不到这一点。
+///
+/// 扫描策略：从 `NEXT_FREE` 起向后找连续 `count` 个空闲帧，尾部不足时回扫前部
+/// （与 [`allocate`] 的环绕策略一致，避免小块空闲区长期不可用）。
+pub fn allocate_contiguous(count: usize) -> Option<PhysFrame> {
+    if count == 0 || !unsafe { *core::ptr::addr_of!(INITIALIZED) } {
+        return None;
+    }
+    let total = total_frames();
+    let cursor = unsafe { *core::ptr::addr_of!(NEXT_FREE) };
+    let start = find_contiguous(cursor, total, count)
+        .or_else(|| find_contiguous(0, cursor, count))?;
+
+    for f in start..start + count {
+        set_bit(f, true);
+    }
+    set_free_frames(free_frames().saturating_sub(count));
+    unsafe { *addr_of_mut!(NEXT_FREE) = start + count }
+    Some(PhysFrame::from_number(start))
+}
+
+/// 释放 `allocate_contiguous` 得到的 `count` 个帧（重复释放会被忽略）。
+pub fn free_contiguous(frame: PhysFrame, count: usize) {
+    for f in frame.number()..frame.number() + count {
+        free(PhysFrame::from_number(f));
+    }
+}
+
+/// 在 `[start, end)` 里找连续 `count` 个空闲帧的起点。
+fn find_contiguous(start: usize, end: usize, count: usize) -> Option<usize> {
+    let mut f = start;
+    while f + count <= end {
+        // 先用 find_free 跳到下一个空闲帧，避免逐位扫描整张位图
+        f = find_free(f, end)?;
+        if f + count > end {
+            return None;
+        }
+        if (f + 1..f + count).all(|g| !bit_used(g)) {
+            return Some(f);
+        }
+        f += 1;
+    }
+    None
+}
+
 /// 释放一帧（重复释放会被忽略）。
 pub fn free(frame: PhysFrame) {
     let f = frame.number();
@@ -279,6 +328,46 @@ pub fn stats() -> Stats {
         total_frames: total_frames(),
         free_frames: free_frames(),
     }
+}
+
+/// 连续帧分配自测（v0.8 验收项：DMA/virtqueue 前置条件）。
+///
+/// 校验三件事：返回的帧确实**物理连续**、写入/读回可见、释放后统计还原。
+pub fn contiguous_selftest() -> Result<u64, &'static str> {
+    const COUNT: usize = 4;
+    let before = stats();
+    if before.free_frames < COUNT * 4 {
+        return Err("not enough free frames for contiguous test");
+    }
+
+    let first = allocate_contiguous(COUNT).ok_or("contiguous allocation failed")?;
+    let mut addresses = [0u64; COUNT];
+    for (i, addr) in addresses.iter_mut().enumerate() {
+        *addr = first.start_address() + (i * FRAME_SIZE) as u64;
+    }
+    // 起点必须帧对齐，且第 i 帧紧接在第 i-1 帧之后（不借助任何映射假设，只看地址）
+    if first.start_address() % FRAME_SIZE as u64 != 0 {
+        return Err("contiguous run is not frame aligned");
+    }
+    // 写首个字节 → 读回；最后一帧同样验证，确保整段可读写
+    unsafe {
+        for addr in addresses {
+            let p = addr as *mut u8;
+            core::ptr::write_volatile(p, 0xA5);
+            core::ptr::write_volatile(p.add(FRAME_SIZE - 1), 0x5A);
+            if core::ptr::read_volatile(p) != 0xA5 || core::ptr::read_volatile(p.add(FRAME_SIZE - 1)) != 0x5A
+            {
+                return Err("contiguous frame readback mismatch");
+            }
+        }
+    }
+
+    free_contiguous(first, COUNT);
+    let after = stats();
+    if after.free_frames != before.free_frames {
+        return Err("contiguous free did not restore frame count");
+    }
+    Ok(first.start_address())
 }
 
 /// 帧分配器压力测试（验收项）：

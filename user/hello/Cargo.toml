@@ -1,0 +1,12 @@
+[package]
+name = "user-hello"
+version = "0.1.0"
+edition = "2021"
+description = "v0.6 用户态脚手架的第一个程序：write/getpid/nanosleep/exit 全链路"
+
+[dependencies]
+libc = { path = "../../libc" }
+
+[[bin]]
+name = "user-hello"
+path = "src/main.rs"

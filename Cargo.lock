@@ -17,5 +17,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libc"
+version = "0.1.0"
+
+[[package]]
 name = "shared"
 version = "0.1.0"
+
+[[package]]
+name = "user-hello"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]

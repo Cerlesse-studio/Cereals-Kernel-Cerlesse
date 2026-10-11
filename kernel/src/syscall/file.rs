@@ -1,38 +1,261 @@
-//! 文件类系统调用（v0.6 最小实现）
+//! 文件类系统调用（v0.7 实现：`read` / `write` / `open` / `close`）
 //!
-//! 本阶段仅接入 `write` 的串口后端：`fd=1` 时将用户缓冲拷贝到串口直接打印。
-//! `read / open / close` 保留骨架，返回 `-ENOSYS`。
+//! v0.6 只有「字符设备」意义上的 stdout/stderr（fd=1/2 写串口）。v0.7 把 fd 接到
+//! VFS 上：
 //!
-//! 错误返回：成功返回非负值；失败返回 `-errno`（如 `-ENOSYS` = -38）。
+//! | fd | 含义 |
+//! | ---- | ---- |
+//! | 0 | stdin —— **尚未接通**（键盘行缓冲是 v0.9 的事）：`read` 返回 0（EOF），不让用户程序卡住 |
+//! | 1 / 2 | stdout / stderr —— 写串口（v0.6 行为不变） |
+//! | ≥ 3 | RAMFS 文件（由 [`crate::fs::file`] 的 fd 表管理） |
+//!
+//! 两条贯穿所有 handler 的规则：
+//!
+//! 1. **用户指针先校验再用**。内核不做「尽力而为」的解引用：区间必须落在当前
+//!    用户地址空间的已映射页里（`write`/`open` 要求可读，`read` 要求可写），
+//!    否则返回 `-EFAULT` 并在串口留痕 —— 这正是隔离生效的证据；
+//! 2. **单次 I/O 有上限**（[`IO_MAX`]），避免用户态用一个巨大的 count 让内核
+//!    长时间不返回（也避免内核栈上出现大缓冲）。
 
 use core::slice;
 
-/// 用户地址空间的最小校验：指针越界／超出用户区域时返回 false。
-#[inline]
-pub(crate) fn is_valid_user_ptr(_space: *const crate::syscall::address_space::UserSpace, _addr: u64, _len: usize) -> bool {
-    // v0.6 中用户页表尚未启用，所有用户态地址均认为可访问（后续 v0.7 补全）。
-    true
+use crate::driver::serial;
+use crate::fs::file as fdtable;
+use crate::fs::vfs;
+use crate::syscall::address_space::UserSpace;
+
+/// 单次 `read`/`write` 允许的最大字节数。
+const IO_MAX: u64 = 4096;
+/// 路径长度上限（`open` 的 `len` 参数）。
+const PATH_MAX: u64 = 256;
+
+/// `-EFAULT`：用户传了不属于自己的地址区间。
+const EFAULT: i64 = -14;
+
+/// 校验用户缓冲区间并要求**可读**，转成切片。
+///
+/// # Safety
+/// `buf` 必须来自 ring3，且 `space` 必须是当前生效的用户地址空间。
+unsafe fn user_bytes<'a>(
+    space: *const UserSpace,
+    buf: u64,
+    count: u64,
+    op: &str,
+) -> Result<&'a [u8], i64> {
+    if space.is_null() {
+        return Err(EFAULT);
+    }
+    let space = unsafe { &*space };
+    if !space.valid_user_range(buf, count) {
+        return Err(report_efault(op, buf, count, false));
+    }
+    Ok(unsafe { slice::from_raw_parts(buf as *const u8, count as usize) })
 }
 
-/// 系统调用 `write(fd, buf, count)`：v0.6 最小实现。
-/// fd=1（stdout）时把 `count` 字节从用户缓冲拷贝到串口。
-pub unsafe fn sys_write(args: &[u64; 5], _space: *const crate::syscall::address_space::UserSpace) -> i64 {
+/// 校验用户缓冲区间并要求**可写**，转成可变切片。
+///
+/// # Safety
+/// 同 [`user_bytes`]。
+unsafe fn user_bytes_mut<'a>(
+    space: *const UserSpace,
+    buf: u64,
+    count: u64,
+    op: &str,
+) -> Result<&'a mut [u8], i64> {
+    if space.is_null() {
+        return Err(EFAULT);
+    }
+    let space = unsafe { &*space };
+    if !space.valid_user_write_range(buf, count) {
+        return Err(report_efault(op, buf, count, true));
+    }
+    Ok(unsafe { slice::from_raw_parts_mut(buf as *mut u8, count as usize) })
+}
+
+/// 越界指针的串口留痕（测试断言这条日志，等于断言「内核真的校验了指针」）。
+fn report_efault(op: &str, addr: u64, len: u64, need_write: bool) -> i64 {
+    serial::print("user: EFAULT ");
+    serial::print(op);
+    serial::print(" ptr=");
+    serial::print_hex(addr);
+    serial::print(" len=");
+    serial::print_dec(len);
+    serial::println(if need_write {
+        " (buffer not writable in user space)"
+    } else {
+        " (buffer not readable in user space)"
+    });
+    EFAULT
+}
+
+/// `user: write fd=<n> len=<n>`。
+fn log_write(fd: i32, n: usize) {
+    serial::print("user: write fd=");
+    serial::print_dec(fd as u64);
+    serial::print(" len=");
+    serial::print_dec(n as u64);
+    serial::println("");
+}
+
+/// `user: read fd=<n> want=<n> got=<n>`。
+fn log_read(fd: i32, want: u64, got: usize) {
+    serial::print("user: read fd=");
+    serial::print_dec(fd as u64);
+    serial::print(" want=");
+    serial::print_dec(want);
+    serial::print(" got=");
+    serial::print_dec(got as u64);
+    serial::println("");
+}
+
+/// `user: <op> fd=<n> errno=<n>`。
+fn log_errno(op: &str, fd: i32, err: i64) {
+    serial::print("user: ");
+    serial::print(op);
+    serial::print(" fd=");
+    serial::print_dec(fd as u64);
+    serial::print(" errno=");
+    serial::print_dec(err.unsigned_abs());
+    serial::println("");
+}
+
+/// 系统调用 `read(fd, buf, count)`。
+pub unsafe fn sys_read(args: &[u64; 5], space: *const UserSpace) -> i64 {
     let fd = args[0] as i32;
     let buf = args[1];
-    let count = args[2] as usize;
+    let count = args[2];
 
-    if fd != 1 {
-        return -3; // -EBADF（v0.6 未实现其他 fd）
+    if count > IO_MAX {
+        return vfs::EINVAL;
     }
     if count == 0 {
         return 0;
     }
-    if !is_valid_user_ptr(_space, buf, count) {
-        return -14; // -EFAULT
+    if fd == 0 {
+        // stdin 未接通：返回 0（EOF）而不是错误，让 `cat` 之类的循环自然结束
+        serial::println("user: read fd=0 got=0 (stdin not connected)");
+        return 0;
+    }
+    if fd < 3 {
+        // fd 1/2 是只写串口设备（读它们返回 EBADF，而不是「读到空」）
+        log_errno("read", fd, vfs::EBADF);
+        return vfs::EBADF;
     }
 
-    // 直接写到串口；若串口初始化未完成则返回 0。
-    let _bytes = slice::from_raw_parts(buf as *const u8, count);
-    crate::driver::serial::put_bytes(_bytes, count);
-    count as i64
+    let dst = match unsafe { user_bytes_mut(space, buf, count, "read") } {
+        Ok(dst) => dst,
+        Err(errno) => return errno,
+    };
+    match fdtable::read(fd, dst) {
+        Ok(n) => {
+            log_read(fd, count, n);
+            n as i64
+        }
+        Err(errno) => {
+            log_errno("read", fd, errno);
+            errno
+        }
+    }
+}
+
+/// 系统调用 `write(fd, buf, count)`。
+pub unsafe fn sys_write(args: &[u64; 5], space: *const UserSpace) -> i64 {
+    let fd = args[0] as i32;
+    let buf = args[1];
+    let count = args[2];
+
+    if count > IO_MAX {
+        return vfs::EINVAL;
+    }
+    if count == 0 {
+        return 0;
+    }
+
+    let bytes = match unsafe { user_bytes(space, buf, count, "write") } {
+        Ok(bytes) => bytes,
+        Err(errno) => return errno,
+    };
+
+    if fd == 1 || fd == 2 {
+        let written = serial::put_bytes(bytes, bytes.len());
+        log_write(fd, written);
+        return written as i64;
+    }
+    if fd < 3 {
+        log_errno("write", fd, vfs::EBADF);
+        return vfs::EBADF;
+    }
+    match fdtable::write(fd, bytes) {
+        Ok(n) => {
+            log_write(fd, n);
+            n as i64
+        }
+        Err(errno) => {
+            log_errno("write", fd, errno);
+            errno
+        }
+    }
+}
+
+/// 系统调用 `open(path, len, flags)`：按路径打开文件并分配 fd。
+///
+/// 参数里带长度而不是要求 NUL 结尾：用户缓冲已经被内核校验过区间，
+/// 用长度就不需要在用户内存里找终止符（少一次不可信内存上的扫描）。
+pub unsafe fn sys_open(args: &[u64; 5], space: *const UserSpace) -> i64 {
+    let ptr = args[0];
+    let len = args[1];
+    let flags = args[2] as i32;
+
+    if len == 0 || len > PATH_MAX {
+        return vfs::EINVAL;
+    }
+    let bytes = match unsafe { user_bytes(space, ptr, len, "open") } {
+        Ok(bytes) => bytes,
+        Err(errno) => return errno,
+    };
+    let path = match core::str::from_utf8(bytes) {
+        Ok(path) => path,
+        Err(_) => {
+            serial::println("user: open rejected (path not utf-8)");
+            return vfs::EINVAL;
+        }
+    };
+
+    match fdtable::open(path, flags) {
+        Ok(fd) => {
+            serial::print("user: open path=");
+            serial::print(path);
+            serial::print(" flags=");
+            serial::print_hex(flags as u64);
+            serial::print(" fd=");
+            serial::print_dec(fd as u64);
+            serial::println("");
+            fd as i64
+        }
+        Err(errno) => {
+            serial::print("user: open path=");
+            serial::print(path);
+            serial::print(" errno=");
+            serial::print_dec(errno.unsigned_abs());
+            serial::println("");
+            errno
+        }
+    }
+}
+
+/// 系统调用 `close(fd)`：释放 fd 槽位。
+pub unsafe fn sys_close(args: &[u64; 5], _space: *const UserSpace) -> i64 {
+    let fd = args[0] as i32;
+    match fdtable::close(fd) {
+        Ok(()) => {
+            serial::print("user: close fd=");
+            serial::print_dec(fd as u64);
+            serial::println("");
+            0
+        }
+        Err(errno) => {
+            log_errno("close", fd, errno);
+            errno
+        }
+    }
 }

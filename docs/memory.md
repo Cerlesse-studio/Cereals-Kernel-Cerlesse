@@ -2,7 +2,7 @@
 
 - 阶段：第三阶段（v0.3）
 - 最后更新：2026-10-08
-- 状态：✅ v0.3 已完成（2026-10-07 QEMU 验收通过；2026-10-08 本次 docs 迭代统一元信息与修订记录）
+- 状态：✅ v0.3 已完成（2026-10-07 验收通过）；v0.8 在其上追加了连续帧分配（DMA/virtqueue 前置，见 2.2）
 
 > 本文档顶部已含阶段/最后更新/状态字段，与项目文档维护约定对齐。
 - 依赖：boot.md（需要 BootInfo 内存映射）
@@ -36,6 +36,18 @@ v0.3 内核继续运行在 bootloader/固件建立的恒等映射上（`phys == 
 - BootServicesCode/Data 等类型**保守保留**：ExitBootServices 后它们其实可回收，但第一版先保证正确性。
 - 分配：自游标向后扫描（整字节 `0xFF` 直接跳过）；尾部耗尽后回头扫描前部；释放后游标可取回，便于复用。
 - 实测（QEMU `-m 512M`）：total = 130801 帧、free ≈ 119.5k 帧（≈ 466 MiB 可用）。
+
+v0.8 追加（同一个位图，两种粒度）：
+
+- `allocate_contiguous(count)` / `free_contiguous(frame, count)`：分配一段**物理连续**的帧。
+  动机是 DMA/virtqueue —— legacy virtio 的队列地址寄存器只装一个 **PFN**，因此「描述符表 + avail +
+  4 KiB 对齐的 used」三段必须落在同一块连续区域（逐帧 `allocate()` 拼不出来）。
+- 扫描策略与 `allocate()` 一致：从游标向后找连续 `count` 帧，尾部不足时回扫前部；
+  先用 `find_free` 跳到下一个空闲帧再验证连续性，不逐位扫整张位图。
+- 验收：`frame: contiguous PASS (4 frames @ 0x100000)`（写入/读回、释放后计数还原），
+  以及 `make test-driver` 里 virtqueue 真的拿到了 3 页连续区（`queue0 size=256 region=0x100000 (3 pages contiguous)`）。
+- 局限：只保证「连续」，不保证对齐到 `count` 的幂（virtqueue 只需要 4 KiB 对齐，
+  因为 used ring 在队列区内的偏移由驱动自己按 4 KiB 对齐算出来）；也没有 DMA 地址窗口/IOMMU 概念。
 
 ### 2.3 内核堆（ADR-011）
 
@@ -117,3 +129,4 @@ KERNEL PANIC: unhandled exception
 | 2026-10-07 | v0.3 完成：位图帧分配器、页表 Mapper/AddressSpace、内核堆与全局分配器、#PF 诊断；补记 B-06/B-07 |
 | 2026-10-07 | 文档完善：本文件不变更实现内容；补记与 DEVELOPMENT.md 同步的版本/文档完成标记一致性 |
 | 2026-10-08 | 本次 docs 迭代统一文档顶部元信息（阶段 / 最后更新 / 状态）与修订记录，保持与 DEVELOPMENT.md 与索引文档描述一致 |
+| 2026-10-11 | v0.8 追加 `allocate_contiguous` / `free_contiguous`（virtqueue 与 DMA 要求物理连续），补记动机、扫描策略、验收证据与局限 |

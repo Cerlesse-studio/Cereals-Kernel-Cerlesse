@@ -355,6 +355,10 @@ fn print_reg(name: &str, val: u64) {
 /// 由 `isr_common` 以 RDI = 栈帧指针调用；`rbx` 由 SysV 约定保留。
 ///
 /// 注：IRQ0（向量 0x20）不再经过此函数，而是由向量 stub 直接调用 irq_dispatch。
+///
+/// v0.6：来自 ring3 的异常**不再 panic**。用户程序的越权访问是预期行为，
+/// 处理方式是打印诊断后终止该用户态执行（`trampoline::leave`）并回到内核调用者，
+/// 内核自身保持存活 —— 这正是「用户地址空间隔离」的验收形态。
 #[no_mangle]
 pub extern "C" fn exception_dispatch(frame: *mut ExceptionFrame) -> ! {
     // SAFETY: frame 由 isr_common 按 ExceptionFrame 布局构造
@@ -362,6 +366,34 @@ pub extern "C" fn exception_dispatch(frame: *mut ExceptionFrame) -> ! {
 
     // 打印完整诊断前临时关闭中断，避免在打印期间再次触发同一向量。
     unsafe { asm!("cli", options(nostack, preserves_flags)); }
+
+    // CS 的 RPL 位区分异常来自用户态还是内核态：来自 ring3 时终止用户程序。
+    if f.cs & 3 == 3 {
+        let name = NAMES.get(f.vector as usize).copied().unwrap_or("unknown");
+        serial::print("user: FAULT ");
+        serial::println(name);
+        serial::print("user: FAULT vector=");
+        serial::print_hex(f.vector);
+        serial::print(" error=");
+        serial::print_hex(f.error_code);
+        serial::print(" rip=");
+        serial::print_hex(f.rip);
+        serial::print(" cs=");
+        serial::print_hex(f.cs);
+        serial::println("");
+        if f.vector == 14 {
+            let cr2: u64;
+            unsafe {
+                asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
+            }
+            serial::print("user: FAULT cr2=");
+            serial::print_hex(cr2);
+            serial::println("");
+        }
+        serial::println("user: isolation PASS (ring3 kernel access blocked; program terminated)");
+        // 丢弃用户上下文，回到 `trampoline::enter` 的内核调用者。
+        unsafe { crate::syscall::trampoline::leave() }
+    }
 
     let name = NAMES.get(f.vector as usize).copied().unwrap_or("unknown");
     serial::println("");

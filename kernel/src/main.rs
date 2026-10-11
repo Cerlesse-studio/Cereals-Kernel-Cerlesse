@@ -17,6 +17,7 @@ extern crate alloc;
 
 mod arch;
 mod driver;
+mod fs;
 mod interrupt;
 mod ipc;
 mod memory;
@@ -27,18 +28,21 @@ mod time;
 type KernelTaskEntry = extern "C" fn() -> !;
 
 extern "C" fn kernel_task_a() -> ! {
+    driver::serial::println("task_a: entered");
     loop {
         unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)); }
     }
 }
 
 extern "C" fn kernel_task_b() -> ! {
+    driver::serial::println("task_b: entered");
     loop {
         unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)); }
     }
 }
 
 extern "C" fn kernel_task_c() -> ! {
+    driver::serial::println("task_c: entered");
     loop {
         unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)); }
     }
@@ -146,6 +150,20 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
     }
     driver::serial::println("context: switch PASS");
 
+    // v0.7：VFS + RAMFS（RAMFS 用内核堆保存文件内容，因此必须在 memory::init 之后）。
+    // `/init` 的内容是内嵌的用户程序 ELF，`user/hello` 稍后从 VFS 读它并交给 ELF Loader。
+    if let Err(errno) = fs::init(syscall::user::init_image()) {
+        driver::serial::print("fs: FAIL errno=");
+        driver::serial::print_dec(errno.unsigned_abs());
+        driver::serial::println("");
+        halt();
+    }
+    if let Err(err) = fs::selftest() {
+        driver::serial::print("fs: FAIL: ");
+        driver::serial::println(err);
+        halt();
+    }
+
     driver::serial::println("Kernel started!");
 
     // v0.4：观测 IF 状态，确认中断使能路径已接通。
@@ -154,6 +172,76 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
         driver::serial::print("IF=");
         driver::serial::print_dec(if enabled { 1u64 } else { 0u64 });
         driver::serial::println("");
+    }
+
+    // v0.8：PCI 枚举 → 驱动注册 → 探测/挂接 → 块设备验收。
+    //
+    // 位置在 `Kernel started!` 之后、调度器/用户态之前：块设备是 v0.8 磁盘文件系统
+    //（FAT32）的地基，而它与调度器、用户态都没有相互依赖 —— 放在这里失败原因也最好定位。
+    //
+    // 启动盘本身就是这块 virtio-blk（见 Makefile / tests/*.py 的 QEMU 命令行），
+    // 所以「内核能启动」与「驱动能读写这块盘」验证的是同一台设备，不是两条并行路径。
+    {
+        let devices = driver::pci::init();
+        driver::serial::print("pci: enumerated devices=");
+        driver::serial::print_dec(devices as u64);
+        driver::serial::println("");
+
+        // 启动盘所在的 legacy virtio-blk 必须出现在总线上（否则后面的探测没什么可挂）。
+        let Some(blk) = driver::pci::find_by_id(
+            driver::virtio_blk::VIRTIO_VENDOR,
+            driver::virtio_blk::VIRTIO_BLK_LEGACY,
+        ) else {
+            driver::serial::println("pci: FAIL: no legacy virtio-blk device on the bus");
+            halt();
+        };
+        let (bus, device, function) = blk.location();
+        driver::serial::print("pci: virtio-blk (legacy) at ");
+        driver::pci::print_bdf(bus, device, function);
+        driver::serial::print(" class=");
+        driver::serial::print_hex(blk.class as u64);
+        driver::serial::print(" subclass=");
+        driver::serial::print_hex(blk.subclass as u64);
+        driver::serial::println("");
+
+        if let Err(err) = driver::driver::register_builtin() {
+            driver::serial::print("driver: FAIL: ");
+            driver::serial::println(err);
+            halt();
+        }
+        driver::driver::report();
+
+        let stats = driver::driver::probe_all();
+        let ok = stats.attached > 0 && stats.all_attached();
+        driver::serial::print(if ok {
+            "driver: probe PASS (devices="
+        } else {
+            "driver: probe FAIL (devices="
+        });
+        driver::serial::print_dec(stats.devices as u64);
+        driver::serial::print(" matched=");
+        driver::serial::print_dec(stats.matched as u64);
+        driver::serial::print(" attached=");
+        driver::serial::print_dec(stats.attached as u64);
+        driver::serial::print(" failed=");
+        driver::serial::print_dec(stats.failed as u64);
+        driver::serial::println(")");
+        if !ok {
+            halt();
+        }
+
+        driver::serial::print("block: registered devices=");
+        driver::serial::print_dec(driver::block::count() as u64);
+        driver::serial::println("");
+        let Some(disk) = driver::block::first() else {
+            driver::serial::println("block: FAIL: no block device registered");
+            halt();
+        };
+        if let Err(err) = driver::block::selftest(disk) {
+            driver::serial::print("block: FAIL: ");
+            driver::serial::println(err);
+            halt();
+        }
     }
 
     // v0.2 验收：异常注入测试（feature 门控，默认构建不触发）
@@ -215,41 +303,24 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
     }
     driver::serial::println("pipe: selftest PASS");
 
+    // v0.6：syscall + 用户态隔离验收。
+    //
+    // 进入用户态前必须挂起调度器：用户程序不在调度器任务表里，
+    // 若 PIT 中断在用户态上下文里切到内核任务，那个任务会在
+    // 「用户页表 + 用户栈」的中间状态上恢复执行。
+    {
+        use crate::scheduler::scheduler as sched;
+        sched::suspend();
+        driver::serial::println("sched: suspended for user-mode run");
+    }
+    if let Err(err) = syscall::user::selftest() {
+        driver::serial::print("user: FAIL: ");
+        driver::serial::println(err);
+        halt();
+    }
+
     // 之后的执行由调度器接管：每个任务在 hlt 中等待下一个时间片。
     halt()
-}
-
-#[no_mangle]
-pub extern "C" fn UserMain() -> ! {
-    // 用户态入口。首次进入时，`r8` 包含本线程的一个初始化参数（0x1），
-    // 随后按最小用户态 `start` 的行为：打印一条标记、
-    // 循环调用 `sys_getpid`/`sys_write`/`sys_sleep` 做一次用户态 syscall 回归。
-    // 退出时调用 `sys_exit`，进入调度器回收/空转即可。
-    for i in 0..5u64 {
-        driver::serial::print("user_main: running ");
-        driver::serial::print_dec(i);
-        driver::serial::println(" (pid=1)");
-
-        // 通过 `sys_sleep` 让用户态任务每 100ms 让出一次 CPU。
-        // 这是 v0.6 最小的计时只实现：使用 `time::timer::sleep_1tick()` 模拟 100ms。
-        if i != 4 {
-            // 这里不直接调用内核定时器，而是通过 `sys_sleep(20000)` 走用户态路径。
-            // 若系统调用入口出现故障，返回到 `UserMain` 后继续循环。
-            unsafe {
-                let ret = syscall::sys_sleep([20000, 0, 0, 0, 0], core::ptr::null());
-                let _ = ret;
-            }
-        }
-    }
-
-    // 用户态退出：提交退出请求。
-    // 用户态退出：提交退出请求（永不返回，原型为 `!`，此路径仅语句完成）。
-    unsafe {
-        let _ = syscall::sys_exit([0, 0, 0, 0, 0], core::ptr::null());
-        loop {
-            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
-        }
-    }
 }
 
 pub(crate) fn halt() -> ! {

@@ -229,6 +229,39 @@ pub fn current_root() -> u64 {
     cpu::read_cr3()
 }
 
+/// 读取 `table` 的第 `index` 项原始值。
+///
+/// # Safety
+/// `table` 必须是有效且可访问的 4KiB 对齐页表帧地址，`index < 512`。
+pub unsafe fn read_entry(table: u64, index: usize) -> u64 {
+    let t = unsafe { table_at(table) };
+    t.entries[index].0
+}
+
+/// 写入 `table` 的第 `index` 项。
+///
+/// # Safety
+/// 同 [`read_entry`]；写入会立即改变映射语义。
+pub unsafe fn write_entry(table: u64, index: usize, value: u64) {
+    let t = unsafe { table_at(table) };
+    t.entries[index] = Entry(value);
+}
+
+/// 第 `level` 级页表索引（对外暴露，用户地址空间拼装表项时使用）。
+pub const fn table_index(virt: u64, level: usize) -> usize {
+    index(virt, level)
+}
+
+/// 从页表项原始值中取物理地址。
+pub const fn entry_address(value: u64) -> u64 {
+    value & ADDR_MASK
+}
+
+/// 释放一张页表帧（用户地址空间回收时使用）。
+pub fn free_table(phys: u64) {
+    frame::free(PhysFrame::containing_address(phys));
+}
+
 /// 确保 `[start, end)` 在当前地址空间中存在恒等映射（缺失则按 4 KiB 补齐）。
 /// 内核堆使用：堆帧以物理地址直接访问，必须保证映射存在且为恒等。
 pub fn ensure_identity_range(start: u64, end: u64) -> Result<(), &'static str> {

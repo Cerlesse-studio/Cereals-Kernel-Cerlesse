@@ -6,6 +6,9 @@
 
 ## 当前进度
 
+**v0.8 前半已落地（2026-10-11）**：驱动注册框架 + PCI 枚举 + 块设备（legacy virtio-blk），磁盘后端与 `mkfs` 仍待做。
+**v0.7 已落地（2026-10-11）**：VFS + RAMFS + ELF Loader、文件 syscall（`open`/`read`/`close`），详情见文末。
+
 **v0.4 已完成（2026-10-08）**：中断控制器 + Timer + 键盘 + 上下文切换原语 + 主机侧 Go 工具（H-04/H-05）。
 PIC（8259A）初始化与 IRQ→向量（32..47）映射 → IRQ 分发注册表 → PIT 通道 0 以 **100Hz（10ms/tick）**
 产生 IRQ0 并维护 tick 计数（每 100 tick 打印一次 `IRQ0_heartbeat tick=<n>`）→
@@ -35,7 +38,83 @@ IRQ 路径未保存通用寄存器导致被打断的代码偶发 #GP（B-09）�
 上下文切换未保存 RFLAGS 导致切出中断上下文后 IF 永久为 0（B-10）、
 IRQ 的 EOI 时序错误导致 PIC 停摆（B-11）。
 
-下一步：按 DEVELOPMENT.md 第 5 节顺序继续——进入 v0.6（syscall + 用户空间隔离）。
+**v0.6 核心已落地（2026-10-10）**：syscall 入口 + 用户态（ring3）+ 用户地址空间隔离。
+选定 **`syscall` / `sysret`** 快速路径（`EFER.SCE` + `IA32_STAR/LSTAR/FMASK`，GDT 按 STAR 布局重排），
+入口汇编自行切到**专用系统调用栈**（`syscall` 不切栈），返回用 `sysretq`；
+用户地址空间为**独立 PML4**（用户映射固定在下标 1 = `0x8000000000`，每级页表均置 `USER`，
+代码页只读可执行、栈页可写不可执行），`Drop` 时整棵释放。
+首批 syscall：`write`（串口，先校验用户缓冲指针）/ `getpid` / `nanosleep`（PIT tick 粒度）/ `exit`。
+来自 ring3 的异常按 `cs & 3` 识别后**终止用户程序而非 panic**（内核继续存活），
+这就是隔离的验收形态：越权读内核页 → `vector=0xe error=0x5 cr2=0x2000000` + `user: isolation PASS`。
+进入用户态前挂起调度器并将 `TSS.RSP0` 切到专用陷阱栈（否则 PIT 会在「用户页表 + 用户栈」的中间状态切到内核任务）。
+
+**v0.6 用户态脚手架已可用（2026-10-11）**：用户程序不再需要手写机器码。
+`libc/`（最小用户态运行时）提供 syscall 封装（`write`/`getpid`/`nanosleep`/`exit`）、
+`_start` → 用户 `main` → `exit(main())` 的启动代码、`print!`/`println!`（一次宏调用 = 一次 `write`）
+与 `#[panic_handler]`；`user/hello` 是第一个跑在 ring3 的**真实 Rust 用户程序**（不再内嵌汇编）。
+当时构建链：`kernel/build.rs` 用嵌套 cargo 构建用户程序（large 代码模型 + `user-release` profile），
+解析 ELF、摊平成「从 `USER_VIRT_BASE` 开始的连续映像」并 `include_bytes!` 内嵌；
+`UserSpace::load_program` 按映像大小逐页映射（1..=8 页，`user/hello` 实测 2 页）。
+（**v0.7 已把「摊平内嵌」换成 ELF Loader**，见下一节；`make user` 仍可单独验证脚手架，
+编写新用户程序的约定见 [libc/README.md](libc/README.md)。）
+
+自动化验证（当时）：`make test-user` 19 项串口断言（v0.7 起同一命令增至 **32 项**）PASS；
+`tests/orchestrate.json` 的 `user` 场景同步断言脚手架证据（当时共 7 场景，v0.7 增至 8）。
+
+**v0.7 已落地（2026-10-11）**：VFS + RAMFS + ELF Loader —— 用户程序不再需要手工摊平。
+
+- **VFS**（`kernel/src/fs/`）：`FileSystem` trait（stat/read/read_all/write/create/mkdir/list/usage）+ 路径工具，
+  错误一律负数 errno；**挂载表按最长前缀路由**（`/mnt/*` 落到 `/mnt` 的后端，日志 `fs: route ... fs=ramfs-scratch`）；
+- **RAMFS**（第一个后端）：`Node { name, kind, data: Vec<u8>, children }`，单文件上限 256 KiB；
+  `fs::init` 建立初始文件树 `/init`（用户程序 ELF）+ `/etc/motd` + `/tmp`；
+  自测 `make test-fs` 断言 stat/内容读回/路由/`ls` 语义/负例 errno（19 项）；
+- **fd 表与文件 syscall**（`fs/file.rs` + `syscall/file.rs`）：0/1/2 保留（stdin 未接通、串口输出），
+  动态 fd ≥ 3 取最小空闲槽位；新增 `read`/`open`/`close`，`write` 支持文件 fd；
+  用户缓冲按页校验（`-EFAULT`），单次 I/O 上限 4096 字节；
+- **ELF Loader**（`syscall/elf.rs`）：ELF64/`ET_EXEC`/`EM_X86_64` → 按**段权限**逐页映射
+  （`W` → 可写、非 `X` → `NX`）→ 拷 `p_filesz`、`p_memsz` 余下置 0 → 入口取 `e_entry`；
+  用户地址布局固定为「映像窗口 64 KiB + 栈 4 页」；用户程序从 RAMFS 的 `/init` 读取装载，
+  因此 `user/hello` 的 `RW` 段（`.data`/`.bss`）现在对 ring3 **可写**（实测 `hello: static counter=1`）；
+- 构建链：`kernel/build.rs` 校验 ELF（基址/段页对齐/`W^X`/映像窗口/无重定位）后**原样内嵌**；
+  `user.ld` 四个段分别 `ALIGN(0x1000)`；`make user` 跑 `tools/check_user_elf.py`（不启 QEMU 验段布局）。
+
+自动化验证：`make test-user`（**32 项**断言：`source=elf` + `segments/image_pages/writable_pages` +
+`open/read/close/write` 全链路 + 内核读回用户写入的文件 + `static counter=1` + `EFAULT` + 退出码/隔离）PASS；
+`make test-fs`（19 项）PASS；`tests/orchestrate.json` 增至 **8 场景**（新增 `fs`）全 PASS。
+
+v0.7 仍**未做**（属 v0.8+）：用户堆（`brk`/`mmap`）、`argc/argv`、`fork/execve/wait4` 与进程对象、
+动态链接、内核高半区迁移；磁盘 FS（FAT32）与 `mkfs`（H-03）属 v0.8，Shell 与 `ls`/`cat` 属 v0.9。
+
+**v0.8 前半已落地（2026-10-11）**：驱动注册框架 + PCI 枚举 + 块设备（virtio-blk legacy）。
+
+- **PCI 枚举**（`kernel/src/driver/pci.rs`）：配置机制 #1（`0xCF8`/`0xCFC`），全总线扫描（用头部类型的
+  多功能位把 256 个 function 的探测砍到 1 个），**BAR 探测**（写全 1 读掩码）并算出窗口大小；
+  类别/子类/编程接口一并解码，日志用 `00:03.0` 形式便于对照 `lspci`;
+- **驱动注册框架**（`kernel/src/driver/driver.rs`）：`Driver` trait（`name`/`matches`/`attach`）+ 固定容量
+  注册表 + `probe_all()`：按注册顺序匹配、一个设备最多被一个驱动接管、`attach` 失败不阻断其它设备，
+  统计以 `ProbeStats { devices, matched, attached, failed }` 返回（验收断言直接看这组数字）；
+- **块设备抽象**（`kernel/src/driver/block.rs`）：`BlockDevice`（512 字节扇区、`lba` 绝对寻址），
+  长度非整扇区**报错而不是静默取整**；设备注册表让上层只认 trait、不认具体驱动；
+- **legacy virtio-blk（0.9.5）驱动**（`kernel/src/driver/virtio_blk.rs`）：状态机
+  `ACKNOWLEDGE → DRIVER → FEATURES_OK → DRIVER_OK`，virtqueue（描述符表 + avail + 4 KiB 对齐的 used，
+  三段必须**物理连续** → `frame::allocate_contiguous`），描述符链「请求头 → 数据 → 状态字节」，
+  notify 后**轮询** used ring（超时用 PIT tick）；数据搬运走页对齐 bounce buffer，
+  因此不要求上层缓冲对齐或连续；遇到 modern（0x1042）设备会打印原因并报错；
+- **启动盘换成 virtio-blk**：`make run` 与全部 QEMU 测试都改为
+  `-device virtio-blk-pci,drive=blk0,disable-modern=on` —— 「镜像能启动」与「内核驱动能读写这块盘」
+  因此是**同一台设备上的同一条路径**。
+
+自动化验证：`make test-driver` **22 项**断言 PASS（`vendor=0x1af4 device_id=0x1001`、`bar0=io:`、
+`queue0 size=256 region=... (3 pages contiguous)`、`capacity=131072 sectors (64 MiB)`、
+`boot sector sig=0x55aa fstype=FAT16`、512/4096/4608 字节分块读一致性、最后扇区写回读+还原、三类负例）；
+`tests/orchestrate.json` 增至 **9 场景**（新增 `driver`）全 PASS。
+另用非 `snapshot=on` 方式启动后比对镜像 md5，确认写测试真的把最后一个扇区恢复了原样。
+
+v0.8 仍**未做**：FAT32 磁盘文件系统挂到 VFS（与 H-03 `mkfs`）—— 这是 v0.8 的剩余部分；
+modern（virtio 1.0）、MSI-X/INTx 中断、多块盘、BAR 重分配、ECAM/ACPI 也留到后续。
+
+下一步：按 DEVELOPMENT.md 第 5 节顺序继续——v0.8 剩余部分（FAT32 磁盘后端 + `mkfs`）
+然后 v0.9（Shell + 用户程序 + 网络）。
 
 ## 文档入口
 
@@ -48,10 +127,20 @@ IRQ 的 EOI 时序错误导致 PIC 停摆（B-11）。
 ## 项目结构（概览）
 
 ```text
-boot/      UEFI 引导（v0.1 ✅）   kernel/    Rust 内核主体（v0.5 ✅，含内存/中断/时钟/键盘/调度）
-shared/    boot/kernel 共享结构    user/      用户态程序（v0.6+）
+boot/      UEFI 引导（v0.1 ✅）   kernel/    Rust 内核主体（v0.8 🟡，含内存/中断/调度/syscall/fs/驱动）
+libc/      最小用户态运行时（v0.7 ✅，含 open/read/close）
+shared/    boot/kernel 共享结构    user/      用户态程序（v0.7：hello ✅，其 ELF 即 RAMFS 上的 /init）
 tools/     Python 主机工具        tools-go/  Go 主机服务
 tests/     QEMU 集成测试（v0.1 ✅） docs/     全部开发文档
+```
+
+驱动分层（v0.8，详见 [docs/drivers.md](docs/drivers.md)）：
+
+```text
+pci.rs ──枚举──▶ driver.rs ──匹配/挂接──▶ virtio_blk.rs
+（总线上有什么）   （谁来管它）              （实现 Driver + BlockDevice）
+                        │
+                        └──▶ block.rs（按扇区读写的统一接口 + 设备注册表）
 ```
 
 ## 常用命令
@@ -66,7 +155,11 @@ make test-pagefault  # v0.3：访问未映射地址，断言 #PF 诊断 + CR2
 make test-keyboard   # v0.4：经 QEMU monitor 注入按键，断言 IRQ1 回显 + PIT 心跳
 make test-scheduler  # v0.5：断言 ≥3 个内核任务在 PIT 时间片下轮转
 make test-ipc        # v0.5：断言 pipe 创建/写入/读取摘要日志 + 自测 PASS
+make test-fs         # v0.7：断言 VFS 挂载路由 + RAMFS 读/写/ls + 负例 errno
+make test-user       # v0.7：断言 ELF 从 RAMFS 装载 + 文件 syscall 全链路 + 用户写入读回 + 隔离
+make test-driver     # v0.8：断言 PCI 枚举 + 驱动挂接 + virtio-blk 扇区读/写/负例
+make user            # v0.7：单独构建并校验用户态脚手架（libc + user/hello → 段页对齐的 ELF）
 make test-all        # 全部集成测试
 make go-test         # v0.4 H-04/H-05：Go 单元测试（串口分析 + 并行编排器）
-make test-orch       # v0.4 H-04：Go 编排器并行跑 6 个集成测试场景（tests/orchestrate.json）
+make test-orch       # v0.4 H-04：Go 编排器并行跑 9 个集成测试场景（tests/orchestrate.json）
 ```
