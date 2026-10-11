@@ -22,7 +22,10 @@
 //! ├── bin/
 //! │   ├── sh   交互式 Shell ELF（v0.9 第一步）
 //! │   ├── hello   外部程序：pid + argv（v0.9 第三步）
-//! │   └── ls / cat / echo / ps   基础用户程序（v0.9 第五步）
+//! │   └── ls / cat / echo / ps / dynhello   基础与动态链接用户程序（v0.9 第五步/动态链接）
+//! ├── lib/     v0.9 动态链接：解释器与共享库（内核按 PT_INTERP/DT_NEEDED 的名字在此查找）
+//! │   ├── ld.so          PT_INTERP 的落点
+//! │   └── libgreet.so    DT_NEEDED=libgreet.so 的落点
 //! ├── etc/
 //! │   └── motd 文本文件（用户程序用 open/read 读它）
 //! └── tmp/     用户程序写文件的落点
@@ -63,7 +66,10 @@ pub const MOTD: &[u8] = b"motd: hello from ramfs\n";
 /// **普通文件**落在 RAMFS 上：内核稍后从 VFS 读它们、交给 ELF Loader 装载。
 /// v0.7 起用户程序就是「文件系统里的一个文件」，没有任何一条是特例
 /// （`/bin/hello` 还是由 Shell `fork` + `execve` 起来的）。
-pub fn init(programs: &[(&'static str, &'static [u8])]) -> Result<(), i64> {
+pub fn init(
+    programs: &[(&'static str, &'static [u8])],
+    libraries: &[(&'static str, &'static [u8])],
+) -> Result<(), i64> {
     mount::table().mount("/", Box::new(ramfs::RamFs::new("ramfs")))?;
     serial::print("fs: mount point=/ fs=");
     serial::println(
@@ -77,7 +83,16 @@ pub fn init(programs: &[(&'static str, &'static [u8])]) -> Result<(), i64> {
     for (path, elf) in programs {
         vfs::create(path)?;
         let written = vfs::write(path, 0, elf)?;
-        log_write(path, written);    }
+        log_write(path, written);
+    }
+
+    // v0.9 动态链接：/lib 放解释器与共享库 —— 同样是普通文件，内核按名字查找
+    vfs::mkdir("/lib")?;
+    for (path, image) in libraries {
+        vfs::create(path)?;
+        let written = vfs::write(path, 0, image)?;
+        log_write(path, written);
+    }
 
     // /etc/motd：用户程序读的对象
     vfs::mkdir("/etc")?;
@@ -230,10 +245,10 @@ pub fn selftest() -> Result<(), &'static str> {
         serial::print(" perms=");
         serial::println(entry.meta.perms());
     }
-    // 根目录条目数：`init` + `bin` + `etc` + `tmp`（v0.9 加上了 `/bin`）。
+    // 根目录条目数：`init` + `bin` + `lib` + `etc` + `tmp`（v0.9 动态链接加上了 `/lib`）。
     // 这是精确断言而不是「至少有几个」：新增/潦掉的根条目必须同步改这里与
     // `make test-fs` 的期望，否则「文件树悄悄变了」不会被发现。
-    if entries.len() != 4 {
+    if entries.len() != 5 {
         return Err("fs: root directory entry count mismatch");
     }
 

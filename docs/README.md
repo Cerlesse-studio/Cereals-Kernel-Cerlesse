@@ -2,7 +2,7 @@
 
 - 阶段：第一阶段 / 文档中心
 - 最后更新：2026-10-11
-- 状态：🟡 持续更新（2026-10-11 同步 v0.9 第五步（**基础用户程序 `ls`/`cat`/`echo`/`ps` + `getdents`/`getprocs`**）实现记录；同日已同步 v0.9 第四步简化网络栈、第三步进程对象、第二步交互式 Shell、第一步用户堆、v0.8 收官与 H-06 包管理器 `.ckc` 提案 P0a）
+- 状态：🟡 持续更新（2026-10-11 同步 v0.9 第六步（**内核侧最小动态链接**：`PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`）实现记录；同日已同步第五步基础用户程序、第四步简化网络栈、第三步进程对象、第二步交互式 Shell、第一步用户堆、v0.8 收官与 H-06 包管理器 `.ckc` 提案 P0a；同日新增 **desktop.md**（v1.0 之后的桌面环境兼容路线，规划））
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
 
@@ -25,8 +25,9 @@
 | [memory.md](./memory.md) | 阶段：物理/虚拟内存 / Heap / Allocator | ✅ v0.3 已完成 |
 | [drivers.md](./drivers.md) | 阶段：驱动框架 / PCI / 磁盘（含 v0.4 中断/时钟/键盘/上下文切换） | ✅ v0.8 已完成（驱动注册框架 + PCI 枚举 + 块设备抽象 + **legacy virtio-blk**，`make test-driver` 22 项 PASS；启动盘已改为 virtio-blk）；v0.4（PIC + PIT 100Hz + PS/2 键盘 + 上下文切换原语）已完成；v0.9 键盘加**行缓冲 + 终端式回显**（`make test-keyboard` 断言同步）；**v0.9 第四步：简化网络栈（virtio-net + Ethernet → ARP → IPv4 → UDP）已落地**（`make test-network` 13 项，见 1.8） |
 | [process.md](./process.md) | 阶段：进程/线程 / 上下文切换 / 调度器 / IPC | ✅ v0.5 已完成（线程模型 + 上下文切换 + Round Robin 时间片调度 `make test-scheduler`；IPC pipe 骨架 `make test-ipc`）；channel / shared_memory 仍为占位；v0.6 追加了 `scheduler::suspend()`；**v0.9 第三步：进程对象与 `fork`/`execve`/`wait4` 已落地**（每进程地址空间 + 每进程 64 KiB 内核栈 + 完整用户帧，`make test-proc`，见 1.4） |
-| [syscall.md](./syscall.md) | 阶段：系统调用 / 用户空间 / ELF | 🟡 v0.7 核心已完成（`syscall`/`sysret` 入口 + ring3 隔离 + `read/write/open/close`+ `write/exit/getpid/sleep` + **ELF Loader** 从 RAMFS `/init` 按段权限装载），v0.9 已落地四步：**用户堆**（3.5）、**`stdin` + 交互式 Shell**（3.6）、**`fork`/`execve`/`wait4` + `argc`/`argv`**（3.7，外部程序 `/bin/hello` 真的能跑）、**基础用户程序 + `getdents`/`getprocs`**（3.8，`/bin/{ls,cat,echo,ps}`）；`make test-user` 61 项 / `make test-shell` 11 项 / `make test-proc` 8 项 + 4 正则 / `make test-programs` 17 项 + 5 正则 PASS；只剩 `mprotect`/环境变量/动态链接未做（见 3.4） |
-| [filesystem.md](./filesystem.md) | 阶段：VFS / RAMFS / 磁盘文件系统 | ✅ v0.7 + **v0.8 磁盘后端**已完成（VFS trait + 挂载表最长前缀路由 + RAMFS + fd 表；**FAT12/16/32 只读后端** + `tools/mkfs/mkfs.py`，`make test-fs` 20 项 / `make test-fat` 21 项 PASS） |
+| [syscall.md](./syscall.md) | 阶段：系统调用 / 用户空间 / ELF | 🟡 v0.7 核心已完成（`syscall`/`sysret` 入口 + ring3 隔离 + `read/write/open/close`+ `write/exit/getpid/sleep` + **ELF Loader** 从 RAMFS `/init` 按段权限装载），v0.9 已落地六步：**用户堆**（3.5）、**`stdin` + 交互式 Shell**（3.6）、**`fork`/`execve`/`wait4` + `argc`/`argv`**（3.7，外部程序 `/bin/hello` 真的能跑）、**基础用户程序 + `getdents`/`getprocs`**（3.8，`/bin/{ls,cat,echo,ps}`）、**内核侧最小动态链接**（3.9，`ET_DYN` + `PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`，`/bin/dynhello` + `/lib/*`）；`make test-user` 61 项 / `make test-shell` 11 项 / `make test-proc` 8 项 + 4 正则 / `make test-programs` 17 项 + 5 正则 / `make test-dyn` 10 项 PASS；仍未做：`mprotect`/环境变量/**完整**动态链接（见 3.4/3.9） |
+| [filesystem.md](./filesystem.md) | 阶段：VFS / RAMFS / 磁盘文件系统 | ✅ v0.7 + **v0.8 磁盘后端**已完成（VFS trait + 挂载表最长前缀路由 + RAMFS + fd 表；**FAT12/16/32 只读后端** + `tools/mkfs/mkfs.py`，`make test-fs` 21 项 / `make test-fat` 21 项 PASS） |
+| [desktop.md](./desktop.md) | **桌面环境兼容路线（v1.0 之后，规划）**：现状审计、用户态/内核侧归属、D0–D5 分层里程碑与 QEMU 验收 | 📋 规划（2026-10-11 新增） |
 
 ## 阶段说明
 
@@ -48,9 +49,25 @@
   第四步 **简化网络栈**（virtio-net + Ethernet → ARP → IPv4 → UDP，`make test-network` 13 项，见 drivers.md 1.8）已落地；
   第五步 **基础用户程序**（`ls`/`ps`/`cat`/`echo` → `/bin/*`，含新增的目录枚举 `getdents` 与进程表 `getprocs`，
   `make test-programs` 17 项 + 5 正则，见 syscall.md 3.8）已落地；
-  仅**动态链接**仍未做。
+  第六步 **内核侧最小动态链接**（`ET_DYN` + `PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`，
+  `make test-dyn` 10 项 + `make dyn-hostcheck` 宿主 glibc 独立复核，见 syscall.md 3.9）已落地 —— ✅ 六步全部完成；
+  **完整**动态链接（用户态 `ld.so`）与 `mprotect` 等仍归后续（见 architecture.md 第 5 节）。
+- **第九阶段（v1.0 之后）**📋：**桌面环境兼容**（内核侧地基与接口对齐，D0 地基 → D1 输入 →
+  D2 显示 → D3 音频 → D4 会话/电源 → D5 收尾）—— 规划见 [desktop.md](./desktop.md)，未开工。
 - **后续**：每进入一个新阶段就编写/修订对应的主题文档；阶段内已落地部分也要及时补记当前状态（例如 v0.4 中断控制器）。
 - 本套文档**会在开发过程中被反复修改**——修改前请在对应文档顶部记录修订日期与变更点。
+-  本次（2026-10-11，第十二轮）修订重点：**新增桌面环境兼容路线（规划）** —— 新建 `desktop.md`
+  （现状审计 + 用户态/内核侧归属纠正 + D0–D5 分层 + v1.1–v1.6 里程碑）；同步 architecture.md 第 5 节、
+  roadmap.md（第九阶段 + 「禁止提前做」项修正）、DEVELOPMENT.md（5.10）、project-structure.md（规划新增目录）
+  与 README.md。
+-  本次（2026-10-11，第十一轮）修订重点：**v0.9 第六步（内核侧最小动态链接）落地** ——
+  新增 `kernel/src/syscall/dynamic.rs`（`ET_DYN` 分流：`PT_INTERP` + `DT_NEEDED` → `/lib/<name>` 递归装载，
+  应用 `R_X86_64_RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`64`，`DT_PLTREL=REL` 明确拒绝）与
+  `address_space.rs` 的共享库窗口（基址 + 1 MiB、32 页）；新增汇编夹具 `user/dynhello/`
+  （`as`+`ld` 现编，`kernel/build.rs` 内嵌）与 RAMFS `/lib`（构建/内嵌清单 7 → 8）；
+  新增 `make test-dyn`（10 项）与 `make dyn-hostcheck`（宿主机 glibc 独立复核）；
+  `test-fs` 20 → 21 项、`test-programs` 条目数 5/7；同步 syscall.md（新增 3.9，修正 3.1/3.4/3.8）、
+  architecture.md 第 5 节、roadmap/DEVELOPMENT/README/project-structure/api/filesystem。
 -  本次（2026-10-11，第十轮）修订重点：**v0.9 第五步（基础用户程序与目录/进程枚举）落地** ——
   新增 `syscall/dir.rs`（`getdents`：VFS `list()` → 定长 88 字节记录，号 78 沿用 Linux 但格式不同）与
   `syscall/process.rs::sys_getprocs`（定长 40 字节记录，号 **256**）；`syscall_table.rs` 确立

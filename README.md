@@ -6,6 +6,18 @@
 
 ## 当前进度
 
+**🔗 动态链接的最小闭环已跑通（2026-10-11，v0.9 第六步：内核侧最小动态链接）**：内核第一次装载了 `ET_DYN` ——
+主程序 `/bin/dynhello`（PIE，链接基址 0）带 `PT_INTERP=/lib/ld.so` 与 `DT_NEEDED=libgreet.so`：
+内核解析这两条、从 RAMFS 的 `/lib` 读入解释器与共享库、把它们依次装进**共享库窗口**（基址 + 1 MiB、32 页），
+再应用 `R_X86_64_RELATIVE`（主程序 `.data` 里的绝对指针）与 `R_X86_64_JUMP_SLOT`（`call greet@PLT` 的 GOT 槽）
+—— 然后 `iretq` 进 ring3。两条输出证明代码真的跑到了：`main: dynamic link ok`（主程序自己的 `.rodata`）与
+`greet: hello from libgreet.so`（共享库的 `.rodata`），退出码就是 `greet()` 返回的 **42**。
+验收：`make test-dyn`（**10 项**，从 `PT_INTERP` 到 `frames free` 无泄漏的整条链）；
+独立复核对齐 `mkfs`+mtools 的思路：`make dyn-hostcheck` 用**宿主机的 glibc `ld.so`** 跑同一批 `.s`
+（`as`+`ld` 重编），两套完全不同的装载器要跑出相同输出与退出码。
+边界（刻意）：链接仍由**内核**做，`PT_INTERP` 指向的解释器被装载但不被进入 —— 真正的用户态 `ld.so`
+需要一个能 `mmap` 文件的内核，属后续版本；完整动态链接仍是第一版非目标。规格见 docs/syscall.md 3.9。
+
 **🧰 基础用户程序已可用（2026-10-11，v0.9 第五步：`ls` / `cat` / `echo` / `ps`）**：`/bin` 里不再只有一个 `hello`。
 四个命令行程序都是**普通用户程序**（Rust + libc，由 Shell 的 `fork`+`execve` 起来），各自只需要一条内核能力：
 `ls` → 新增的 **`getdents`**（把 VFS 的目录项写成定长 88 字节记录）、`ps` → 新增的 **`getprocs`**
@@ -15,7 +27,8 @@
 `ps` 于是能读出 `pid=3 ppid=0 state=RUNNING comm=sh` 与 `pid=7 ppid=3 … comm=ps` —— 这正是 `fork` 建出的父子关系
 （`Process::comm` 是新增的定长 16 字节字段，`execve` 成功后改写为程序名）。
 验收：`make test-programs`（**17 项 + 5 条正则**，QEMU monitor 注入 `ls` / `ls /bin` / `ps` / `/bin/echo …` / `/bin/cat /etc/motd`）——
-其中 `ls: /bin entries=6` 说明 RAMFS 上恰好是本次构建的 6 个程序，`cat: /etc/motd bytes=23` 说明程序端真的读到了内核提供的文件。
+其中 `ls: /bin entries=7` 说明 RAMFS 上恰好是本次构建的 7 个程序（`sh`/`hello`/`ls`/`cat`/`echo`/`ps` + 第六步的 `dynhello`），
+`cat: /etc/motd bytes=23` 说明程序端真的读到了内核提供的文件。
 规格见 docs/syscall.md 3.8。注：内建命令会**遮蔽**同名程序（与真实 shell 一致），所以 `cat`/`echo` 要走程序得写 `/bin/cat` / `/bin/echo`；
 `make test-proc` 的“找不到的程序”负例已从 `ls` 改为 `foo`。
 
@@ -196,7 +209,10 @@ v0.7 仍**未做**（后续版本补齐）：动态链接、内核高半区迁�
 v0.8 仍**未做**（明确不算完成）：FAT 后端**只读**（写盘/簇分配器、扇区缓存属后续）、不解析分区表、
 modern（virtio 1.0）、MSI-X/INTx 中断、超过两块盘、BAR 重分配、ECAM/ACPI。
 
-下一步：按 DEVELOPMENT.md 第 5 节顺序继续 —— v0.9（Shell + 用户程序 + 网络）。
+下一步：按 DEVELOPMENT.md 第 5 节顺序继续 —— v1.0（用户/组/权限、启动链收口与发布）；
+`mprotect`、完整动态链接（用户态 `ld.so`）、TCP/ICMP 与 socket、更多用户程序按需补。
+v1.0 之后的**桌面环境兼容路线**（内核侧地基与接口对齐：D0 地基 → D1 输入 → D2 显示 →
+D3 音频 → D4 会话/电源 → D5 收尾）已写入 [docs/desktop.md](docs/desktop.md)（规划）。
 
 ---
 
@@ -253,7 +269,7 @@ Cerlesse 不做「完整 Linux 替代品」，而是按 **Boot → 内存 → �
 
 ## 当前状态
 
-**v0.1 – v0.8 已全部完成并通过自动化验收；v0.9 已落地三步，剩余动态链接与网络。**
+**v0.1 – v0.9 已全部完成并通过自动化验收（v0.9 六步：用户堆 / 交互式 Shell / 进程对象 / 简化网络栈 / 基础用户程序 / 最小动态链接）。**
 
 | 版本 | 状态 | 交付内容摘要 |
 | ---- | ---- | ---- |
@@ -265,10 +281,10 @@ Cerlesse 不做「完整 Linux 替代品」，而是按 **Boot → 内存 → �
 | v0.6 | ✅ | `syscall`/`sysret` 入口 + ring3 隔离 + 用户态脚手架（`libc`） |
 | v0.7 | ✅ | VFS + RAMFS + fd 表 + 文件 syscall + ELF Loader |
 | v0.8 | ✅ | 驱动注册框架 + PCI 枚举 + 块设备 + legacy virtio-blk + FAT12/16/32 只读 + `mkfs` |
-| v0.9 | 🟡 | 用户堆 → `stdin` + 交互式 Shell → 进程对象 + `fork`/`execve`/`wait4`；**剩余：动态链接、网络** |
+| v0.9 | ✅ | 用户堆 → `stdin` + 交互式 Shell → 进程对象 + `fork`/`execve`/`wait4` → 简化网络栈 → 基础用户程序（`ls`/`ps`/`cat`/`echo`）→ **内核侧最小动态链接** |
 | v1.0 | ⬜ | 权限/凭证 + 完整启动链 + 发布 |
 
-**v0.9 已落地的三步（外部程序真的能跑）**：
+**v0.9 已落地的六步**：
 
 1. **用户堆**：`brk`/`mmap`/`munmap`（W^X、新页全零、`invlpg`）+ `libc` 的 `#[global_allocator]`，
    用户程序可以用 `Vec`/`String`/`Box`；
@@ -276,7 +292,12 @@ Cerlesse 不做「完整 Linux 替代品」，而是按 **Boot → 内存 → �
    （3 秒无整行 `-EAGAIN`）→ `/bin/sh`（提示符 `root@cerlesse C:>`，内建 `help`/`echo`/`cat`/`pid`/`exit`）；
 3. **进程对象 + `fork`/`execve`/`wait4` + `argc`/`argv`**：每进程独立地址空间 +
    每进程 64 KiB 内核栈（栈底哨兵）+ 停在 syscall 里的完整用户帧；Shell 的外部命令
-   `/bin/hello` 由 `fork`+`execve`+`wait4` 真正跑起来（找不到的程序 → `ENOENT` → `exit(127)`）。
+   `/bin/hello` 由 `fork`+`execve`+`wait4` 真正跑起来（找不到的程序 → `ENOENT` → `exit(127)`）；
+4. **简化网络栈**：virtio-net → Ethernet → ARP → IPv4 → UDP（DHCP 往返，`make test-network` 13 项）；
+5. **基础用户程序**：`/bin/{ls,cat,echo,ps}` 由 Shell 真的 exec 起来（新增 `getdents`/`getprocs`，
+   `make test-programs` 17 项 + 5 正则）；
+6. **最小动态链接**：`ET_DYN` + `PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`
+   （`make test-dyn` 10 项 + `make dyn-hostcheck` glibc 独立复核）。
 
 详细的实现记录、踩坑与验收证据见 [DEVELOPMENT.md](DEVELOPMENT.md) 第 5、9 节。
 
@@ -289,13 +310,16 @@ Cerlesse 不做「完整 Linux 替代品」，而是按 **Boot → 内存 → �
 - **进程与调度**：进程对象（PCB：地址空间/用户帧/内核栈/状态机）、Round Robin 200ms 时间片、pipe。
 - **系统调用与用户态**：`syscall`/`sysret` 快速路径、独立用户 PML4（每级 `USER`、代码 RO+X、栈 RW+NX）、
   ring3 异常终止而不 panic；`read`/`write`/`open`/`close`/`mmap`/`munmap`/`brk`/`getpid`/`nanosleep`/
-  `fork`/`execve`/`exit`/`wait4`（`mprotect` 待实现）。
+  `fork`/`execve`/`exit`/`wait4`（`mprotect` 待实现）；`ET_DYN` + `PT_INTERP` + `DT_NEEDED` +
+  重定位（内核侧最小动态链接，见 docs/syscall.md 3.9）。
 - **文件系统**：VFS（`FileSystem` trait + 最长前缀挂载路由）、RAMFS、fd 表、
   磁盘 FAT12/16/32 **只读**后端（8.3 + NT 标志 + LFN、任意偏移读、`EROFS`/`EUCLEAN`）。
 - **驱动**：驱动注册框架（`Driver` trait + `probe_all` + `ProbeStats`）、PCI 枚举（机制 #1 + BAR 探测）、
   块设备抽象、legacy virtio-blk 0.9.5（virtqueue + 轮询 + bounce buffer）。
 - **用户程序**：`libc` 最小运行时（syscall 封装 / `_start` / `print!` / panic handler / 堆 / `argc`-`argv`）；
-  `user/hello`（`/init`）、`user/shell`（`/bin/sh`）、`user/hello-bin`（外部程序 `/bin/hello`）。
+  `user/hello`（`/init`）、`user/shell`（`/bin/sh`）、`user/hello-bin`（外部程序 `/bin/hello`）、
+  `user/{ls,cat,echo,ps}`（→ `/bin/*`）、动态链接夹具 `user/dynhello`（→ `/bin/dynhello` +
+  `/lib/{ld.so,libgreet.so}`，由 `as`+`ld` 现编）。
 - **主机侧工具**：镜像构建、ELF 段布局检查、`mkfs`（FAT 镜像，mtools 独立复核）、
   CKC 包容器 `.ckc`（H-06 P0a）、Go 测试编排器 `testorch` 与串口分析 `serialmon`。
 
@@ -309,6 +333,7 @@ Cerlesse 不做「完整 Linux 替代品」，而是按 **Boot → 内存 → �
 | QEMU | `qemu-system-x86_64`（机器 `q35`，512M） |
 | OVMF | `OVMF_CODE.fd` / `OVMF_VARS.fd`（默认 `/usr/share/OVMF/`） |
 | GNU Make + Python 3 | 构建入口与主机侧工具（仅标准库） |
+| binutils（`as` / `ld`） | v0.9 动态链接夹具由内核构建期现编（`user/dynhello/*.s`），构建内核必需 |
 | 可选：mtools（`mdir`/`mtype`） | FAT 镜像独立复核（`make test-fat`） |
 | 可选：Go | `testorch` / `serialmon`（`make go-test` / `make test-orch`） |
 
@@ -329,7 +354,7 @@ make run OVMF_CODE=/path/OVMF_CODE.fd OVMF_VARS=/path/OVMF_VARS.fd QEMU=/path/qe
 make build      # 构建 boot + kernel + 磁盘镜像（build/disk.img）
 make run        # QEMU + OVMF 启动（串口输出到终端）
 make test       # 冒烟测试：断言串口出现 "Kernel started!"
-make test-all   # 全部 13 个集成测试目标
+make test-all   # 全部 16 个集成测试目标
 ```
 
 ## 运行示例
@@ -363,8 +388,9 @@ root@cerlesse C:>
 
 ```text
 boot/      UEFI 引导（v0.1 ✅）        kernel/   Rust 内核主体（v0.8 ✅，含内存/中断/调度/
-libc/      最小用户态运行时（v0.9 ✅）            syscall/fs/驱动/进程）
-shared/    boot/kernel 共享结构         user/     用户程序（hello ✅ / shell ✅ / hello-bin ✅）
+libc/      最小用户态运行时（v0.9 ✅）            syscall/fs/驱动/进程/动态链接）
+shared/    boot/kernel 共享结构         user/     用户程序（hello / shell / hello-bin /
+                                                     ls / cat / echo / ps / dynhello ✅）
 tools/     Python 主机工具              tools-go/ Go 主机服务
 tests/     QEMU 集成测试                docs/     全部开发文档
 ```
@@ -400,13 +426,15 @@ make test-user       # v0.7/v0.9：ELF 从 RAMFS 装载 + 文件 syscall + 用�
 make test-shell      # v0.9：注入按键跑交互式 Shell（help / cat /etc/motd / exit，11 项）
 make test-proc       # v0.9：fork/execve/wait4 全链路（外部程序 /bin/hello + argv + 退出码回收，8 项 + 4 正则）
 make test-programs   # v0.9：从 Shell 跑 /bin/{ls,cat,echo,ps}（getdents 列目录 + getprocs 列进程，17 项 + 5 正则）
+make test-dyn        # v0.9：内核侧最小动态链接（PT_INTERP + DT_NEEDED + RELATIVE/JUMP_SLOT，10 项）
+make dyn-hostcheck   # v0.9：同一批动态链接夹具交给宿主机 glibc ld.so 独立复核（缺 binutils 时跳过）
 make test-driver     # v0.8：断言 PCI 枚举 + 驱动挂接 + virtio-blk 扇区读/写/负例
 make fat-image       # v0.8：用 tools/mkfs/mkfs.py 生成 FAT32 测试盘（内容见 tests/fatroot/）
 make test-fat        # v0.8：双盘启动，断言 FAT16/32 挂到 VFS 后的读/ls/LFN/跨簇/偏移读/EROFS
 make test-network    # v0.9：virtio-net + Ethernet/ARP/IPv4/UDP（ARP 网关解析 + DHCP UDP 往返，13 项）
-make user            # v0.7/v0.9：单独构建并校验七个用户程序（hello/shell/hello-bin/ls/cat/echo/ps → 段页对齐的 ELF）
+make user            # v0.7/v0.9：单独构建并校验七个 Rust 用户程序（hello/shell/hello-bin/ls/cat/echo/ps → 段页对齐的 ELF；动态链接夹具由内核构建期现编）
 make test-pkg        # H-06 P0a：CKC 包容器（.ckc）与打包/校验规则（主机侧，不启 QEMU）
 make test-all        # 全部集成测试
 make go-test         # v0.4 H-04/H-05：Go 单元测试（串口分析 + 并行编排器）
-make test-orch       # v0.4 H-04：Go 编排器并行跑 14 个集成测试场景（tests/orchestrate.json）
+make test-orch       # v0.4 H-04：Go 编排器并行跑全部 15 个集成测试场景（tests/orchestrate.json）
 ```

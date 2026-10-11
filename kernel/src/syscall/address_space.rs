@@ -33,9 +33,10 @@
 //! 0x0000_0080_0000_0000 + 0x10000 页 16..19  用户栈（16 KiB，RW、NX）
 //! 0x0000_0080_0000_0000 + 0x20000 页 32..95  brk 堆窗口（256 KiB，按需映射，RW、NX）
 //! 0x0000_0080_0000_0000 + 0x60000 页 96..159 匿名 mmap 窗口（256 KiB，first-fit，RW 或 RX）
+//! 0x0000_0080_0000_0000 + 0x100000 页 256..287 共享库窗口（128 KiB，v0.9 动态链接）
 //! ```
 //!
-//! 映像窗口、栈、堆、mmap 窗口都落在同一张 PT 覆盖的 2 MiB 内（共 160 页，占 512 项里的
+//! 映像窗口、栈、堆、mmap 窗口、共享库窗口都落在同一张 PT 覆盖的 2 MiB 内（共 288 页，占 512 项里的
 //! 一小部分），因此本模块仍然只需要一张 PT。**中间没被映射的页（例如页 20..31）摸到就 #PF**
 //! —— 这是隔离的正常表现，v0.6 的探针测试仍然有效。
 //!
@@ -106,6 +107,17 @@ pub const USER_MMAP_PAGES: usize = 64;
 /// 匿名 mmap 窗口字节上限。
 pub const USER_MMAP_MAX: u64 = USER_MMAP_PAGES as u64 * PAGE_SIZE;
 
+/// 共享库窗口起始虚拟地址（v0.9 动态链接；页号 256，= 基址 + 1 MiB）。
+///
+/// `PT_INTERP` 指向的解释器与每个 `DT_NEEDED` 共享库都装在这个窗口里，
+/// 而不是映像窗口：主程序（ET_DYN PIE）仍固定落在 [`USER_VIRT_BASE`]，
+/// 共享对象则依次串排在窗口里（见 `syscall/dynamic.rs`）。
+pub const USER_DYN_BASE: u64 = USER_VIRT_BASE + 0x0010_0000;
+/// 共享库窗口页数（32 页 = 128 KiB）。最小闭环里 = 解释器 + 一个库，绰绰有余。
+pub const USER_DYN_PAGES: usize = 32;
+/// 共享库窗口字节上限。
+pub const USER_DYN_MAX: u64 = USER_DYN_PAGES as u64 * PAGE_SIZE;
+
 /// 本地址空间在 `new()` 期间拥有的帧数量：PML4 + PDPT + PD + PT + 栈页。
 ///
 /// 映像页不在其中：它们在 `map_image_page` 里按 ELF 段按需分配。
@@ -151,6 +163,10 @@ pub struct UserSpace {
     mmap: [Option<PhysFrame>; USER_MMAP_PAGES],
     /// 每个 mmap 页的映射标志（`PRESENT` 位为 0 表示该页空闲），用于缓冲校验
     mmap_flags: [u64; USER_MMAP_PAGES],
+    /// 共享库窗口页帧（v0.9 动态链接；`None` = 未映射）
+    dyn_pages: [Option<PhysFrame>; USER_DYN_PAGES],
+    /// 每个共享库页的映射标志（`PRESENT` 位为 0 表示未映射），用于缓冲校验
+    dyn_flags: [u64; USER_DYN_PAGES],
 }
 
 impl UserSpace {
@@ -252,6 +268,8 @@ impl UserSpace {
             brk: USER_HEAP_VIRT,
             mmap: [None; USER_MMAP_PAGES],
             mmap_flags: [0; USER_MMAP_PAGES],
+            dyn_pages: [None; USER_DYN_PAGES],
+            dyn_flags: [0; USER_DYN_PAGES],
         })
     }
 
@@ -305,6 +323,63 @@ impl UserSpace {
             )
         };
         Ok(frame.start_address())
+    }
+
+    /// 在共享库窗口映射第 `index` 页并返回其物理地址（幂等，语义同
+    /// [`UserSpace::map_image_page`]）。动态链接器用它把 `PT_INTERP` 解释器与
+    /// `DT_NEEDED` 共享库一页页放进来。
+    pub fn map_dyn_page(&mut self, index: usize, flags: u64) -> Result<u64, i64> {
+        if index >= USER_DYN_PAGES {
+            return Err(EINVAL);
+        }
+        let merged = flags | PRESENT | USER;
+        if let Some(frame) = self.dyn_pages[index] {
+            self.dyn_flags[index] |= merged;
+            let entry = frame.start_address() | self.dyn_flags[index];
+            unsafe {
+                write_entry(
+                    self.pt,
+                    table_index(USER_DYN_BASE + index as u64 * PAGE_SIZE, 0),
+                    entry,
+                )
+            };
+            return Ok(frame.start_address());
+        }
+        let frame = frame::allocate().ok_or(ENOMEM)?;
+        // SAFETY: 该帧由本空间拥有，且内核 CR3 下其物理地址恒等可写
+        unsafe { core::ptr::write_bytes(frame.start_address() as *mut u8, 0, PAGE_SIZE as usize) };
+        self.dyn_pages[index] = Some(frame);
+        self.dyn_flags[index] = merged;
+        unsafe {
+            write_entry(
+                self.pt,
+                table_index(USER_DYN_BASE + index as u64 * PAGE_SIZE, 0),
+                frame.start_address() | merged,
+            )
+        };
+        Ok(frame.start_address())
+    }
+
+    /// 已映射的共享库窗口页数（统计/日志用）。
+    pub fn dyn_page_count(&self) -> usize {
+        self.dyn_pages.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    /// 用户虚拟地址 → 物理地址（内核 CR3 下写重定位/拷贝段数据用）。
+    ///
+    /// 只覆盖映像窗口与共享库窗口：v0.7/v0.9 动态链接需要写的就是这两处
+    /// （段数据、`.rela` 重定位目标）。未映射返回 `None`（绝不返回一个假地址）。
+    pub fn phys_of(&self, virt: u64) -> Option<u64> {
+        let in_page = virt & (PAGE_SIZE - 1);
+        if (USER_VIRT_BASE..USER_VIRT_BASE + USER_IMAGE_MAX).contains(&virt) {
+            let index = ((virt - USER_VIRT_BASE) / PAGE_SIZE) as usize;
+            return self.image[index].map(|frame| frame.start_address() + in_page);
+        }
+        if (USER_DYN_BASE..USER_DYN_BASE + USER_DYN_MAX).contains(&virt) {
+            let index = ((virt - USER_DYN_BASE) / PAGE_SIZE) as usize;
+            return self.dyn_pages[index].map(|frame| frame.start_address() + in_page);
+        }
+        None
     }
 
     /// 映射一段**原始机器码**（内嵌隔离探针用；位置无关、单页即可）。
@@ -380,6 +455,19 @@ impl UserSpace {
             map_new_page(pt, &mut child.mmap[i], virt, flags)?;
             child.mmap_flags[i] = flags;
             let dst = child.mmap[i].expect("map_new_page 已填槽位").start_address();
+            unsafe { copy_page(src.start_address(), dst) };
+        }
+
+        // 5. 共享库窗口（动态链接的程序被 fork 时，子进程也要有同布局的库页）
+        for i in 0..USER_DYN_PAGES {
+            let Some(src) = self.dyn_pages[i] else {
+                continue;
+            };
+            let virt = USER_DYN_BASE + i as u64 * PAGE_SIZE;
+            let flags = self.dyn_flags[i];
+            map_new_page(pt, &mut child.dyn_pages[i], virt, flags)?;
+            child.dyn_flags[i] = flags;
+            let dst = child.dyn_pages[i].expect("map_new_page 已填槽位").start_address();
             unsafe { copy_page(src.start_address(), dst) };
         }
 
@@ -622,6 +710,13 @@ impl UserSpace {
             let flags = self.mmap_flags[index];
             return if flags & PRESENT == 0 { None } else { Some(flags) };
         }
+        // 共享库窗口（v0.9 动态链接）：库里的 .rodata/.text 必须能被 syscall 的
+        // 缓冲校验认可（例如共享库自己发起的 `write`，缓冲区在库的只读段里）。
+        if page >= USER_DYN_BASE && page < USER_DYN_BASE + USER_DYN_MAX {
+            let index = ((page - USER_DYN_BASE) / PAGE_SIZE) as usize;
+            let flags = self.dyn_flags[index];
+            return if flags & PRESENT == 0 { None } else { Some(flags) };
+        }
         if page < USER_VIRT_BASE {
             return None;
         }
@@ -655,6 +750,12 @@ impl Drop for UserSpace {
             }
         }
         for slot in self.mmap.iter() {
+            if let Some(frame) = slot {
+                frame::free(*frame);
+            }
+        }
+        // 共享库窗口（v0.9 动态链接装载的解释器与 .so）
+        for slot in self.dyn_pages.iter() {
             if let Some(frame) = slot {
                 frame::free(*frame);
             }

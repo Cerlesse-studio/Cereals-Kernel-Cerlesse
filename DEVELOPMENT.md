@@ -26,7 +26,9 @@
   同日**第四步：简化网络栈**（virtio-net + Ethernet → ARP → IPv4 → UDP，ARP 解析网关 + DHCP 往返，
   `make test-network` 13 项）；同日**第五步：基础用户程序（`ls`/`cat`/`echo`/`ps`）** —— 新增
   `getdents`（目录枚举）与 `getprocs`（进程表快照，Cerlesse 扩展号段 256），`/bin` 下四个程序全部可跑
-  （`make test-programs`，17 项 + 5 条正则）；动态链接仍为占位
+  （`make test-programs`，17 项 + 5 条正则）；同日**第六步：内核侧最小动态链接** ——
+  `ET_DYN` 分流 + `PT_INTERP`/`DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`（`make test-dyn` 10 项 +
+  `make dyn-hostcheck` 宿主机 glibc 独立复核），v0.9 六步全部落地
 - 关联文档：[docs/architecture.md](docs/architecture.md) · [docs/roadmap.md](docs/roadmap.md) · [docs/project-structure.md](docs/project-structure.md) · [docs/drivers.md](docs/drivers.md) · [docs/syscall.md](docs/syscall.md) · [docs/filesystem.md](docs/filesystem.md) · [docs/process.md](docs/process.md)
 
 ---
@@ -45,7 +47,7 @@
 | R-06 | 系统调用入口、首批 syscall、用户态隔离 | v0.6 | ✅ |
 | R-07 | VFS + RAMFS + ELF Loader | v0.7 | ✅ |
 | R-08 | 驱动框架、PCI 枚举、磁盘驱动 | v0.8 | ✅ |
-| R-09 | Shell、基础用户程序、简化网络栈 | v0.9 | 🟡（Shell/用户程序 ✅，网络未做） |
+| R-09 | Shell、基础用户程序、简化网络栈、最小动态链接 | v0.9 | ✅（六步全部落地，见第 5 节 v0.9 清单） |
 | R-10 | 权限/凭证、可完整启动的类 Linux 小型 OS | v1.0 | ⬜ |
 
 ### 1.2 主机侧需求（Python / Go）
@@ -61,7 +63,11 @@
 
 ### 1.3 非目标（见 architecture.md 第 5 节）
 
-SMP、USB、Wi-Fi、GPU、完整 POSIX、完整动态链接 ELF、完整 TCP/IP、多架构。
+SMP、USB、Wi-Fi、GPU（**3D 加速**）、完整 POSIX、完整动态链接 ELF、完整 TCP/IP、多架构。
+
+> v1.0 之后另设**桌面环境兼容路线**（内核侧地基与接口对齐：设备模型/`ioctl`/`poll`/evdev/
+> fbdev→KMS/ALSA 子集/ACPI 子集等），规划与里程碑见 [docs/desktop.md](docs/desktop.md)；
+> 它不改变本文档 v1.0 的范围。
 
 ---
 
@@ -102,7 +108,8 @@ boot ──→ arch(x86_64) ──→ interrupt ──→ time
 - `libc`：最小用户态运行时（syscall 封装 + `_start` + `print!/println!` + 堆 + `args`）。
 - `user/*`：`no_std` 用户态程序，产出静态 ELF；当前可运行的有
   `user/hello`（→ RAMFS `/init`）、`user/shell`（→ `/bin/sh`）、`user/hello-bin`（→ `/bin/hello`，外部程序）；
-  `init/ls/cat/echo/ps` 仍为占位（`cat` 先以 Shell 内建命令形式落地）。
+  `init/ls/cat/echo/ps` 曾为占位，现已全部落地（`hello` → `/init`、`shell` → `/bin/sh`、`ls`/`cat`/`echo`/`ps` → `/bin/*`）；
+  `user/init` 本身仍未使用。
 - `tools/`（Python）与 `tools-go/`（Go）**不进 Cargo workspace**，各自独立管理（仅标准库）。
 - 交叉编译在 Linux 与 Windows 主机上均通过 `rustup target add` 相同目标完成（见 docs/boot.md）。
 
@@ -130,6 +137,9 @@ panic = "abort"
   当前 `user/hello`（→ RAMFS `/init`）、`user/shell`（→ `/bin/sh`）、`user/hello-bin`（→ `/bin/hello`）
   与 `user/{ls,cat,echo,ps}`（→ `/bin/*`，v0.9 第五步）均为可运行的真实程序；
   `user/init` 仍是占位（内核实际跑的 `/init` 是 `user/hello` 的构建产物）。
+- `user/dynhello/`：**不是 Rust crate**，而是 v0.9 动态链接的汇编夹具（`dynhello.s`/`libgreet.s`/`ldso.s`）；
+  由 `kernel/build.rs` 用 binutils（`as`+`ld`）在构建期现编并内嵌为 RAMFS `/bin/dynhello` 与 `/lib/*`
+  （裸目标 `x86_64-unknown-none` 不支持 `cdylib`，所以这一组工件不走 cargo）。
 - `tools/`（Python）与 `tools-go/`（Go）**不进 Cargo workspace**，各自独立管理。
 - 交叉编译在 Linux 与 Windows 主机上均通过 `rustup target add` 相同目标完成（见 docs/boot.md）。
 
@@ -155,7 +165,7 @@ panic = "abort"
 | v0.6 | Syscall + User Space + 用户态脚手架 | ✅ 2026-10-10 |
 | v0.7 | VFS + RAMFS + ELF Loader | ✅ 2026-10-11 |
 | v0.8 | Driver + PCI + Disk（FAT 只读 + mkfs） | ✅ 2026-10-11 |
-| v0.9 | Shell + User Programs + Network | 🟡 已落地三步 |
+| v0.9 | Shell + User Programs + Network | ✅ 2026-10-11（六步：用户堆 / 交互式 Shell / 进程对象 / 简化网络栈 / 基础用户程序 / 最小动态链接） |
 | v1.0 | 完整可启动类 Linux 小型 OS | ⬜ |
 
 ### 5.2 v0.1 – v0.5 完成记录（要点）
@@ -266,7 +276,7 @@ panic = "abort"
 - 块 I/O 同步轮询（自旋 + PIT tick 超时），不配置 MSI-X/INTx；
 - 驱动注册表容量固定、启动期写入、之后只读（`main` 只看 `ProbeStats`）。
 
-### v0.9 — Shell + User Programs + Network
+### v0.9 — Shell + User Programs + Network（已实现并通过验收，2026-10-11）
 - [x] **运行时前置条件第一步：用户堆**（2026-10-11 落地）
     - [x] `brk`（256 KiB 窗口，页对齐、增长全成或全不成；“失败返回原值”的 Linux 语义）
     - [x] `mmap`（只收 `MAP_PRIVATE|MAP_ANONYMOUS`，5 参数无 offset；窗口 256 KiB、first-fit；**新页全零**；`PROT_WRITE|PROT_EXEC` → `EINVAL`（W^X））
@@ -321,12 +331,30 @@ panic = "abort"
     - [x] 验收：新增 `make test-programs`（**17 项 + 5 条正则**，QEMU monitor 注入
           `ls` / `ls /bin` / `ps` / `/bin/echo …` / `/bin/cat /etc/motd`）；编排新增 `programs` 场景（13 → **14 场景**）；
           `make test-proc` 的“找不到的程序”负例由 `ls` 改为 `foo`
-- [ ] 动态链接（`PT_INTERP`/`ld.so`）与 `mprotect`（W^X 转换）；文件映射（`mmap` 加 offset）
+- [x] **运行时前置条件第六步：内核侧最小动态链接**（2026-10-11 落地）
+    - [x] `syscall/elf.rs::load` 按 `e_type` 分流：`ET_DYN` → 新增 `syscall/dynamic.rs`（`ET_EXEC` 路径一行未改）
+    - [x] `dynamic.rs`：解析 `PT_INTERP`（→ VFS `/lib/ld.so`）、`PT_DYNAMIC`/`DT_NEEDED`（→ `/lib/<name>`，递归，
+          `MAX_OBJECTS = 8` 挡住 `DT_NEEDED` 环）与 `DT_*` 表项；`DT_PLTREL=REL` **明确拒绝**
+    - [x] 共享库窗口（`address_space.rs`）：`USER_DYN_BASE` = 基址 + 1 MiB、32 页；`map_dyn_page`（幂等、按需、
+          新页全零、同一套 W^X）+ `dyn_page_count` + `phys_of`（内核 CR3 下写重定位）；`fork` 复制窗口、
+          `page_flags` 认可窗口、`Drop` 整树释放
+    - [x] 重定位：`R_X86_64_RELATIVE` 与 `GLOB_DAT`/`JUMP_SLOT`/`R_X86_64_64`（在所有对象的 `.dynsym` 里
+          按名字线性扫描，只认已定义符号）；未知类型跳过并留日志，解析不到符号 → `-ENOEXEC`
+    - [x] 夹具 `user/dynhello/`（`as` + `ld` 现编，`kernel/build.rs` 内嵌）与 RAMFS `/lib`
+          （`fs::init` 新增 `libraries` 参数；`PROGRAM_IMAGES` 7 → 8，与 `LIBRARY_IMAGES` 分开）
+    - [x] 验收：新增 `make test-dyn`（**10 项**：`PT_INTERP`/`NEEDED`/两个装载基址/`JUMP_SLOT` 重定位/
+          `link PASS objects=3 relocs=2`/两条 ring3 输出/`exit code=42`/无帧泄漏）与
+          `make dyn-hostcheck`（**宿主机 glibc `ld.so` 独立复核**同一批 `.s`，两套装载器必须一致）；
+          `make test-user` 的帧回收检查覆盖共享库窗口；`test-fs` 20 → **21 项**（新增 `/lib`）、
+          `test-programs` 条目数断言 `/`=5、`/bin`=7；`make test-all` 加入 `test-dyn`
+- [ ] `mprotect`（W^X 转换）与文件映射（`mmap` 加 offset）
+      （动态链接的**完整**形态 —— 用户态 `ld.so`、版本符号、TLS —— 仍不做，见 architecture.md 第 5 节）
 - [ ] 其余用户程序（cp/mv/rm/mkdir/kill）与 Shell 增强（`cd`、管道、重定向）
       （`ls`/`ps`/`cat`/`echo` 已于 2026-10-11 落地，见上）
 - [ ] TCP（尽力）/ ICMP 与 Socket syscall 最小集（`network/{tcp,socket}.rs` 仍为占位）
 - [x] 验收：Shell 能启动外部程序（`make test-proc`，2026-10-11）；基础用户程序可跑（`make test-programs`，2026-10-11）；
-     网络最小闭环（`make test-network`，2026-10-11）；动态链接与 ping/HTTP 简例仍待落地
+     网络最小闭环（`make test-network`，2026-10-11）；动态链接最小闭环（`make test-dyn` + `make dyn-hostcheck`，2026-10-11）；
+     ping/HTTP 简例（TCP/ICMP）仍待落地
 
 ### 5.7 v1.0 — 完整可启动类 Linux 小型 OS
 
@@ -366,6 +394,23 @@ v0.9 记录的两条踩坑（设计记录，非编号缺陷）：debug 构建下
 
 见 [docs/architecture.md](docs/architecture.md) 第 6 节（ADR-001 … ADR-011）。新增重大决策时追加编号并同步本文。
 
+### 5.10 桌面兼容路线（v1.0 之后，规划）
+
+见 [docs/desktop.md](docs/desktop.md)（现状审计 + 用户态/内核侧归属纠正 + D0–D5 分层 + QEMU 可断言验收）。
+里程碑建议：
+
+| 版本 | 目标 | 验收抓手 |
+| ---- | ---- | ---- |
+| v1.1 | D0 地基：设备模型 + `ioctl` + `poll` + `/proc`/`/sys` 最小视图 | `make test-devfs` / `make test-procfs` |
+| v1.2 | D1 输入：输入核心 + evdev + uinput | `make test-input` |
+| v1.3 | D2a fbdev + `screendump` 像素断言 | `make test-fb` |
+| v1.4 | D2b KMS 子集 + `virtio-gpu` | `make test-kms` |
+| v1.5 | D3 音频 + D4 电源/会话地基 | `make test-snd` / `make test-power` |
+| v1.6+ | D5 网络/文件系统/权限收尾 | 逐项 |
+
+> 优先级修正（见 desktop.md 第 5 节）：**先 D0 地基，再 D1 输入，再 D2 显示**；
+> systemd-logind / D-Bus / PipeWire 是用户态组件，KVM 与桌面前置无关（它是「当宿主」的方向）。
+
 ---
 
 ## 6. 测试方案
@@ -381,6 +426,7 @@ v0.9 记录的两条踩坑（设计记录，非编号缺陷）：debug 构建下
 | 磁盘文件系统 | 双盘启动 → FAT16 启动盘读内核映像 / FAT32 测试盘读·LFN·跨簇·偏移·负例 | Python | v0.8 |
 | 包容器（不启 QEMU） | `.ckc` 确定性、头部逐字段、payload 篡改、ustar 规则、打包期规则 + `tar` 独立复核 | Python | H-06 P0a |
 | 键盘/交互/进程 | QEMU monitor `sendkey` 注入真实按键 → 行缓冲/Shell/进程调用全流程（`--expect-re` 支持正则 + 反向引用） | Python | v0.4，v0.9 扩展 |
+| 动态链接 | 内核装载器（`make test-dyn`）与宿主 glibc `ld.so`（`make dyn-hostcheck`）跑同一份 `.s` 夹具，输出与退出码一致 | Python + binutils | v0.9 |
 
 约定：
 
@@ -466,6 +512,8 @@ qemu-system-x86_64 -machine q35 -m 512M -serial stdio -display none \
 | 2026-10-11 | **v0.9 第三步：进程对象 + `fork`/`execve`/`wait4`** —— `process/process.rs` 换成真正的 PCB（地址空间 / 用户帧 / 每进程 64 KiB 内核栈 + 栈底哨兵 / `return_to` / `Ready\|Running\|Zombie`）；新增 `kernel/src/syscall/process.rs`（fork 复制地址空间与当前帧、execve 换映像并重建 argv 用户栈、wait4 延迟调度 + 回收）；`trampoline` 改为按进程切 CR3/`TSS.RSP0`/syscall 栈顶/当前进程下标； `libc` 新增 `args`（入口寄存器 ABI）并去掉 `fork`/`execve`/`wait4` 的 ENOSYS 说法；新增外部程序 `user/hello-bin` → RAMFS `/bin/hello`，Shell 的 `cmd_external` 改走 `fork`+`execve`+`wait4`；`tests/test_keyboard.py` 新增 `--expect-re`（正则 + 反向引用）；新增 `make test-proc`（8 项 + 4 正则）并加入 `test-all`，编排场景 11 → **12**（新增 `proc`）；`make test-shell` 12 → 11 项；记录两条踩坑（debug 构建下 16 KiB 内核栈静默溢出踩坏 `.bss` 帧分配器；子进程退出时必须先恢复父进程 CR3 再 Drop 地址空间）；同步 syscall/process/libc-README/project-structure/roadmap/README |
 | 2026-10-11 | **v0.9 第二步：交互式 Shell 与 `stdin`** —— 键盘行缓冲（128 字节 + 行编辑，回显由 `KB <字符>` 改为终端式原样回显，`kbd: line ready len=N`）、`read(0)` 行缓冲语义（3 秒 `-EAGAIN`）、新增 `user/shell`（提示符 `root@cerlesse C:>`、内建 `help`/`echo`/`cat`/`pid`/`exit`、外部命令真调 `fork()`）、`kernel/build.rs` 改为多用户程序构建（`/init` + `/bin/sh`）、`syscall/mod.rs` 对已命名未实现的号打印 `syscall: ENOSYS nr=… name=…`；新增 `make test-shell`（12 项）与编排 `shell` 场景（11 场景）；`make test-user` 59 → **61 项**，`test-fs` 根目录 3 → 4；同步 syscall/drivers/process/project-structure/roadmap/README |
 | 2026-10-11 | **v0.9 第一步：用户堆**（运行时前置条件）—— 新增 `kernel/src/syscall/memory.rs`（`mmap`/`munmap`/`brk`：W^X、`MAP_*`/`PROT_*` 白名单、5 参数无 offset 的取舍、逐条错误码）、`address_space.rs` 新增 brk 窗口（256 KiB）与匿名 mmap 窗口（256 KiB，first-fit，清页表项时 `invlpg`）、`libc/heap.rs`（`#[global_allocator]`，bump over mmap）与 `brk/mmap/munmap` 封装、`user/hello` 堆自测、`user.rs` 页帧泄漏检查；`make test-user` 断言 32 → **59 项**，`orchestrate.json` 的 `user` 场景同步；全量回归 PASS（`test-fs` 19 / `test-driver` 22 / `test-fat` 21 / `make go-test` / `make test-orch` 10 场景） |
+| 2026-10-11 | **v0.9 第六步（收官）：内核侧最小动态链接** —— 新增 `kernel/src/syscall/dynamic.rs`（`ET_DYN` 分流：`PT_INTERP` + `DT_NEEDED` → `/lib/<name>` 递归装载，应用 `R_X86_64_RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`64`，`DT_PLTREL=REL` 明确拒绝）；`syscall/elf.rs` 按 `e_type` 分流（`ET_EXEC` 路径不变）；`address_space.rs` 新增共享库窗口（基址 + 1 MiB、32 页）与 `map_dyn_page`/`dyn_page_count`/`phys_of`（内核 CR3 下写重定位），`fork`/`page_flags`/`Drop` 同步；新增夹具 `user/dynhello/`（`as`+`ld` 现编，`kernel/build.rs` 内嵌）与 RAMFS `/lib`（`fs::init` 新增 `libraries` 参数，程序清单 7 → 8）；新增 `make test-dyn`（**10 项**）与 `make dyn-hostcheck`（宿主机 glibc 独立复核）并加入 `test-all`；`test-fs` 20 → **21 项**、`test-programs` 条目数断言 5/7；同步 syscall.md（新增 3.9 + 3.1/3.4/3.8 修订）、architecture.md 第 5 节、roadmap/README/project-structure/api |
 | 2026-10-11 | **H-06 包管理器提案 v1 完成（设计阶段，不进内核主线）**：docs/package-manager.md 从「设想」补成可实施规格 —— 术语字段级定义、七个制品格式（`PKG.toml`/确定性 `.cpk`/`catalog.toml(+sig)`/`cpkg.toml`/receipt/journal/内容寻址 store）、内容哈希 + 三级校验（签名 → 绑定 → 落盘后逐文件）、安全模型（显式信任根、scope 域边界与路径白名单、**纯文件安装/无安装脚本**、setuid 拒绝、威胁—对策表）、事务阶段与原子性边界（文件级 + 可恢复）、效率预算（幂等零写入、文件级去重、`gc`）、CLI 与稳定退出码、MVP 三期（P0 主机侧 `tools/pkgmgr/` → P1 与镜像构建/基线对接 → P2 增量补丁等）、可脚本断言的验收条目（`make test-pkg`）；同步 docs/README.md 索引状态（设计中 → 提案 v1）与 H-06 行 |
+| 2026-10-11 | **新增「桌面环境兼容路线」（v1.0 之后，规划）**：新建 docs/desktop.md —— 现状审计（逐项有据：显示无/输入无 evdev/无 ioctl-poll/无设备模型与 `/proc`/无音频/无 ACPI/security 占位/fs 只读）、用户态与内核侧归属纠正（logind/D-Bus/PipeWire 是用户态；KVM 与桌面前置无关）、被遗漏的地基（设备模型/`ioctl`/`poll`/file-backed mmap/futex/信号/AF_UNIX/`/proc`+`/sys`/memfd）、D0–D5 分层与 QEMU 可断言验收（monitor `sendkey`/`screendump` 实测可用）、里程碑 v1.1–v1.6；本文档新增 5.10 与 1.3 注记，同步 roadmap/architecture/project-structure/docs-README/README |
 
 

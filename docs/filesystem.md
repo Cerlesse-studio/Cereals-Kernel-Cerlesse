@@ -105,7 +105,11 @@ v0.7 **没有**：软/硬链接、权限位（`perms()` 返回固定串 `-rw-r--
 ├── bin/     全部外部程序（内核内嵌；由 Shell fork+execve 起来，见 syscall.md 3.7/3.8）
 │   ├── sh   交互式 Shell ELF（v0.9 第二步）
 │   ├── hello    外部程序：pid + argv（v0.9 第三步）
-│   └── ls / cat / echo / ps   基础用户程序（v0.9 第五步）
+│   ├── ls / cat / echo / ps   基础用户程序（v0.9 第五步）
+│   └── dynhello   动态链接主程序（ET_DYN PIE；v0.9 第六步，见 syscall.md 3.9）
+├── lib/     v0.9 第六步：**被装载的对象**（不是被运行的程序）—— 内核按 PT_INTERP/DT_NEEDED 的名字在此查找
+│   ├── ld.so         PT_INTERP 的落点（被装载、被重定位，但不被进入）
+│   └── libgreet.so   DT_NEEDED=libgreet.so 的落点（导出 greet）
 ├── etc/
 │   └── motd 文本文件（23 字节，用户程序用 open/read 读它）
 └── tmp/     用户程序写文件的落点
@@ -120,16 +124,21 @@ fs: create /init
 fs: write /init bytes=29096
 fs: create /bin/sh
 fs: write /bin/sh bytes=29096
-...             （/bin/hello、/bin/ls、/bin/cat、/bin/echo、/bin/ps 同形：create + write bytes=<ELF 大小>）
+...             （/bin/hello、/bin/ls、/bin/cat、/bin/echo、/bin/ps、/bin/dynhello 同形：create + write bytes=<ELF 大小>）
+fs: mkdir /lib
+fs: create /lib/ld.so
+fs: write /lib/ld.so bytes=<ELF 大小>
+fs: create /lib/libgreet.so
+fs: write /lib/libgreet.so bytes=<ELF 大小>
 fs: mkdir /etc
 fs: create /etc/motd
 fs: write /etc/motd bytes=23
 fs: mkdir /tmp
-fs: ramfs files=8 bytes=162735     （init + 6 个程序 + motd；目录不计入文件数）
+fs: ramfs files=11 bytes=<总计>    （init + 7 个程序 + motd + /lib 的 2 个对象；目录不计入文件数）
 ```
 
-（ELF 字节数随构建变化，断言只写前缀；`files=8` 是**清单长度**的后果 —— 加一个程序就要同步
-`syscall/user.rs::PROGRAM_IMAGES`、`kernel/build.rs::USER_PROGRAMS` 与这里。）
+（ELF 字节数随构建变化，断言只写前缀；`files=11` 是**清单长度**的后果 —— 加一个程序/库就要同步
+`syscall/user.rs::PROGRAM_IMAGES`/`LIBRARY_IMAGES`、`kernel/build.rs` 的构建清单与这里。）
 
 ### 2.6 fd 表与 syscall 对接
 
@@ -152,8 +161,9 @@ fd 编号（与 Linux 一致的形状，见 syscall.md 2.7）：
 - [x] 挂载与初始文件树：`fs: mount point=/ fs=ramfs` / `fs: create /init` / `fs: write /etc/motd bytes=23` / `fs: mkdir /tmp`
 - [x] 元数据与内容：`fs: stat /etc/motd kind=file size=23 perms=-rw-r--r--`、`fs: read /etc/motd len=23 data=motd: hello from ramfs`
 - [x] **挂载点路由**：`fs: mount point=/mnt fs=ramfs-scratch` + `fs: route /mnt/note.txt fs=ramfs-scratch` + `fs: readback /mnt/note.txt len=7 data=v0.7-ok`
-- [x] 目录列举（`ls` 语义）：`fs: ls / entries=4` + 每项 `name/kind/size/perms`
-      （v0.9 前为 3；新增 `/bin` 后变 4，这是个精确断言：根条目变化必须同步改 `fs::selftest` 与测试期望）
+- [x] 目录列举（`ls` 语义）：`fs: ls / entries=5` + 每项 `name/kind/size/perms`
+      （v0.7 为 3；v0.9 第二步新增 `/bin` → 4，第六步新增 `/lib` → 5——这是个精确断言：
+      根条目变化必须同步改 `fs::selftest` 与测试期望）
 - [x] 负例 errno：`fs: negative cases PASS (ENOENT/ENOTDIR/EISDIR/EEXIST/EINVAL)`
 - [x] 文件 syscall 全链路（随 `make test-user`，v0.7 时 32 项、v0.9 起 **61 项**断言）：`user: open path=/etc/motd flags=0x0 fd=3`
       → `user: read fd=3 want=64 got=23` → 内容经 `write` 打到串口 → `user: read fd=3 want=64 got=0`（EOF）
@@ -272,6 +282,7 @@ fs: disk selftest PASS
 | 2026-10-07 | 补记路线细化：明确 VFS 先行/RAMFS 后端/文件描述符表与 syscall 对接顺序、补充 ELF Loader 对接关系、补充 FAT32/mkfs 后续位置 |
 | 2026-10-08 | 本次 docs 迭代统一文档顶部元信息（阶段 / 最后更新 / 状态）与修订记录，保持与 DEVELOPMENT.md 与索引文档描述一致 |
 | 2026-10-11 | 备注：v0.8 的块设备层已落地（`block.rs` + `virtio_blk.rs`，`make test-driver`）；当时 FAT 后端与 `mkfs` 仍未开始 |
+| 2026-10-11 | **v0.9 第六步影响**：RAMFS 新增 `/lib`（`ld.so` + `libgreet.so`，作为**被装载的对象**，见 syscall.md 3.9），`/bin` 再加 `dynhello` → `fs: ramfs files` 8 → **11**，根目录条目数 4 → **5**（2.5 的树/启动日志与 2.7 的 `entries=5` 同步；`make test-fs` 20 → **21 项**）；`fs::init` 新增 `libraries` 参数，`FileSystem` 与 syscall 层无改动（动态链接读库走的就是普通 `vfs::read_all`） |
 | 2026-10-11 | **v0.9 第五步影响**：RAMFS 初始文件树里的 `/bin` 由 1 个程序（`sh`）扩到 6 个（`sh` + `hello` + `ls`/`cat`/`echo`/`ps`），`fs: ramfs files` 2 → **8**（2.5 的树与启动日志同步；根目录条目数仍为 4）；`ls` 从「`/bin/ls` 不存在 → execve ENOENT」变成真实程序（`make test-programs` 断言 `getdents` 真的读了 VFS 目录项） |
 | 2026-10-11 | **v0.9 第二步影响**：RAMFS 初始文件树新增 `/bin`（`/bin/sh` = 交互式 Shell），根目录条目数 3 → 4（`fs::selftest` 与 `make test-fs` 期望同步）；`stdin`（fd 0）改接键盘行缓冲，fd 表描述更新 |
 | 2026-10-11 | **v0.8 磁盘后端落地（收官）**：新增 `fs/fat.rs`（FAT12/16/32 只读：BPB 解析与类型判定、固定根目录区/簇链目录、8.3 + NT 标志 + LFN、偏移读、`EROFS`/`EUCLEAN`）与 `fs::mount_disks`（`/disk` + `/mnt/fat`，验证最长前缀路由）；`FileSystem` trait 收 `&mut self` 且 `read_all` 返回 `Vec<u8>`（磁盘内容不在内存里）；修「单盘启动误判 `/mnt/fat` 已挂」（改用 `vfs::is_mount_point`）；新增 `vfs::is_mount_point`；`make test-fat`（21 项，双盘启动，编排第 10 个场景）；`tools/mkfs/mkfs.py` + `tests/fatroot/`；第 3 节由「后续计划」改写为实现记录 |

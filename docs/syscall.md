@@ -1,13 +1,16 @@
 # 系统调用 / 用户空间 / ELF（阶段文档）
 
-- 阶段：第六阶段（v0.6 – v0.7）+ 第九阶段开局（v0.9 运行时前置条件）
+- 阶段：第六阶段（v0.6 – v0.7）+ 第九阶段（v0.9 运行时前置条件与动态链接）
 - 最后更新：2026-10-11
 - 状态：🟡 v0.7 已落地：**ELF Loader**（从 RAMFS 上的 `/init` 装载，按段权限逐页映射）+ 文件 syscall
   （`read`/`write`/`open`/`close`，对接 VFS/RAMFS）+ 用户 `RW` 段对 ring3 可写；
-  **v0.9 已落地三步**：用户堆（3.5）、`stdin` + 交互式 Shell（3.6）、
-  **进程对象 + `fork`/`execve`/`wait4` + `argc`/`argv`**（3.7，外部程序真的能跑了）；
-  `make test-user` 61 项 / `make test-shell` 11 项 / `make test-proc` 8 项 + 4 条正则 / `make test-fs` 20 项 PASS；
-  仍未做：`mprotect`、环境变量（`envp`）、动态链接（见 3.4）
+  **v0.9 已落地六步**：用户堆（3.5）、`stdin` + 交互式 Shell（3.6）、
+  **进程对象 + `fork`/`execve`/`wait4` + `argc`/`argv`**（3.7，外部程序真的能跑了）、
+  简化网络栈（drivers.md 1.8）、基础用户程序与目录/进程枚举（3.8）、
+  **内核侧最小动态链接**（3.9：`PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`）；
+  `make test-user` 61 项 / `make test-shell` 11 项 / `make test-proc` 8 项 + 4 条正则 /
+  `make test-programs` 17 项 + 5 条正则 / `make test-dyn` 10 项 / `make test-fs` 21 项 PASS；
+  仍未做：`mprotect`、环境变量（`envp`）、**完整**动态链接（用户态 `ld.so`，见 3.9）
 
 > 本文档顶部保留阶段 / 最后更新 / 状态字段，与项目文档维护约定对齐。
 - 依赖：process.md（进程模型）、memory.md（用户地址空间）
@@ -23,7 +26,9 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
 4. **v0.9 第二步（已做）**：`stdin`（键盘行缓冲 → `read(0)` 整行交付）+ 交互式 Shell `/bin/sh`（见 3.6）。
 5. **v0.9 第三步（已做）**：进程对象与 `fork`/`execve`/`wait4` + `argc`/`argv` ——
    Shell 现在能真的跑起外部程序（见 3.7 与 `docs/process.md` 1.4）。
-6. **仍未做**：`mprotect`（W^X 转换）、环境变量（`envp`）、动态链接（`PT_INTERP`/`ld.so`）。
+6. **v0.9 第五·六步（已做）**：基础用户程序与目录/进程枚举（见 3.8）、
+   **内核侧最小动态链接**（见 3.9：`PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`）。
+7. **仍未做**：`mprotect`（W^X 转换）、环境变量（`envp`）、**完整**动态链接（用户态 `ld.so`）。
 
 ## 2. v0.6 实际实现（2026-10-10 落地）
 
@@ -277,6 +282,8 @@ user/hello (Rust + libc)
 
 1. **解析**：只接受 `ELF64 / little-endian / ET_EXEC / EM_X86_64`；每个 `PT_LOAD` 必须在
    用户映像窗口 `[0x0000_0080_0000_0000, +64 KiB)` 内，入口必须落在某个段里；
+   （v0.9 动态链接起，`ET_DYN` 在 `load` 入口分流到 `dynamic.rs`，见 3.9 —— 上面的固定地址
+   规则仍是 `ET_EXEC` 路径的规则，那条路径一行未改）
 2. **映射**：按**页**并集各段权限 —— `p_flags` 的 `W` → `WRITABLE`、非 `X` → `NO_EXEC`；
    页帧在首次映射时分配并清零，同页被多个段覆盖时只并集权限（不重复清零）；
 3. **拷贝**：每段 `p_filesz` 字节写进对应页，`p_memsz - p_filesz` 保持 0（这就是 `.bss`）；
@@ -289,9 +296,10 @@ user/hello (Rust + libc)
 0x0000_0080_0000_0000 + 0x10000  页 16..19  用户栈（16 KiB，RW、NX）
 0x0000_0080_0000_0000 + 0x20000  页 32..95  brk 堆窗口（256 KiB，按需映射，RW、NX；v0.9）
 0x0000_0080_0000_0000 + 0x60000  页 96..159 匿名 mmap 窗口（256 KiB，first-fit，RW 或 RX；v0.9）
+0x0000_0080_0000_0000 + 0x100000 页 256..287 共享库窗口（128 KiB；v0.9 动态链接：解释器 + `.so`）
 ```
 
-四个窗口都在同一张 PT 覆盖的 2 MiB 内（共 160 页），因此仍然只需要一张页表；
+五个窗口都在同一张 PT 覆盖的 2 MiB 内（共 288 页），因此仍然只需要一张页表；
 窗户之间（如页 20..31）没映射 —— ring3 摸到就是 #PF，这是隔离的正常表现。
 
 两个新的构建期/装载期约束（都有实测理由）：
@@ -319,7 +327,7 @@ user/hello (Rust + libc)
 
 ### 3.3 验收（v0.7，实测）
 
-`make test-user`（v0.7 时 32 项；v0.9 第一步增至 59 项，见 3.5）与 `make test-fs`（20 项）
+`make test-user`（v0.7 时 32 项；v0.9 第一步增至 59 项、第三步起 **61 项**，见 3.5）与 `make test-fs`（**21 项**）
 串口断言全部 PASS，关键证据：
 
 - [x] **ELF 从文件装载**：`fs: create /init` → `user: program=/init source=elf bytes=15596 segments=4
@@ -358,12 +366,14 @@ user/hello (Rust + libc)
 - ~~基础用户程序与目录/进程枚举~~ → **已做**（3.8：`getdents` + `getprocs`，`/bin/{ls,cat,echo,ps}`）；
   其余程序（`cp`/`mv`/`rm`/`mkdir`/`kill`）与 Shell 增强（`cd`、管道、重定向）仍未做；
 - `stac`/`clac` 精细控制（内核目前直接读写用户页）、内核高半区迁移；
-- 动态链接 / `PT_INTERP` / `ET_DYN`（只接受 `ET_EXEC` + 无重定位）。
+- ~~动态链接 / `PT_INTERP` / `ET_DYN`~~ → **最小闭环已做**（3.9：`PT_INTERP` + `DT_NEEDED` +
+  `RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`）；**完整**动态链接（用户态 `ld.so`、版本符号、TLS、`rpath`）仍未做。
 
 ### 3.5 用户堆（v0.9 第一步，2026-10-11 落地）
 
 v0.9 的运行时前置条件按依赖顺序补：**先有可分配的用户内存**（本版），再有 `argc/argv`、
-`fork`/`execve`/`wait4` 与进程对象，最后才是动态链接（`ld.so`）与 shell。
+`fork`/`execve`/`wait4` 与进程对象，然后是动态链接与 shell（shell 于 3.6 落地，动态链接的
+最小闭环于 3.9 落地）。
 理由很直接：glibc、`ld.so`、任何真实程序的第一件事都是要堆。
 
 | 项 | 实现位置 | 说明 |
@@ -507,7 +517,7 @@ v0.9 第三步把入口改成按进程切换（当前进程下标 + 每进程内
 
 | 程序 | RAMFS 路径 | 用到的内核能力 | 输出（可与串口逐条对齐） |
 | ---- | ---- | ---- | ---- |
-| `user/ls` | `/bin/ls` | `getdents` | `ls: / entries=4` + 每条 `ls: entry name=… kind=file|dir size=…` |
+| `user/ls` | `/bin/ls` | `getdents` | `ls: / entries=5` + 每条 `ls: entry name=… kind=file|dir size=…` |
 | `user/ps` | `/bin/ps` | `getprocs` | 表头 + 每条 `ps: pid=… ppid=… state=RUNNING comm=…` + `ps: N process(es)` |
 | `user/cat` | `/bin/cat` | `open`/`read`/`write`/`close` | 文件内容 + `cat: /etc/motd bytes=23` |
 | `user/echo` | `/bin/echo` | `argc`/`argv` + 一次 `write` | 参数拼成一行（一次系统调用，与内建 `echo` 的每参数一次 `write` 不同） |
@@ -520,10 +530,11 @@ Linux `task_struct.comm` 的形状）—— `create` 用调试名填充，`execv
 验收（`make test-programs`：注入 `ls` / `ls /bin` / `ps` / `/bin/echo …` / `/bin/cat /etc/motd`，
 17 项 + 5 条正则）：
 
-- [x] `user: getdents path=/ entries=4 returned=4` + `ls: / entries=4`：`ls` 读的是 **VFS 的目录项**
+- [x] `user: getdents path=/ entries=5 returned=5` + `ls: / entries=5`：`ls` 读的是 **VFS 的目录项**
       （v0.7 起 `list()` 只有内核自测用过）；`ls: entry name=bin kind=dir size=0` 证明元数据也被读出来了；
-- [x] `ls: /bin entries=6`：`/bin` 里恰好是这次构建写进去的 6 个程序（`sh`/`hello`/`ls`/`cat`/`echo`/`ps`）——
-      同时证明 `fs::init` 的程序清单是完整的；
+      （`/` 在第五步时是 4 条，3.9 又加了 `/lib` → 5 条）
+- [x] `ls: /bin entries=7`：`/bin` 里恰好是这次构建写进去的 7 个程序
+      （`sh`/`hello`/`ls`/`cat`/`echo`/`ps`/`dynhello`，最后一个见 3.9）—— 同时证明 `fs::init` 的程序清单是完整的；
 - [x] `user: getprocs count=2` + `ps: pid=3 ppid=0 state=RUNNING comm=sh` + `ps: pid=N ppid=3 … comm=ps`：
       `ps` 读的是**内核进程表**：表里恰好是 Shell 与 `ps` 自己，`ppid` 指回 Shell（`fork` 建出的父子关系）；
 - [x] `user: exec pid=N path=/bin/{ls,ps,echo,cat} segments=4 image_pages=5 entry=0x8000000000`：
@@ -532,9 +543,70 @@ Linux `task_struct.comm` 的形状）—— `create` 用调试名填充，`execv
 - [x] `echo program works`：`argv` 经内核写入新进程用户栈后被程序原样打印；
 - [x] `sh: {ls,ps,/bin/echo,/bin/cat}: exit code=0`：四个程序的退出码都沿 `wait4` 回到 Shell。
 
+### 3.9 内核侧最小动态链接（v0.9 第六步，2026-10-11 落地）
+
+v0.9 之前装载器只接受 `ET_EXEC`：ELF 里的地址就是运行地址，内核不做任何加载时重定位
+（`tools/check_user_elf.py` 的第 7 条就是「没有 `SHT_REL/RELA + SHF_ALLOC`」）。这一步把
+**动态链接的最小闭环**在 ring3 里跑通 —— 目标不是「能跑 glibc」，而是让一条真实存在的
+动态链接路径（`PT_INTERP` + `DT_NEEDED` + PLT/GOT 重定位）有可断言的证据。
+
+| 环节 | 实现位置 | 说明 |
+| ---- | ---- | ---- |
+| `ET_DYN` 分流 | `syscall/elf.rs::load` 入口 | `e_type == 3` → `syscall/dynamic.rs::load`；`ET_EXEC` 的静态程序路径**一行未改** |
+| `PT_INTERP` | `syscall/dynamic.rs` | 取出解释器路径（本夹具是 `/lib/ld.so`）→ 从 VFS 读入 → 当作普通共享对象装载 |
+| `DT_NEEDED` | 同上 | 每个依赖名拼成 `/lib/<name>` → VFS 读入 → 装载；支持递归，`MAX_OBJECTS = 8` 挡住 `DT_NEEDED` 环 |
+| `.dynamic` 解析 | 同上 | `DT_STRTAB`/`DT_SYMTAB`/`DT_SYMENT`/`DT_RELA`/`DT_RELASZ`/`DT_RELAENT`/`DT_JMPREL`/`DT_PLTRELSZ`/`DT_PLTREL`/`DT_HASH`；`DT_PLTREL == DT_REL` → **明确拒绝**（避免「看起来跑通了但重定位没做」） |
+| 共享库窗口 | `syscall/address_space.rs` | `USER_DYN_BASE = USER_VIRT_BASE + 1 MiB`、32 页（128 KiB）：`map_dyn_page`（幂等、按需分配、新页全零、同一套 W^X 页权限）依次串排解释器与每个 `.so`；`fork` 复制整个窗口（`UserSpace::clone`） |
+| 重定位 | `syscall/dynamic.rs` | `R_X86_64_RELATIVE`（`base + addend`）与 `GLOB_DAT`/`JUMP_SLOT`/`R_X86_64_64`（在**所有对象**的 `.dynsym` 里按名字线性扫描，命中已定义符号 → 定义对象基址 + `st_value` + addend）；未知类型跳过并留日志，解析不到符号 → `-ENOEXEC` |
+| 写入路径 | `UserSpace::phys_of` | 装载发生在内核 CR3、切用户 CR3 之前，所以段数据与重定位都经「用户虚拟地址 → 物理帧」反查后写（内核恒等映射物理内存） |
+
+地址布局（`address_space.rs` 头部注释同步更新）：
+
+```text
+0x8000000000            映像窗口（主程序 ET_DYN PIE 与静态 ET_EXEC 同址；64 KiB）
+0x8000020000            brk 堆窗口（256 KiB）
+0x8000060000            匿名 mmap 窗口（256 KiB）
+0x8000100000            **共享库窗口**（32 页 = 128 KiB；解释器 + DT_NEEDED 依次串排）
+```
+
+主程序仍在映像窗口：`e_entry`、`argv` 栈、`/init` 等既有路径全部不变，静态与动态程序共用
+同一条装载入口（只在 `e_type` 上分流），装载基址都是 `USER_VIRT_BASE`（链接基址 0 + 基址修正）。
+
+**边界（刻意，与 `docs/architecture.md` 第 5 节一致）**：链接由**内核**做。`PT_INTERP` 指向的
+解释器会被装载和重定位，但**不被进入** —— 真正的用户态 `ld.so` 需要一个能 `mmap` 文件的内核
+（本版 `mmap` 只支持匿名页），留到后续版本。不支持：版本节（`.gnu.version*`）、
+`DT_RPATH/RUNPATH`/`LD_LIBRARY_PATH`（固定 `/lib/<name>`）、TLS、`INIT/FINI`、`DT_REL`
+（x86_64 上均为 `RELA`）、惰性绑定（所有 `JUMP_SLOT` 在装载期填充）。
+
+夹具（`user/dynhello/`，由 binutils `as` + `ld` 在构建期现编，`kernel/build.rs::build_dynamic_fixtures`
+产出到 `$OUT_DIR/dyn/` 并内嵌）：`dynhello.s` 是带 `PT_INTERP`/`DT_NEEDED`/PLT 的 PIE 主程序，
+`libgreet.s` 是导出 `greet` 的共享库，`ldso.s` 是解释器占位。启动时三个工件作为**普通文件**
+落进 RAMFS：`/bin/dynhello`、`/lib/ld.so`、`/lib/libgreet.so`（`fs::init` 新增 `/lib`；
+程序清单 7 → 8，`PROGRAM_IMAGES` 与 `LIBRARY_IMAGES` 分开 —— 后者是「被装载的对象」，
+不是「被直接运行的程序」，这一步与真实系统里「解释器与 `.so` 就是文件系统里的文件」一致）。
+
+验收（`make test-dyn`，10 项串口断言）：
+
+- [x] `dyn: PT_INTERP=/lib/ld.so` + `dyn: NEEDED libgreet.so -> /lib/libgreet.so`：两条路径都是内核
+      从 ELF 里读出来的（不是测试脚本写死的字符串）；
+- [x] `dyn: load <main> base=0x8000000000 segments=4 pages=5` 与 `dyn: load /lib/libgreet.so base=0x8000103000`：
+      主程序在映像窗口、库在共享库窗口，`base` 由装载器选定（对象链接基址是 0）；
+- [x] `dyn: reloc R_X86_64_JUMP_SLOT sym=greet -> obj=/lib/libgreet.so` +
+      `dyn: link PASS objects=3 relocs=2 entry=0x8000001020`：3 个对象、2 条重定位真的应用了
+      （另一条是 `R_X86_64_RELATIVE`）；
+- [x] `main: dynamic link ok`（主程序自己的 `.rodata`）与 `greet: hello from libgreet.so`
+      （共享库的 `.rodata`，在共享库窗口里）—— **两条代码路径都在 ring3 里跑了**，且库里的 `write`
+      缓冲通过了内核的用户缓冲校验（`page_flags` 认这个窗口）；
+- [x] `user: exit code=42`：退出码 = 共享库 `greet()` 的返回值；
+      `user: dynamic link PASS (PT_INTERP + libgreet.so + RELATIVE/JUMP_SLOT)`；
+      `user: frames free before=… after=…` —— 连共享库窗口一起无页帧泄漏。
+- [x] **独立复核**：`make dyn-hostcheck` 用**宿主机的 glibc `ld.so`** 跑同一批 `.s`（`as` + `ld` 重编）——
+      两套完全不同的装载器都要跑出相同的两行输出与 `exit(42)`，才说明 ELF 结构 / 机器码 /
+      重定位语义是对的（与 `mkfs` + mtools 同一个思路；环境无 binutils/glibc 时跳过）。
+
 ## 4. 调用链示例
 
-实际调用链（v0.7 + v0.9 用户堆）：
+实际调用链（v0.7 + v0.9 用户堆 / 动态链接）：
 
 ```text
 用户态 syscall 指令
@@ -549,6 +621,13 @@ Linux `task_struct.comm` 的形状）—— `create` 用调试名填充，`execv
        └─ getprocs → 进程表快照 → 用户缓冲（`user/ps`）
   → dir::sys_getdents
        └─ fs::vfs::list → 定长 88 字节记录 → 用户缓冲（`user/ls`）
+  → elf::load 按 e_type 分流（v0.9 动态链接，3.9）
+       ├─ ET_EXEC → 固定地址逐段装载（v0.7 起）
+       └─ ET_DYN  → dynamic::load
+            ├─ PT_INTERP=/lib/ld.so → VFS 读入 → 装进共享库窗口
+            ├─ 每个 DT_NEEDED → /lib/<name> → VFS 读入 → 装进共享库窗口
+            └─ R_X86_64_RELATIVE / GLOB_DAT / JUMP_SLOT / 64 → 写 GOT/数据槽
+                 → 入口 = 装载基址 + e_entry（`/bin/dynhello`）
   → sysretq 回到用户态（恢复 rdi/rsi/rdx/r10/r8/r9；exit 与 ring3 异常走 leave_user 回内核）
 ```
 
@@ -557,7 +636,8 @@ fd ≥ 3 一律经 VFS 抽象路由，syscall 层不认识具体后端。
 
 ## 5. 非目标 / 后续
 
-- 完整 ELF 动态链接：非第一版目标。
+- **完整** ELF 动态链接：非第一版目标；v0.9 第六步落地的是**内核侧最小闭环**（3.9）——
+  用户态 `ld.so`、版本符号、TLS、`rpath`/`LD_LIBRARY_PATH` 均不在第一版内。
 - 完整 POSIX：非第一版目标。
 - 完整内存保护细节（`stac/clac` 精细控制、内核高半区迁移）：在 v0.7 起记录，必要时追加 ADR。
 
@@ -575,3 +655,4 @@ fd ≥ 3 一律经 VFS 抽象路由，syscall 层不认识具体后端。
 | 2026-10-11 | **v0.9 第三步：`fork`/`execve`/`wait4` + `argc`/`argv`（外部程序真的能跑了）** —— 新增 3.7；`syscall/process.rs` 实现三号（fork 复制地址空间与当前用户帧、execve 换映像并重建 argv 用户栈、wait4 延迟调度 + 回收），`process/process.rs` 换成真正的 PCB（每进程 64 KiB 内核栈 + 栈底哨兵、`Ready/Running/Zombie`、`return_to`），`trampoline` 改为按进程切换（CR3/TSS.RSP0/栈顶/当前进程）；`libc` 去掉「已定号未实现」的说法，新增 `libc/src/args.rs`（`rdi`/`rsi` 入口 ABI）；新增 `user/hello-bin` → `/bin/hello` 作为外部程序；Shell 的 `cmd_external` 改走 `fork`+`execve`+`wait4`（`ls` 现在是“execve 失败 → exit(127)”）；`tests/test_keyboard.py` 新增 `--expect-re`（正则 + 反向引用，用于断言 PID 一致性）；新增 `make test-proc`（8 项 + 4 条正则）并加入 `test-all`，编排场景 11 → **12**（新增 `proc`）；`make test-shell` 12 → **11 项**（去掉两条 ENOSYS 依赖证据，改为断言外部程序路径）；`make test-user` 的 `shell PASS` 断言同步 |
 | 2026-10-11 | **v0.7 落地**：第 3 节从规划改为实现记录 —— ELF Loader（解析/按段权限逐页映射/入口取 `e_entry`）、用户地址布局（映像窗口 64 KiB + 栈 4 页）、段页对齐与 `.lbss` 孤儿段的实测坑、`make user` 的独立 ELF 检查（`tools/check_user_elf.py`）；2.7 填入 `read/open/write/close`（含 fd 表与两条硬规则）；2.10 标注 v0.7 已做项；4 节更新调用链；3.4 列出仍未做项（用户堆/`argc/argv`/`fork` 系/动态链接） |
 | 2026-10-11 | **v0.9 第五步：基础用户程序（`ls`/`cat`/`echo`/`ps`）与目录/进程枚举** —— 新增 3.8；新增 `syscall/dir.rs`（`getdents = 78`，定长 88 字节记录、VFS `list()` 转发、截断语义与 `-EINVAL` 边界）与 `syscall/process.rs::sys_getprocs`（**扩展号段 256**，定长 40 字节记录）；`syscall_table.rs` 的 `SYS_MAX` 256 → 257，并写明「`0..=255` = Linux 语义、`>= 256` = Cerlesse 扩展」；`process/process.rs` 新增定长 `comm: [u8; 16]`（`create` 填充、`execve` 改写为程序名），顶层程序运行前置为 `RUNNING`；`libc` 新增 `getdents`/`getprocs` 与 `dirent_*`/`procinfo_*` 解析器；新增 `user/{ls,cat,echo,ps}` 四个程序（`kernel/build.rs`/`workspace`/`fs::init` 清单 3 → 7）；Shell 的帮助文本补上四个程序并说明「内建遮蔽同名程序」；新增 `make test-programs`（17 项 + 5 条正则）与编排 `programs` 场景（场景数 **13 → 14**）；`make test-proc` 的负例由 `ls` 改为 `foo`（`/bin/ls` 已存在，不能再当“找不到的程序”） |
+| 2026-10-11 | **v0.9 第六步：内核侧最小动态链接** —— 新增 3.9；`syscall/elf.rs::load` 按 `e_type` 分流（`ET_DYN` → 新增 `syscall/dynamic.rs`，`ET_EXEC` 路径不变）；`address_space.rs` 新增共享库窗口（`USER_DYN_BASE` = 基址 + 1 MiB、32 页）与 `map_dyn_page`/`dyn_page_count`/`phys_of`（内核 CR3 下写重定位），`fork` 复制窗口、`page_flags` 认可该窗口、`Drop` 整树释放；`dynamic.rs` 解析 `PT_INTERP`/`PT_DYNAMIC`/`DT_NEEDED`（`/lib/<name>` 递归装载，上限 8 个对象）并应用 `R_X86_64_RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`R_X86_64_64`（按名字线性扫描 `.dynsym`；`DT_PLTREL=REL` 明确拒绝）；新增夹具 `user/dynhello/`（`as`+`ld` 现编，`kernel/build.rs` 内嵌）与 RAMFS `/lib`（`fs::init` 新增 `libraries` 参数，程序清单 7 → 8）；新增 `make test-dyn`（10 项）与 `make dyn-hostcheck`（宿主 glibc 独立复核），`make test-fs` 20 → 21 项、`test-programs` 的 `/` 与 `/bin` 条目数同步 5/7；3.8 的条目数断言与 3.1 的地址布局/`ET_EXEC` 说明同步更新 |
