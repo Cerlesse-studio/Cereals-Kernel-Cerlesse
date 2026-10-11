@@ -18,8 +18,8 @@
   + 独立恢复环境（分层借鉴 KernelSU，但不照搬 Android root 机制），见 [ckm.md](ckm.md)；
   同日再加 **「CSS 存储管理系统」（v1.0 之后，与 CKM 同期）**：磁盘→分区→卷→盘符/挂载点，
   Windows 式盘符 + Linux 式统一 VFS，见 [storage.md](storage.md)；
-  **同日 CSS-1（底层识别）已落地**（GPT/MBR 只读扫描 + `storage_volumes`/`storage_rescan` +
-  `make test-storage`），余下 CSS-2…CSS-6 规划中）
+  **同日 CSS-1（底层识别）与 CSS-2（VFS 收口）均已落地**（GPT/MBR 只读扫描 + `storage_volumes`/`storage_rescan`
+  + 挂载表带卷身份/多挂载点/卸载 + 挂载错误改 errno + `make test-storage`），余下 CSS-3…CSS-6 规划中）
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
 
@@ -127,11 +127,16 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
     **CSS-1（底层识别）已于 2026-10-11 落地**：`kernel/src/storage/`（GPT/MBR 只读扫描 + 卷记录 +
     解析自测）、`storage_volumes`(261)/`storage_rescan`(265)、`mkfs` 的 GPT/MBR 夹具、`libc` 解析器
     与 `/bin/volumes`、`make test-storage` 系列。
+    **CSS-2（VFS 收口）同日落地**：`FileSystem::caps`/`volume_info`、FAT 探测收归 `fs/fat.rs`、
+    挂载表拆「后端 / 挂载点」并带 `vol_id`/`options`（`alias_volume`/`umount`，挂载计数写回卷记录）、
+    挂载错误改 errno、`stat` 行尾 `vol=`、`fs::storage_mount_selftest` 开机自测；
+    `tests/test_boot.py` 增 `--expect-re`（反向引用绑同一 `vol_id`，因为启动盘序列号随镜像构建变化）。
 
 ## 5. 修订记录
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-11 | **CSS-2（VFS 收口）落地** —— `fs::mount` 拆 `backends`/`mounts`（一个后端可被多挂载点引用）+ `vol_id`/`options`/`alias_volume`/`umount`/`route`/`sync_counts`；`FileSystem` 增 `caps`/`volume_info`（保守缺省；RAMFS 可写、FAT 只读+大小写不敏感+卷标）；FAT 探测唯一入口 `fs::fat::probe`/`probe_sector`（删掉 `storage/volume.rs` 里重复的 BPB 判定）、`FatFs::open` → `OpenError{errno,reason}`；`fs::mount_disks` 按卷表挂载并保留 `/disk`/`/mnt/fat` 兼容点；`fs: stat` 行尾 `vol=`；新增 `fs::storage_mount_selftest` 开机自测与 `storage: mount`/`volcheck`/`unmount`/`fs: route` 证据行；`tests/test_boot.py` 增 `--expect-re`；`make test-storage`（31 项 + 2 正则）/`test-storage-mbr`（14 项 + 1 正则）与编排场景 `fs`/`fat`/`storage`/`storage-mbr`/`programs` 全 PASS；第十二阶段与 storage.md 第 2/5/9/10 节同步 |
 | 2026-10-11 | **新增「CSS 存储管理系统规划」（v1.0 之后）** —— 新建 [storage.md](storage.md)：卷模型（设备→分区→卷→盘符/挂载点 + 稳定 `vol_id`）、Windows 式盘符与 Linux 式挂载双视图、VFS 收口与挂载表带卷身份、与 CKM 的接口（能力位 / 判定点 / 号段 261–266）、文件系统支持路线、CSS-1…CSS-6 分期与 11 条验收；本文件标第十二阶段并补 v1.0 之后规划段 |
 | 2026-10-06 | 第一阶段初稿：10 个里程碑 + 25 步依赖顺序 |
 | 2026-10-06 | v0.1 完成，里程碑表标记 ✅ |

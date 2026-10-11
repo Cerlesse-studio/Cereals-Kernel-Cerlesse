@@ -53,7 +53,7 @@
 | 78 | `getdents` | ✅ | 目录枚举，定长 88 字节记录（v0.9 第五步） |
 | 256 | `getprocs` | ✅ | 进程表快照，定长 40 字节记录（v0.9 第五步，扩展号段） |
 | 261 | `storage_volumes` | ✅ | 卷表快照，定长 64 字节记录（CSS-1，只读、无需能力位） |
-| 262–264 | `storage_mount`/`unmount`/`assign_letter` | ENOSYS | CSS-3 待实现（扩展号段） |
+| 262–264 | `storage_mount`/`unmount`/`assign_letter` | ENOSYS | CSS-3 待实现（扩展号段；CSS-2 已先提供**内核内**的 `fs::mount::MountTable::{mount_volume,alias_volume,umount}` 作为它的落点） |
 | 265 | `storage_rescan` | ✅ | 重扫设备的分区与文件系统（CSS-1；设备不存在 `-ENODEV`） |
 | 266 | `storage_format` | ENOSYS | CSS-4 待实现（扩展号段） |
 | 其他 | — | ENOSYS | 号合法但未实现：查表命中 ENOSYS 桩；常见者会打印 `syscall: ENOSYS nr=… name=…` |
@@ -312,19 +312,35 @@ pub trait FileSystem {
     fn mkdir(&mut self, path: &str) -> Result<(), i64>;
     fn list(&mut self, path: &str) -> Result<Vec<DirEntry>, i64>;
     fn usage(&self) -> (usize, usize) { (0, 0) }   // (文件数, 占用字节数)
+    // CSS-2：两个只读查询，缺省是保守实现（只读 / 无卷信息）
+    fn caps(&self) -> FsCaps { FsCaps::read_only_unknown() }
+    fn volume_info(&self) -> VolumeInfo { VolumeInfo::unknown() }
 }
 ```
 
-现有实现：`ramfs::RamFs`（内存，可读写，单文件 ≤ 256 KiB）、`fat::FatFs`（FAT12/16/32 **只读**，写操作 `EROFS`）。
+现有实现：`ramfs::RamFs`（内存，可读写，单文件 ≤ 256 KiB；`caps` = 可写）、
+`fat::FatFs`（FAT12/16/32 **只读**，写操作 `EROFS`；`caps` = 只读 + 大小写不敏感 + 有卷标，
+`volume_info` = BPB 序列号/卷标/容量 —— 与 `storage_volumes` 记录逐字段一致，开机自测 `storage: volcheck` 会验）。
+
+`FsCaps`/`VolumeInfo`/`MountOptions` 都定义在 `fs/vfs.rs`；`ENOTSUP`(-95)=「盘在、格式没后端」，
+与 `ENOENT`（没有）区分。
 
 **VFS 系统级入口**（经挂载表最长前缀路由；`kernel/src/fs/vfs.rs`）：
 `stat` / `read` / `read_all` / `write` / `create` / `mkdir` / `list` / `usage` /
-`is_mount_point` / `backend_name`。
+`is_mount_point` / `backend_name`；CSS-2 追加 `route(path)`（挂载点 + 后端 + `vol_id` + 选项）、
+`backend_caps(path)`、`backend_volume_info(path)`。
 路径工具：`normalize`（拒绝 `.`/`..`）、`components`、`within`。
 
-挂载表（`fs/mount.rs`）：`resolve(path)` → `(&mut dyn FileSystem, String)`；`is_mount_point`；
-启动时 `fs::init` 建立初始树（`/init`、`/etc/motd`、`/tmp`、`/bin`），`fs::mount_disks` 挂
-`/disk`（启动盘）与 `/mnt/fat`（测试盘）。
+挂载表（`fs/mount.rs`）：CSS-2 拆成 **`backends`（后端存储）+ `mounts`（挂载点条目）**，
+一个后端可被多个挂载点引用（同一卷多入口，不是两份数据）。
+`mount(point, fs)`（非卷挂载，如 RAMFS 根）/ `mount_volume(point, fs, vol_id, options)` /
+`alias_volume(point, vol_id, options)`（给已挂载的卷再加一个点）/ `umount(point)`（`/` → `EINVAL`，
+非挂载点 → `ENOENT`；后端不释放），错误一律负数 `i64`；`resolve(path)` → `(&mut dyn FileSystem, String)`；
+`is_mount_point`；`route(path)`；挂载/卸载会把「哪个卷挂了几个点」写回卷记录（偏移 56）。
+启动时 `fs::init` 建立初始树（`/init`、`/etc/motd`、`/tmp`、`/bin`），`fs::mount_disks` 经卷表挂
+`/disk`（启动盘）与 `/mnt/fat`（测试盘，可能不是 FAT → 跳过并打 errno）；
+`fs::storage_mount_selftest` 随后验证多挂载点与卸载（证据行 `storage: mount … vol=… ro=…`、
+`fs: route path=… vol=…`、`fs: stat … vol=…`、`storage: unmount … mounts=…`）。
 
 ### 5.2 驱动：`Driver` trait（`kernel/src/driver/driver.rs`）
 
@@ -447,6 +463,7 @@ make clean
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-11 | **CSS-2（VFS 收口）**：5.1 节的 `FileSystem` 补 `caps`/`volume_info`（保守缺省）、`FatFs::open` 的错误类型改为 `OpenError { errno, reason }`、VFS 入口提 `route`/`backend_caps`/`backend_volume_info`、挂载表改为 `backends`+`mounts` 并补 `mount_volume`/`alias_volume`/`umount`；5.3 号表行标注 262–264 的内核落点已先备好 |
 | 2026-10-11 | 创建本文档：汇总系统调用 ABI（寄存器约定/号表/逐条语义）、errno 表、`libc` API、
 内核内部 trait（`FileSystem`/`Driver`/`BlockDevice`）、主机侧工具 CLI 与 Makefile 目标 |
 | 2026-10-11 | 补记 v0.9 第六步（最小动态链接）：5.5 构建期接口新增 `as`+`ld` 夹具说明；第 7 节新增 `test-dyn`（10 项）与 `dyn-hostcheck`、补上漏记的 `test-programs`/`test-network` 行，`test-fs` 20 → 21 |

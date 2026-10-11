@@ -216,6 +216,86 @@ impl Geometry {
     }
 }
 
+// ---- CSS-2：探测入口（`docs/storage.md` 5.1 / 5.3）----
+//
+// 「这个偏移上有没有 FAT」**只能**由 FAT 后端自己回答（探测顺序由 `storage::volume` 固定，
+// 不让后端互相争抢）。CSS-1 时这份 BPB 判断曾在 `storage/volume.rs` 里被抄写过一遍；
+// CSS-2 把它收回到这里，于是「FAT 的规则」在内核里只有一处（`Geometry::parse` + 本文件）。
+
+/// 探测结果（三种结局，调用方不需要猜）。
+pub enum ProbeOutcome {
+    /// 读引导扇区失败：设备消失 / I/O 错误（不是「不是 FAT」）。
+    ReadFailed,
+    /// 这个偏移上不是 FAT（没有 `0xAA55`，或 BPB 自相矛盾）。
+    NotFat,
+    /// 是 FAT。
+    Fat(FatProbe),
+}
+
+/// 探测命中的 FAT 卷（几何 + BPB 里的自带标识）。
+#[derive(Clone, Copy)]
+pub struct FatProbe {
+    /// 卷几何（含 FAT12/16/32 类型）。
+    pub geometry: Geometry,
+    /// 卷序列号（BPB `BS_VolID`，**未**加类型前缀）。
+    pub serial: u32,
+    /// 卷标原始 11 字节（未规范化；规范化由 `storage::volume` 做，记录里只放规范形式）。
+    pub label: [u8; 11],
+    /// 卷容量（取「BPB 说的扇区数 × 512」与「调用方给的容量」的较小值）。
+    pub total_bytes: u64,
+}
+
+/// 探测 `start_lba` 起、`sectors` 个扇区的卷是不是 FAT（只读；不挂载、不修改任何字节）。
+///
+/// `sectors` 是**卷**的大小（无分区表的整盘，或分区表里的一个分区），因此
+/// 「卷比它所在的分区还大」会被 `Geometry::parse` 拒绝 —— 这是分区探针能否工作的前提。
+pub fn probe(dev: &mut dyn BlockDevice, start_lba: u64, sectors: u64) -> ProbeOutcome {
+    let mut boot = [0u8; SECTOR_SIZE as usize];
+    match dev.read(start_lba, &mut boot) {
+        Ok(got) if got == boot.len() => {}
+        _ => return ProbeOutcome::ReadFailed,
+    }
+    match probe_sector(&boot, sectors.saturating_mul(SECTOR_SIZE as u64)) {
+        Some(hit) => ProbeOutcome::Fat(hit),
+        None => ProbeOutcome::NotFat,
+    }
+}
+
+/// 从一个已读出的引导扇区判断是不是 FAT（`probe` 的纯函数内核；没有设备依赖）。
+///
+/// 规则与 `Geometry::parse` 同源：扇区大小必须是 512、簇大小必须是 2 的幂、
+/// 保留扇区/FAT 数非零、BPB 的卷不能大于设备容量 —— 任何一条不满足都答
+/// [`ProbeOutcome::NotFat`]（由调用方继续试后面的格式）。
+pub fn probe_sector(boot: &[u8], capacity_bytes: u64) -> Option<FatProbe> {
+    if boot.len() < SECTOR_SIZE as usize {
+        return None;
+    }
+    if boot[510] != 0x55 || boot[511] != 0xAA {
+        return None;
+    }
+    let geometry = Geometry::parse(boot, capacity_bytes).ok()?;
+    let (serial, label) = bp_identity(boot, geometry.fat_type);
+    let total_bytes = capacity_bytes.min(geometry.total_sectors as u64 * SECTOR_SIZE as u64);
+    Some(FatProbe { geometry, serial, label, total_bytes })
+}
+
+/// BPB 里的身份字段：序列号与卷标的偏移**按 FAT 类型**取。
+///
+/// FAT12/16 在 `0x27` / `0x2B`，FAT32 在 `0x43` / `0x47`（都在扩展引导签名 `0x29` 之后）。
+/// 不按类型区分就会把 FAT12/16 的序列号读成 0，于是所有 FAT12/16 卷的 `vol_id` 撞在一起。
+fn bp_identity(boot: &[u8], fat_type: FatType) -> (u32, [u8; 11]) {
+    let (serial_off, label_off) = if fat_type == FatType::Fat32 { (0x43, 0x47) } else { (0x27, 0x2B) };
+    let serial = u32::from_le_bytes([
+        boot[serial_off],
+        boot[serial_off + 1],
+        boot[serial_off + 2],
+        boot[serial_off + 3],
+    ]);
+    let mut label = [0u8; 11];
+    label.copy_from_slice(&boot[label_off..label_off + 11]);
+    (serial, label)
+}
+
 /// 目录的形态：12/16 的根目录是**固定区域**，其余（含 FAT32 根）是**簇链**。
 #[derive(Clone, Copy)]
 enum DirRef {
@@ -419,6 +499,33 @@ fn scan_dir_sector(sector: &[u8], out: &mut Vec<RawEntry>, lfn: &mut Lfn) -> boo
 }
 
 /// FAT 文件系统实例。
+/// 打开失败的原因：**errno**（给调用方做错误语义，CSS-2 起挂载失败不再只是一句话）
+/// + 一句话（给人看的证据行）。
+pub struct OpenError {
+    /// `-EIO`（读失败）/ `-ENOTSUP`（不是 FAT）/ `-EUCLEAN`（是 FAT 但 BPB 自相矛盾）。
+    pub errno: i64,
+    /// 人读的原因（`fs: mount point=… failed errno=… : <reason>`）。
+    pub reason: &'static str,
+}
+
+impl OpenError {
+    /// 设备读失败。
+    fn io(reason: &'static str) -> Self {
+        Self { errno: vfs::EIO, reason }
+    }
+
+    /// 不是这个格式（例如整盘上带着 MBR 分区表）。
+    fn not_fat(reason: &'static str) -> Self {
+        Self { errno: vfs::ENOTSUP, reason }
+    }
+
+    /// 是 FAT，但结构自相矛盾（BPB 校验不过）。
+    fn corrupt(reason: &'static str) -> Self {
+        Self { errno: vfs::EUCLEAN, reason }
+    }
+}
+
+/// FAT 文件系统实例。
 pub struct FatFs {
     /// 底层块设备（独占借用；挂载表持有本后端）
     dev: &'static mut dyn BlockDevice,
@@ -426,19 +533,26 @@ pub struct FatFs {
     name: &'static str,
     /// 卷几何
     geometry: Geometry,
+    /// 卷序列号（BPB `BS_VolID`；CSS-2 的 `volume_info` 用）
+    serial: u32,
+    /// 卷标原始 11 字节（未规范化；CSS-2 的 `volume_info` 用）
+    volume_label: [u8; 11],
 }
 
 impl FatFs {
     /// 打开块设备上的 FAT 卷（读引导扇区 + 解析 BPB）。
     ///
-    /// 失败原因（都会打印到调用方日志里）：
+    /// 失败原因（errno 见 [`OpenError`]）：
     /// - 设备读失败（[`vfs::EIO`]）；
-    /// - 没有 `0xAA55` 引导签名 —— 说明这不是一个 FAT 卷（例如带着 MBR 分区表）；
-    /// - BPB 自相矛盾（扇区大小/簇大小/卷比设备大），见 [`Geometry::parse`]。
-    pub fn open(dev: &'static mut dyn BlockDevice) -> Result<Self, &'static str> {
+    /// - 没有 `0xAA55` 引导签名 —— 说明这不是一个 FAT 卷（例如带着 MBR 分区表），
+    ///   这与「盘不在」不同，因此是 [`vfs::ENOTSUP`]；
+    /// - BPB 自相矛盾（扇区大小/簇大小/卷比设备大），见 [`Geometry::parse`] → [`vfs::EUCLEAN`]。
+    pub fn open(dev: &'static mut dyn BlockDevice) -> Result<Self, OpenError> {
         let mut fs = Self {
             dev,
             name: "fat",
+            serial: 0,
+            volume_label: [0u8; 11],
             geometry: Geometry {
                 fat_type: FatType::Fat12,
                 bytes_per_sector: 0,
@@ -455,13 +569,19 @@ impl FatFs {
         };
 
         let mut boot = [0u8; SECTOR_SIZE as usize];
-        fs.read_bytes(0, &mut boot).map_err(|_| "fat: cannot read the boot sector")?;
+        fs.read_bytes(0, &mut boot)
+            .map_err(|_| OpenError::io("fat: cannot read the boot sector"))?;
         if boot[510] != 0x55 || boot[511] != 0xAA {
-            return Err("fat: boot signature 0xAA55 missing (not a FAT volume?)");
+            return Err(OpenError::not_fat(
+                "fat: boot signature 0xAA55 missing (not a FAT volume?)",
+            ));
         }
         let capacity = fs.dev.capacity_bytes();
-        fs.geometry = Geometry::parse(&boot, capacity)?;
+        fs.geometry = Geometry::parse(&boot, capacity).map_err(OpenError::corrupt)?;
         fs.name = fs.geometry.fat_type.name();
+        let (serial, label) = bp_identity(&boot, fs.geometry.fat_type);
+        fs.serial = serial;
+        fs.volume_label = label;
         Ok(fs)
     }
 
@@ -664,6 +784,32 @@ impl FatFs {
 impl FileSystem for FatFs {
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// CSS-2：FAT 后端的能力位（只读、大小写不敏感、8.3 与 LFN）。
+    ///
+    /// `read_only = true` 就是「只读的原因」的数据来源：挂载行里的 `ro=ro-backend`
+    /// 不是写死的字面量，而是这里问出来的（写支持见 `docs/storage.md` CSS-4）。
+    fn caps(&self) -> vfs::FsCaps {
+        vfs::FsCaps {
+            read_only: true,
+            case_insensitive: true,
+            max_name_len: 255,
+            has_label: true,
+        }
+    }
+
+    /// CSS-2：卷自带标识（序列号 + BPB 卷标原始字节）。
+    ///
+    /// 挂载后会与 `storage_volumes` 的记录逐字段比对（`fs::storage_mount_selftest`）：
+    /// 两边认的是同一张 BPB，这就是「记录布局这个 ABI 被消费者读对了」的另一半证据。
+    fn volume_info(&self) -> vfs::VolumeInfo {
+        vfs::VolumeInfo {
+            serial: Some(self.serial),
+            label: self.volume_label,
+            label_len: vfs::VolumeInfo::trimmed_len(&self.volume_label),
+            total_bytes: self.geometry.total_sectors as u64 * SECTOR_SIZE as u64,
+        }
     }
 
     fn stat(&mut self, path: &str) -> Result<Metadata, i64> {

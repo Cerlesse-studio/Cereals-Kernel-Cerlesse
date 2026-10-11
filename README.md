@@ -95,7 +95,7 @@ root@cerlesse C:>
 ```
 
 - **一条命令进入可用系统**：`make run` 构建引导器 + 内核 + 磁盘镜像并启动 QEMU，串口就是控制台。
-- **每一层都有可复现的验收入口**：`make test-all` 跑 20 个集成测试目标加边界门禁，覆盖引导 / 异常 / 内存 / 中断 / 调度 / IPC / 文件系统 / 存储（分区/卷/盘符） / 驱动 / 网络 / 用户态；`make test-orch` 再用 Go 编排器并行跑 17 个场景并二次复核串口日志。
+- **每一层都有可复现的验收入口**：`make test-all` 跑 20 个集成测试目标加边界门禁，覆盖引导 / 异常 / 内存 / 中断 / 调度 / IPC / 文件系统 / 存储（分区/卷/多挂载点/卸载） / 驱动 / 网络 / 用户态；`make test-orch` 再用 Go 编排器并行跑 17 个场景并二次复核串口日志。
 - **机制与功能分层，而且边界有门禁**：内核只提供机制，Shell、`init`、`libc`、coreutils 位于独立 workspace [`userland/`](userland/README.md)。把 `userland/` 整个移出 checkout，`make image-kernel` 仍能产出可启动镜像（`make test-kernel-only` 通过），`make check-boundary` 会挡住把依赖加回来的提交。
 - **可读的设计与踩坑记录**：每个子系统一份规格文档（含「为什么这样做」和真实故障复盘），入口见 [文档索引](docs/README.md)。
 
@@ -115,7 +115,7 @@ root@cerlesse C:>
 | `make test-fs` / `make test-fat` | VFS + RAMFS / FAT12/16/32 只读后端（双盘启动） |
 | `make test-driver` / `make test-network` | PCI 枚举 + virtio-blk / virtio-net + ARP + DHCP |
 | `make test-dyn` / `make dyn-hostcheck` | 内核侧最小动态链接 / 同一批夹具交给宿主机 glibc `ld.so` 复核 |
-| `make test-storage` / `make test-storage-mbr` | GPT / MBR 分区镜像的卷枚举（`storage_volumes`）+ 主机侧夹具复核 |
+| `make test-storage` / `make test-storage-mbr` | GPT / MBR 分区镜像的卷枚举（`storage_volumes`）+ VFS 收口（卷身份上挂载点、多挂载点、卸载）+ 主机侧夹具复核 |
 | `make check` / `make check-boundary` | 主机侧门禁（边界 + Go 单测）/ 内核不得依赖用户态 |
 | `make test-orch` / `make test-pkg` | 17 个场景并行编排 / CKC 包容器 `.ckc`（主机侧，不启 QEMU） |
 
@@ -143,7 +143,7 @@ tests/     QEMU 集成测试与编排    docs/      开发文档（每个子系�
 | [docs/filesystem.md](docs/filesystem.md) · [docs/drivers.md](docs/drivers.md) | VFS、RAMFS、FAT / 驱动框架、PCI、virtio、网络栈 |
 | [docs/roadmap.md](docs/roadmap.md) · [docs/desktop.md](docs/desktop.md) | 路线图 / v1.0 之后的桌面环境兼容路线 |
 | [docs/ckm.md](docs/ckm.md) · [docs/package-manager.md](docs/package-manager.md) | CKM（内核级权限控制与扩展管理）规划：权限模型、内核接口、扩展生命周期 / `.ckc` 包格式与事务 |
-| [docs/storage.md](docs/storage.md) | CSS（存储管理）规划：卷模型与稳定标识、Windows 式盘符 + Linux 式挂载双视图、VFS 收口、与 CKM 的权限/持久化对接 |
+| [docs/storage.md](docs/storage.md) | CSS（存储管理）规划：卷模型与稳定标识、Windows 式盘符 + Linux 式挂载双视图、VFS 收口（**CSS-1/CSS-2 已落地**）、与 CKM 的权限/持久化对接 |
 
 ## 当前状态
 
@@ -163,7 +163,10 @@ Cerlesse Kernel + CKM 内核控制核心 + CKM 用户态管理服务 + 可插拔
 
 存储侧有一条并列的路线（[CSS 存储管理提案](docs/storage.md)）：**像 Windows 一样管理磁盘与卷**
 （盘符、卷标、稳定卷标识、多挂载点），**像 Linux 一样通过统一 VFS 兼容多种文件系统**
-（新格式只是再实现一个 `FileSystem`）。第一版只做 GPT/MBR **只读**扫描与卷管理，写能力按格式逐阶段开放。
+（新格式只是再实现一个 `FileSystem`）。**已落地 CSS-1（底层识别）与 CSS-2（VFS 收口）**：
+GPT/MBR 只读扫描 + 稳定 `vol_id` + `storage_volumes`/`storage_rescan`，挂载表带卷身份、一个卷可挂多个点、
+卸载后卷仍在表里、挂载失败给 errno（`EEXIST`/`ENOSPC`/`ENOTSUP`/`EUCLEAN`…）；
+盘符分配（CSS-3）与写能力（CSS-4：FAT → exFAT → ext2）按阶段开放，第一版不写分区表。
 
 逐版本的实现记录、验收证据与踩坑见 [DEVELOPMENT.md](DEVELOPMENT.md) 第 5 节，路线图见 [docs/roadmap.md](docs/roadmap.md)。
 

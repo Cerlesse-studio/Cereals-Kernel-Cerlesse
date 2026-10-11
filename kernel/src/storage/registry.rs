@@ -50,6 +50,49 @@ pub fn volume_count() -> usize {
     count
 }
 
+/// 按稳定标识找卷（CSS-2：挂载表用它把「挂载点」接到「卷」上）。
+pub fn find(vol_id: &str) -> Option<&'static Volume> {
+    for i in 0..MAX_VOLUMES {
+        if let Some(volume) = volume_at(i) {
+            if volume.id.as_str() == vol_id {
+                return Some(volume);
+            }
+        }
+    }
+    None
+}
+
+/// 按「块设备号 + 分区号」找卷（CSS-2：挂载一块整盘时用它取卷身份）。
+///
+/// 分区表里的卷 `part_index >= 1`；无分区表的整盘卷是 `part_index == 0`。
+pub fn find_at(disk_id: u16, part_index: u8) -> Option<&'static Volume> {
+    for i in 0..MAX_VOLUMES {
+        if let Some(volume) = volume_at(i) {
+            if volume.disk_id == disk_id && volume.part_index == part_index {
+                return Some(volume);
+            }
+        }
+    }
+    None
+}
+
+/// 更新某卷的挂载点数（记录偏移 56）。
+///
+/// **唯一写入方是挂载表**（`fs::mount::MountTable::sync_counts`）：挂载计数是
+/// 「挂载表的状态」而不是「卷自身的属性」，因此不允许别处各自 `+= 1` ——
+/// 那种写法迟早会漏掉一次卸载，然后永远多 1。返回是否找到该卷。
+pub fn set_mount_count(vol_id: &str, count: u32) -> bool {
+    for i in 0..MAX_VOLUMES {
+        if let Some(slot) = slots().get_mut(i).and_then(|s| s.as_mut()) {
+            if slot.id.as_str() == vol_id {
+                slot.mount_count = count;
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// 扫描全部块设备并（可选）重建卷表。
 ///
 /// 证据行的顺序是「磁盘/分区行 → （冲突检测后）卷行」：卷的健康状态会被**卷表整体**
@@ -68,6 +111,9 @@ pub fn scan_all(reset: bool) -> Result<usize, &'static str> {
     for index in 0..block::count() {
         log_disk_volumes(index);
     }
+    // 重建出来的卷记录里 `mounts` 是 0，但已经挂着的卷并没有卸载 ——
+    // 按挂载表重放一次（CSS-2：`/bin/volumes` 看到的计数必须与挂载表一致）。
+    crate::fs::mount::table().sync_counts();
     Ok(volume_count())
 }
 
@@ -84,6 +130,7 @@ pub fn rescan_disk(index: usize) -> Result<usize, &'static str> {
     scan_disk(index)?;
     detect_conflicts();
     log_disk_volumes(index);
+    crate::fs::mount::table().sync_counts();
     serial::print("storage: rescan disk=");
     serial::print_dec(index as u64);
     serial::print(" volumes=");

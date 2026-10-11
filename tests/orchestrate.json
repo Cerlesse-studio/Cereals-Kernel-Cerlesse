@@ -189,7 +189,7 @@
         "--expect", "fs: mount point=/ fs=ramfs",
         "--expect", "fs: create /init",
         "--expect", "fs: write /etc/motd bytes=23",
-        "--expect", "fs: stat /etc/motd kind=file size=23 perms=-rw-r--r--",
+        "--expect", "fs: stat /etc/motd kind=file size=23 perms=-rw-r--r-- vol=-",
         "--expect", "fs: read /etc/motd len=23 data=motd: hello from ramfs",
         "--expect", "fs: mount point=/mnt fs=ramfs-scratch",
         "--expect", "fs: route /mnt/note.txt fs=ramfs-scratch",
@@ -205,7 +205,7 @@
         "fs: mount point=/ fs=ramfs",
         "fs: create /init",
         "fs: write /etc/motd bytes=23",
-        "fs: stat /etc/motd kind=file size=23 perms=-rw-r--r--",
+        "fs: stat /etc/motd kind=file size=23 perms=-rw-r--r-- vol=-",
         "fs: read /etc/motd len=23 data=motd: hello from ramfs",
         "fs: mount point=/mnt fs=ramfs-scratch",
         "fs: route /mnt/note.txt fs=ramfs-scratch",
@@ -312,7 +312,14 @@
         "--expect", "storage: vol id=fs:111111112222 disk=1 part=2 fs=ext4 label=cerlesse-ex letter=- mounts=0 ro=ro-backend health=unsupported",
         "--expect", "storage: vol id=raw:4 disk=4 part=0 fs=unsupported label=- letter=- mounts=0 ro=ro-backend health=unsupported",
         "--expect", "storage: parse selftest PASS (cases=11 checks=45)",
-        "--expect", "storage: selftest PASS (checks=124)"
+        "--expect", "storage: selftest PASS (checks=124)",
+        "--expect", "fs: storage mount selftest begin",
+        "--expect", "fs: alias point=/volumes/NO_NAME offset=4096 bytes=64 (same bytes as /disk/KERNEL.ELF)",
+        "--expect", "fs: after unmount path=/volumes/NO_NAME/KERNEL.ELF errno=2",
+        "--expect", "fs: mount negative cases PASS (ENOENT/EINVAL/EEXIST)",
+        "--expect", "fs: storage mount selftest PASS",
+        "--expect-re", "fs: route path=/volumes/NO_NAME/KERNEL.ELF point=/volumes/NO_NAME vol=(fs:[0-9a-f]+) fs=fat16 ro=ro-backend.*?fs: stat path=/volumes/NO_NAME/KERNEL.ELF kind=file size=[0-9]+ vol=\\1",
+        "--expect-re", "storage: mount point=/disk vol=(fs:[0-9a-f]+) ro=ro-backend.*?storage: volcheck id=\\1 backend=fat16 caps=ro-backend case=insensitive label=NO_NAME bytes=67108864 record=ok.*?storage: mount point=/volumes/NO_NAME vol=\\1 ro=ro-backend.*?fs: route path=/volumes/NO_NAME/KERNEL.ELF point=/volumes/NO_NAME vol=\\1 fs=fat16 ro=ro-backend.*?storage: unmount point=/volumes/NO_NAME vol=\\1 mounts=1.*?fs: after unmount"
       ],
       "serialLog": "build/orch/storage/serial.log",
       "expect": [
@@ -325,7 +332,8 @@
         "storage: vol id=fs:111111112222 disk=1 part=2 fs=ext4 label=cerlesse-ex letter=- mounts=0 ro=ro-backend health=unsupported",
         "storage: vol id=raw:4 disk=4 part=0 fs=unsupported label=- letter=- mounts=0 ro=ro-backend health=unsupported",
         "storage: parse selftest PASS (cases=11 checks=45)",
-        "storage: selftest PASS (checks=124)"
+        "storage: selftest PASS (checks=124)",
+        "fs: storage mount selftest PASS"
       ],
       "timeoutSec": 70
     },
@@ -345,7 +353,9 @@
         "--expect", "storage: disk index=2 dev=virtio-blk2 sectors=10240 table=MBR partitions=2 health=degraded",
         "--expect", "storage: vol id=fs:66602620 disk=1 part=1 fs=fat12 label=EFI-ESP letter=- mounts=0 ro=ro-backend health=ok",
         "--expect", "storage: vol id=pt:1-6-14338 disk=1 part=6 fs=unsupported label=- letter=- mounts=0 ro=ro-backend health=unsupported",
-        "--expect", "storage: selftest PASS (checks=82)"
+        "--expect", "storage: selftest PASS (checks=82)",
+        "--expect", "fs: storage mount selftest PASS",
+        "--expect-re", "storage: mount point=/disk vol=(fs:[0-9a-f]+) ro=ro-backend.*?storage: unmount point=/volumes/NO_NAME vol=\\1 mounts=1"
       ],
       "serialLog": "build/orch/storage-mbr/serial.log",
       "expect": [
@@ -355,7 +365,8 @@
         "storage: disk index=2 dev=virtio-blk2 sectors=10240 table=MBR partitions=2 health=degraded",
         "storage: vol id=fs:66602620 disk=1 part=1 fs=fat12 label=EFI-ESP letter=- mounts=0 ro=ro-backend health=ok",
         "storage: vol id=pt:1-6-14338 disk=1 part=6 fs=unsupported label=- letter=- mounts=0 ro=ro-backend health=unsupported",
-        "storage: selftest PASS (checks=82)"
+        "storage: selftest PASS (checks=82)",
+        "fs: storage mount selftest PASS"
       ],
       "timeoutSec": 70
     },

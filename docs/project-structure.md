@@ -92,10 +92,10 @@ Cerlesse/
 | `kernel/src/process/` | 进程/线程模型、PID、状态机 | v0.5 |
 | `kernel/src/scheduler/` | 调度队列、Round Robin | v0.5 |
 | `kernel/src/syscall/` | 系统调用入口/分发、用户地址空间、ELF Loader、首批与文件 syscall、**用户堆（`memory.rs`：`brk`/`mmap`/`munmap`）**、**进程调用（`process.rs`：`fork`/`execve`/`wait4` + argv 用户栈 + `getprocs`）**、**目录枚举（`dir.rs`：`getdents`）**、**最小动态链接（`dynamic.rs`：`ET_DYN`/`PT_INTERP`/`DT_NEEDED`/重定位）** | v0.6–v0.7 ✅ / v0.9 第一·三·五·六步 ✅ |
-| `kernel/src/fs/` | VFS 抽象（trait + 路径工具）、挂载表路由、RAMFS、fd 表、**FAT12/16/32 只读后端** | v0.7 ✅ / v0.8 ✅ |
+| `kernel/src/fs/` | VFS 抽象（trait + 路径工具）、挂载表路由、RAMFS、fd 表、**FAT12/16/32 只读后端**；**CSS-2 收口：后端能力位/卷信息、挂载表带卷身份与多挂载点、卸载、挂载错误改 errno** | v0.7 ✅ / v0.8 ✅ / CSS-2 ✅ |
 | `kernel/src/driver/` | 串口（v0.1）、键盘（v0.4）、**驱动注册框架 / PCI 枚举 / 块设备抽象 / virtio-blk**（v0.8 ✅） | v0.4 / v0.8 |
 | `kernel/src/driver/{pci,driver,block,virtio_blk}.rs` | `pci` 只回答「总线上有什么」；`driver` 回答「谁来管它」（`Driver` trait + `probe_all`）；`block` 是上层唯一可见的按扇区接口；`virtio_blk` 是具体实现（同时实现 `Driver` 与 `BlockDevice`） | v0.8 ✅ |
-| `kernel/src/fs/fat.rs` | 块设备上的 FAT12/16/32 **只读**后端（第二个 `FileSystem` 实现）：BPB 解析、固定根目录区/簇链目录、8.3 + NT 标志 + LFN、任意偏移读；写操作 `EROFS`；损坏结构 `EUCLEAN` | v0.8 ✅ |
+| `kernel/src/fs/fat.rs` | 块设备上的 FAT12/16/32 **只读**后端（第二个 `FileSystem` 实现）：BPB 解析、固定根目录区/簇链目录、8.3 + NT 标志 + LFN、任意偏移读；写操作 `EROFS`；损坏结构 `EUCLEAN`；**CSS-2 起同时是 FAT 的探测唯一入口（`probe`/`probe_sector`）与 `caps`/`volume_info` 的提供方，`open` 返回 `OpenError{errno,reason}`** | v0.8 ✅ / CSS-2 ✅ |
 | `kernel/src/memory/frame.rs` | 位图帧分配器；v0.8 追加 `allocate_contiguous` / `free_contiguous`（virtqueue 与 DMA 要求的物理连续缓冲） | v0.3 ✅ / v0.8 ✅ |
 | `kernel/src/arch/x86_64/port.rs` | 端口 I/O 统一入口：`inb/inw/inl` + `outb/outw/outl`（PCI 配置空间与 legacy virtio 寄存器窗口依赖 32 位读写） | v0.8 ✅ |
 | `kernel/src/ipc/` | 管道、通道、共享内存 | v0.5+ |
@@ -142,13 +142,13 @@ CKM（内核级权限控制与扩展管理，见 [ckm.md](ckm.md)）预计新开
 ### 3.2 CSS 规划新增（第十二阶段，尚未创建）
 
 CSS（存储管理，见 [storage.md](storage.md)）预计新开/扩展以下目录；**当前都还不存在或未扩展**，
-按 CSS-1…CSS-6 分期创建并回填（**CSS-1 已落地**）：
+按 CSS-1…CSS-6 分期创建并回填（**CSS-1/CSS-2 已落地**）：
 
 | 规划目录 | 职责 | 分期 |
 | ---- | ---- | ---- |
 | `kernel/src/storage/{mod,registry,partition,gpt,mbr,volume,selftest}.rs` | CSS：设备/分区/卷登记、GPT/MBR **只读**解析、稳定卷标识 `vol_id`、卷标/健康状态/只读原因（✅ CSS-1 已落地） | CSS-1 |
 | `kernel/src/syscall/storage.rs` | CSS 的 syscall 入口（号 **261–266**：卷枚举/挂载/卸载/分配字母/重扫/格式化；✅ 261/265 已实现，其余桩） | CSS-1 / CSS-3 |
-| `kernel/src/fs/{vfs,mount,inode,file,ramfs,fat}.rs` | **现状保留**；CSS-2 只加 `caps`/`volume_info`/`probe`、挂载表带 `vol_id`/`options`、挂载错误改 errno、`stat` 输出 `vol=` | CSS-2 |
+| `kernel/src/fs/{vfs,mount,inode,file,ramfs,fat}.rs` | ✅ **CSS-2 已落地**：加 `caps`/`volume_info`（及 `FsCaps`/`VolumeInfo`/`MountOptions`）、FAT 探测收归 `fs/fat.rs`、挂载表拆「后端 / 挂载点」并带 `vol_id`/`options`（`alias_volume`/`umount`/`sync_counts`）、挂载错误改 errno、`stat` 输出 `vol=` | CSS-2 ✅ |
 | `kernel/src/fs/{exfat,ext2,ext4,ntfs,iso9660}/` | 新文件系统后端（各自实现 `FileSystem`，VFS 不变） | CSS-4 / CSS-6 |
 | `userland/libc` 的 path 模块 | Windows 式路径（`C:\x`）→ POSIX 路径重写（查 `storage_volumes`，不硬编码字母） | CSS-3 |
 | `userland/ckm/`（`ckm storage …`） | CSS Manager：列出磁盘/分区/卷、挂载/卸载、分配盘符、显示健康与只读原因 | CSS-5 |

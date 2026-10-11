@@ -217,7 +217,8 @@ pub struct Volume {
     pub total_bytes: u64,
     /// 可用容量（`None` = unknown，不许用 0 冒充）。
     pub free_bytes: Option<u64>,
-    /// 当前挂载点数（CSS-1 恒 0：挂载表还没接入卷身份）。
+    /// 当前挂载点数（CSS-2 起由挂载表维护：挂载/卸载后 `registry::set_mount_count`
+    /// 写入，重扫后由 `MountTable::sync_counts` 重放；新建的卷从 0 开始）。
     pub mount_count: u32,
     /// 是否可移动介质（CSS-1 未知，恒 false）。
     pub removable: bool,
@@ -389,6 +390,8 @@ pub fn make_volume(
         health,
         total_bytes: probe.total_bytes,
         free_bytes: None,
+        // 探测阶段还不知道挂载表的状态；已挂载的卷由 `registry::scan_all` 末尾的
+        // `MountTable::sync_counts()` 重放回真实计数（CSS-2）。
         mount_count: 0,
         removable: false,
     }
@@ -398,8 +401,29 @@ pub fn make_volume(
 ///
 /// 顺序固定（`docs/storage.md` 5.3）：FAT → EXFAT → EXT2/EXT4 → NTFS → ISO9660。
 /// 命中多个当前不会发生（各格式的识别特征互斥）；命中不了就是 `unsupported`。
+///
+/// **FAT 这一支由后端自己回答**（`fs::fat::probe`，CSS-2）：BPB 的规则只能有一处，
+/// 否则「内核接受但挂不上」与「挂得上但内核认不出」迟早同时出现。
 pub fn probe(dev: &mut dyn BlockDevice, start_lba: u64, sectors: u64) -> Probe {
     let capacity = sectors.saturating_mul(SECTOR_SIZE as u64);
+
+    match crate::fs::fat::probe(dev, start_lba, sectors) {
+        crate::fs::fat::ProbeOutcome::ReadFailed => {
+            let mut probe = Probe::empty(capacity);
+            probe.read_failed = true;
+            return probe;
+        }
+        crate::fs::fat::ProbeOutcome::Fat(hit) => {
+            let mut probe = Probe::empty(hit.total_bytes);
+            probe.fs = fat_kind(hit.geometry.fat_type);
+            // 序列号按 LE 字节原样进记录（与 CSS-1 逐字节相同：raw → u32 → raw）
+            probe.uuid = Some(FsUuid::from_bytes(&hit.serial.to_le_bytes(), 4));
+            copy_label(&hit.label, &mut probe);
+            return probe;
+        }
+        crate::fs::fat::ProbeOutcome::NotFat => {}
+    }
+
     let mut boot = [0u8; SECTOR_SIZE as usize];
     if read_at(dev, start_lba, &mut boot).is_err() {
         let mut probe = Probe::empty(capacity);
@@ -407,9 +431,6 @@ pub fn probe(dev: &mut dyn BlockDevice, start_lba: u64, sectors: u64) -> Probe {
         return probe;
     }
 
-    if let Some(probe) = probe_fat(&boot, capacity) {
-        return probe;
-    }
     if &boot[3..11] == b"EXFAT   " {
         let mut probe = Probe::empty(capacity);
         probe.fs = FsKind::ExFat;
@@ -457,82 +478,51 @@ pub fn probe(dev: &mut dyn BlockDevice, start_lba: u64, sectors: u64) -> Probe {
     Probe::empty(capacity)
 }
 
-/// FAT12/16/32 探测（BPB 几何 + 簇数判型，与 `fs::fat` 同一条规则）。
-fn probe_fat(boot: &[u8; SECTOR_SIZE as usize], capacity: u64) -> Option<Probe> {
-    let bps = u16::from_le_bytes([boot[11], boot[12]]) as u32;
-    if bps != SECTOR_SIZE || bps == 0 {
-        // 只接受 512 字节扇区的卷（与内核 FAT 后端的限制一致）
-        return None;
+/// FAT 类型 → 记录的 `fs_kind`（两个枚举的映射放在这里，避免各自 `as u8`）。
+fn fat_kind(fat_type: crate::fs::fat::FatType) -> FsKind {
+    match fat_type {
+        crate::fs::fat::FatType::Fat12 => FsKind::Fat12,
+        crate::fs::fat::FatType::Fat16 => FsKind::Fat16,
+        crate::fs::fat::FatType::Fat32 => FsKind::Fat32,
     }
-    let spc = boot[13] as u32;
-    if spc == 0 || !spc.is_power_of_two() || spc > 128 {
-        return None;
-    }
-    let reserved = u16::from_le_bytes([boot[14], boot[15]]) as u32;
-    let nfats = boot[16] as u32;
-    let root_entries = u16::from_le_bytes([boot[17], boot[18]]) as u32;
-    if reserved == 0 || nfats == 0 || nfats > 4 {
-        return None;
-    }
-    let total16 = u16::from_le_bytes([boot[19], boot[20]]) as u32;
-    let total32 = u32::from_le_bytes([boot[32], boot[33], boot[34], boot[35]]);
-    let total = if total16 != 0 { total16 } else { total32 };
-    let fat16 = u16::from_le_bytes([boot[22], boot[23]]) as u32;
-    let fat32 = u32::from_le_bytes([boot[36], boot[37], boot[38], boot[39]]);
-    let fat_size = if fat16 != 0 { fat16 } else { fat32 };
-    if total == 0 || fat_size == 0 {
-        return None;
-    }
-    let root_dir_sectors = root_entries.div_ceil(SECTOR_SIZE / 32);
-    let overhead = reserved + nfats * fat_size + root_dir_sectors;
-    if total <= overhead {
-        return None;
-    }
-    let clusters = (total - overhead) / spc;
-    if clusters == 0 {
-        return None;
-    }
-    let fs = if clusters < 4085 {
-        FsKind::Fat12
-    } else if clusters < 65525 {
-        FsKind::Fat16
-    } else {
-        FsKind::Fat32
-    };
-    let mut probe = Probe::empty(capacity.min(total as u64 * bps as u64));
-    probe.fs = fs;
-    // FAT 卷序列号：**FAT12/16 在 BPB 0x27，FAT32 在 0x43**（两者都在扩展引导签名
-    // 0x29 之后）—— 这是 BPB 布局的硬事实，不按类型区分就会把 FAT12/16 的序列号
-    // 读成 0（`mkfs` 写的是 0x27），于是所有 FAT12/16 卷的 `vol_id` 全撞在一起。
-    let serial_off = if fs == FsKind::Fat32 { 0x43 } else { 0x27 };
-    probe.uuid = Some(FsUuid::from_bytes(&boot[serial_off..serial_off + 4], 4));
-    // 卷标：FAT12/16 在 0x2B，FAT32 在 0x47（`mkfs` 与常见格式化工具都会写）
-    let label_off = if fs == FsKind::Fat32 { 0x47 } else { 0x2B };
-    copy_label(&boot[label_off..label_off + LABEL_MAX], &mut probe);
-    Some(probe)
 }
 
-/// 把一段原始卷标规范化进 [`Probe`]：去尾部空格/NUL，非法字节替换，超长置截断位。
-fn copy_label(src: &[u8], probe: &mut Probe) {
+/// 把一段原始卷标规范化：去尾部空格/NUL，非法字节替换成 `.`/`_`，超长置截断位。
+/// 返回（规范化字节、有效长度、是否被截断）。
+///
+/// **公开的原因**：CSS-2 的挂载自测要把「后端报的 `volume_info()`」与「记录里的卷标」
+/// 对起来（`fs::storage_mount_selftest`）—— 两边必须用同一条规范化规则，
+/// 否则比的是两种东西（也就无法证明记录布局被消费者读对了）。
+pub fn normalize_label(src: &[u8]) -> ([u8; LABEL_MAX], u8, bool) {
     let mut end = src.len();
     while end > 0 && (src[end - 1] == b' ' || src[end - 1] == 0) {
         end -= 1;
     }
-    let mut out = 0usize;
+    let mut label = [0u8; LABEL_MAX];
+    let mut count = 0usize;
+    let mut truncated = false;
     for &byte in &src[..end] {
         let ch = match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' => byte,
             b' ' => b'_',
             _ => b'.',
         };
-        if out == LABEL_MAX {
-            probe.label_truncated = true;
+        if count == LABEL_MAX {
+            truncated = true;
             break;
         }
-        probe.label[out] = ch;
-        out += 1;
+        label[count] = ch;
+        count += 1;
     }
-    probe.label_len = out as u8;
+    (label, count as u8, truncated)
+}
+
+/// 把一段原始卷标规范化进 [`Probe`]。
+fn copy_label(src: &[u8], probe: &mut Probe) {
+    let (label, len, truncated) = normalize_label(src);
+    probe.label = label;
+    probe.label_len = len;
+    probe.label_truncated = truncated;
 }
 
 /// `[u8]` → 小写十六进制（无前缀，无分隔）。

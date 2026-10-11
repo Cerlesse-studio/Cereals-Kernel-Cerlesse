@@ -19,7 +19,7 @@
 | [lang-selection.md](./lang-selection.md) | 按功能领域汇总的性能最佳语言对照（辅助选型参考） | ✅ 新增（2026-10-07） |
 | [package-manager.md](./package-manager.md) | 面向内核/系统生态的高效、安全、轻量、灵活包管理器设计提案（H-06） | 🟡 提案 v1 + **P0a 已落地**：包容器后缀 **`.ckc`**（CKC = Cerlesse Kernel Container，64 字节头 + 确定性 ustar，身份 = payload 哈希），实现 `tools/pkgmgr/ckc.py`，验收 `make test-pkg` 37 项（含 `tar` 独立复核）；事务/catalog（P0b）与内核侧接入（P1）待做，见该文档 11.1 |
 | [ckm.md](./ckm.md) | **Cerlesse Kernel Manager（CKM）设计提案**：权限模型（单管理员 + 能力位 + 判定点）、内核接口（`kernel/src/ckm/` + 扩展号段 + 定长记录）、扩展生命周期与覆盖层、事务/恢复/安全模式、CKM-1…CKM-7 分期与故障验收 | 📋 提案 v1（规划，2026-10-11 新增；**尚未写代码**） |
-| [storage.md](./storage.md) | **Cerlesse Storage System（CSS）设计提案**：卷模型（设备→分区→卷→盘符/挂载点 + 稳定 `vol_id`）、Windows 式盘符与 Linux 式挂载双视图、VFS 收口（`FileSystem` 增量 + 挂载表带卷身份 + 错误语义改 errno）、与 CKM 的接口（2 个能力位 + 判定点 8–10 + 号段 261–266）、文件系统支持路线与第三方依赖政策、后端装载政策（第一版编译内置，6.8）、CSS-1…CSS-6 分期与 11 条验收 | 🟡 **CSS-1 已落地**（`kernel/src/storage/` + `storage_volumes`(261)/`storage_rescan`(265) + `mkfs` GPT/MBR 夹具 + `make test-storage`），其余 CSS-2…CSS-6 规划中 |
+| [storage.md](./storage.md) | **Cerlesse Storage System（CSS）设计提案**：卷模型（设备→分区→卷→盘符/挂载点 + 稳定 `vol_id`）、Windows 式盘符与 Linux 式挂载双视图、VFS 收口（`FileSystem` 增量 + 挂载表带卷身份 + 错误语义改 errno）、与 CKM 的接口（2 个能力位 + 判定点 8–10 + 号段 261–266）、文件系统支持路线与第三方依赖政策、后端装载政策（第一版编译内置，6.8）、CSS-1…CSS-6 分期与 11 条验收 | 🟡 **CSS-1/CSS-2 已落地**（`kernel/src/storage/` + `storage_volumes`(261)/`storage_rescan`(265) + `mkfs` GPT/MBR 夹具 + 挂载表带卷身份/多挂载点/卸载 + 挂载错误改 errno + `make test-storage`），CSS-3…CSS-6 规划中 |
 | [project-structure.md](./project-structure.md) | 目录结构与模块职责划分 | ✅ 已完成 |
 | [../DEVELOPMENT.md](../DEVELOPMENT.md) | 主开发文档：需求、依赖、任务清单、测试、QEMU、Issue 规划 | ✅ 已完成 |
 | [api.md](./api.md) | **API 参考**：系统调用 ABI / errno / `libc` API / 内核内部 trait / 主机工具 CLI / Make 目标 | 🟡 持续更新（2026-10-11 新建） |
@@ -70,7 +70,7 @@
 - **第十一阶段（v1.0 之后）**📋：**CKM —— 内核级权限控制与扩展管理**（CKM Core 在内核 /
   CKM Service 与 Manager 在用户态 / 可插拔覆盖层 / 独立恢复环境），分 CKM-1…CKM-7；
   第一版不做动态内核模块装载与 GUI —— 规划见 [ckm.md](./ckm.md)，未开工。
-- **第十二阶段（v1.0 之后，与第十一阶段同期）**📋：**CSS —— Cerlesse 存储管理系统**（磁盘/分区识别 → 卷与稳定标识 → 盘符与多挂载点 → 可写文件系统 → `ckm storage` 管理程序），分 CSS-1…CSS-6；第一版不写分区表、不做 RAID/LVM/加密卷/GUI —— 规划见 [storage.md](./storage.md)，未开工。
+- **第十二阶段（v1.0 之后，与第十一阶段同期）**🔨：**CSS —— Cerlesse 存储管理系统**（磁盘/分区识别 → 卷与稳定标识 → 盘符与多挂载点 → 可写文件系统 → `ckm storage` 管理程序），分 CSS-1…CSS-6；第一版不写分区表、不做 RAID/LVM/加密卷/GUI。**CSS-1（底层识别）与 CSS-2（VFS 收口）已落地**（GPT/MBR 只读扫描 + 卷记录 + `storage_volumes`/`storage_rescan` + 挂载表带卷身份/多挂载点/卸载 + 挂载错误改 errno），CSS-3（盘符/状态树）及以后未开工 —— 见 [storage.md](./storage.md)。
 - **后续**：每进入一个新阶段就编写/修订对应的主题文档；阶段内已落地部分也要及时补记当前状态（例如 v0.4 中断控制器）。
 - 本套文档**会在开发过程中被反复修改**——修改前请在对应文档顶部记录修订日期与变更点。
 -  本次（2026-10-11，第十七轮）修订重点：**新增 CSS（Cerlesse Storage System）存储管理提案（规划，不写代码）** —— 新建 `storage.md`：
@@ -88,9 +88,18 @@
   README（文档入口）、tools/README.md（`mkfs` 规划分区表生成）与 filesystem.md（交叉引用）；
   同日复核补：**6.8 文件系统后端装载政策**（第一版编译内置、不经 CKM 运行时装卸）、6.1 覆盖层/回滚/恢复归 CKM、
   6.7「兼容性 = `fs=`+`ro=`+`health=` 完整展示」、第 11 节「不做写回修复」（`fsck` 只读检查）；
-  随后 **CSS-1 落地**：新建 `kernel/src/storage/`（GPT/MBR 只读扫描 + 卷记录 + 解析自测）、
+  随后 **CSS-1（底层识别）落地**：新建 `kernel/src/storage/`（GPT/MBR 只读扫描 + 卷记录 + 解析自测）、
   `storage_volumes`(261)/`storage_rescan`(265)、`mkfs` GPT/MBR 夹具、`libc` 解析器与 `/bin/volumes`、
   `make test-storage` 系列与编排场景 `storage`/`storage-mbr`（15 → 17 场景），见 storage.md 第 9/10 节。
+  随后 **CSS-2（VFS 收口）落地**：`FileSystem::caps`/`volume_info`（保守缺省；RAMFS 可写 / FAT 只读 +
+  大小写不敏感 + 卷标）；FAT 探测收归 `fs/fat.rs`（`probe`/`probe_sector`，删掉 `storage/volume.rs` 的重复 BPB 判定）、
+  `FatFs::open` → `OpenError { errno, reason }`；挂载表拆「后端 / 挂载点」并带 `vol_id`/`options`
+  （`alias_volume`/`umount`，挂载计数写回卷记录偏移 56）；`fs: stat` 行尾 `vol=`；
+  新增 `fs::storage_mount_selftest` 开机自测（只读原因来自能力位、`storage: volcheck` 后端与记录一致、
+  同一卷多挂载点同字节、卸载后 `ENOENT` 且卷仍在表、`ENOENT`/`EINVAL`/`EEXIST` 反例）；
+  `tests/test_boot.py` 增 `--expect-re`（反向引用绑同一 `vol_id`，因为启动盘序列号随镜像构建变化）；
+  `make test-storage`（31 项 + 2 正则）、`test-storage-mbr`（14 项 + 1 正则），
+  编排场景 `fs`/`fat`/`storage`/`storage-mbr`/`programs` 全 PASS。
 -  本次（2026-10-11，第十四轮）修订重点：**纯内核化执行阶段二/四/五（部分）** —— 新增
   `tools/check-boundary.py`（6 项边界门禁 + `--selftest`，并入 `make test-all`）；`libc/`+`user/` 移入
   `userland/` 独立 workspace（自带 `Cargo.toml`/`.cargo/config.toml`/`Makefile`/`README.md`，产出

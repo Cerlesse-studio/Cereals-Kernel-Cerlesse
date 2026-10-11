@@ -52,8 +52,8 @@ help:
 	@echo "  test-fat - v0.8: assert FAT16/32 on disk mounted in VFS: read/ls/LFN/multi-cluster/EROFS"
 	@echo "  storage-images - CSS-1: build GPT/MBR fixtures (mkfs.py; ext4 payload from host mkfs.ext4)"
 	@echo "  test-storage-fixtures - CSS-1: host-side fixture gate (our 2nd parser + partx/mtools/dumpe2fs)"
-	@echo "  test-storage - CSS-1: GPT family — partitions, fs probing, vol_id/label/health, clone conflict"
-	@echo "  test-storage-mbr - CSS-1: MBR family — primary table + EBR chain (logical 5/6) + broken chain"
+	@echo "  test-storage - CSS-1/CSS-2: GPT family + VFS mount collapse (vol_id on mounts, alias mount, umount, volcheck)"
+	@echo "  test-storage-mbr - CSS-1/CSS-2: MBR family — primary table + EBR chain (logical 5/6) + broken chain"
 	@echo "  test-network - v0.9: assert virtio-net + Ethernet/ARP/IPv4/UDP (ARP gateway + DHCP UDP round-trip)"
 	@echo "  userland-images - build the userland (independent workspace): programs + dyn fixtures + manifest"
 	@echo "  user   - alias of userland-images"
@@ -197,7 +197,7 @@ test-fs: image
 		--expect "fs: create /etc/motd" \
 		--expect "fs: write /etc/motd bytes=23" \
 		--expect "fs: mkdir /tmp" \
-		--expect "fs: stat /etc/motd kind=file size=23 perms=-rw-r--r--" \
+		--expect "fs: stat /etc/motd kind=file size=23 perms=-rw-r--r-- vol=-" \
 		--expect "fs: read /etc/motd len=23 data=motd: hello from ramfs" \
 		--expect "fs: mount point=/mnt fs=ramfs-scratch" \
 		--expect "fs: route /mnt/note.txt fs=ramfs-scratch" \
@@ -558,7 +558,14 @@ test-storage: image storage-images
 		--expect "storage: vol id=fs:8f6c2620 disk=3 part=1 fs=fat16 label=BK-ESP letter=- mounts=0 ro=ro-backend health=ok" \
 		--expect "storage: vol id=raw:4 disk=4 part=0 fs=unsupported label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
 		--expect "storage: parse selftest PASS (cases=11 checks=45)" \
-		--expect "storage: selftest PASS (checks=124)"
+		--expect "storage: selftest PASS (checks=124)" \
+		--expect "fs: storage mount selftest begin" \
+		--expect "fs: alias point=/volumes/NO_NAME offset=4096 bytes=64 (same bytes as /disk/KERNEL.ELF)" \
+		--expect "fs: after unmount path=/volumes/NO_NAME/KERNEL.ELF errno=2" \
+		--expect "fs: mount negative cases PASS (ENOENT/EINVAL/EEXIST)" \
+		--expect "fs: storage mount selftest PASS" \
+		--expect-re "storage: mount point=/disk vol=(fs:[0-9a-f]+) ro=ro-backend.*?storage: volcheck id=\1 backend=fat16 caps=ro-backend case=insensitive label=NO_NAME bytes=67108864 record=ok.*?storage: mount point=/volumes/NO_NAME vol=\1 ro=ro-backend.*?fs: route path=/volumes/NO_NAME/KERNEL.ELF point=/volumes/NO_NAME vol=\1 fs=fat16 ro=ro-backend.*?fs: stat path=/volumes/NO_NAME/KERNEL.ELF kind=file size=[0-9]+ vol=\1.*?storage: unmount point=/volumes/NO_NAME vol=\1 mounts=1.*?fs: after unmount" \
+		--expect-re "fs: route path=/volumes/NO_NAME/KERNEL.ELF point=/volumes/NO_NAME vol=(fs:[0-9a-f]+) fs=fat16 ro=ro-backend.*?fs: stat path=/volumes/NO_NAME/KERNEL.ELF kind=file size=[0-9]+ vol=\1"
 
 # CSS-1 验收（MBR 系）：4 个主表项 + 扩展链（EBR）里的逻辑分区 5/6，以及断链的处理。
 #
@@ -585,7 +592,9 @@ test-storage-mbr: image storage-images
 		--expect "storage: vol id=fs:23482620 disk=2 part=5 fs=ntfs label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
 		--expect "storage: vol id=fs:99192620 disk=2 part=6 fs=exfat label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
 		--expect "storage: parse selftest PASS (cases=11 checks=45)" \
-		--expect "storage: selftest PASS (checks=82)"
+		--expect "storage: selftest PASS (checks=82)" \
+		--expect "fs: storage mount selftest PASS" \
+		--expect-re "storage: mount point=/disk vol=(fs:[0-9a-f]+) ro=ro-backend.*?storage: unmount point=/volumes/NO_NAME vol=\1 mounts=1"
 
 # v0.5 验收：IPC（pipe 骨架）创建/写入/读取串口摘要日志 + 自测，随 Round Robin 巡回后执行
 test-ipc: image
@@ -739,7 +748,7 @@ test-programs: image
 		--expect "ps: 2 process(es)" \
 		--expect "user: storage_volumes count=1 total=1" \
 		--expect "volumes: id disk part fs label label_trunc ro health bytes free_known free mounts" \
-		--expect "disk=0 part=0 fs=fat16 label=NO_NAME label_trunc=0 ro=ro-backend health=ok bytes=67108864 free_known=0 free=0 mounts=0" \
+		--expect "disk=0 part=0 fs=fat16 label=NO_NAME label_trunc=0 ro=ro-backend health=ok bytes=67108864 free_known=0 free=0 mounts=1" \
 		--expect "volumes: 1 volume(s) (total=1)" \
 		--expect "cat: /etc/motd bytes=23" \
 		--expect "echo program works" \

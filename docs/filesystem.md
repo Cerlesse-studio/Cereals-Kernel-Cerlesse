@@ -4,7 +4,8 @@
 - 最后更新：2026-10-11
 - 状态：✅ v0.7 核心已实现并验收（VFS + RAMFS + 挂载点路由 + fd 表 → `open`/`read`/`write`/`close`，
   `make test-fs` 20 项串口断言 PASS）；**v0.8 磁盘后端（FAT12/16/32，只读）已挂到同一套 VFS** 并验收
-  （`make test-fat` 21 项），H-03 `mkfs`（`tools/mkfs/mkfs.py`）同步落地
+  （`make test-fat` 21 项），H-03 `mkfs`（`tools/mkfs/mkfs.py`）同步落地；
+  **CSS-2（VFS 收口）亦已落地**：后端能力位/卷信息、挂载表带卷身份与多挂载点、卸载、挂载错误改 errno
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
 - 依赖：syscall.md（open/read/write/close）、memory.md（内核堆：RAMFS 的数据就在堆上）
@@ -30,8 +31,8 @@
 | 模块 | 职责 | 关键类型/函数 |
 | ---- | ---- | ---- |
 | `inode.rs` | 与后端无关的节点形状 | `NodeKind`（File/Dir）、`Metadata`（kind/size/`perms()`）、`DirEntry` |
-| `vfs.rs` | 抽象 + 路径工具 + 系统级入口 | `trait FileSystem`、`normalize/components/within`、`stat/read_all/read/write/create/mkdir/list/usage/backend_name` |
-| `mount.rs` | 挂载表（**最长前缀路由**） | `MountTable::mount/resolve`、全局 `mount::table()` |
+| `vfs.rs` | 抽象 + 路径工具 + 系统级入口 | `trait FileSystem`、`normalize/components/within`、`stat/read_all/read/write/create/mkdir/list/usage/backend_name`，**CSS-2**：`FsCaps`/`VolumeInfo`/`MountOptions`、`route/backend_caps/backend_volume_info`、`ENOTSUP` |
+| `mount.rs` | 挂载表（**最长前缀路由**；CSS-2 拆成「后端 / 挂载点」两个表） | `MountTable::mount/mount_volume/alias_volume/umount/resolve/route/sync_counts`、`MountEntry { point, backend, vol_id, options }`、全局 `mount::table()` |
 | `ramfs.rs` | 第一个后端（内存 FS） | `RamFs { root: Node }`、`Node { name, kind, data: Vec<u8>, children: Vec<Node> }` |
 | `file.rs` | fd 表（`open` 的落点） | `FdTable`、`open/read/write/close/reset`、`O_RDONLY/O_WRONLY/O_RDWR/O_CREAT` |
 
@@ -48,6 +49,9 @@ pub trait FileSystem {
     fn mkdir(&mut self, path: &str) -> Result<(), i64>;
     fn list(&mut self, path: &str) -> Result<Vec<DirEntry>, i64>;
     fn usage(&self) -> (usize, usize) { (0, 0) } // 默认实现：磁盘后端不适用
+    // CSS-2 追加的两个只读查询（都带保守缺省：只读、无卷标 → 猜错的代价是数据被写坏）
+    fn caps(&self) -> FsCaps { FsCaps::read_only_unknown() }
+    fn volume_info(&self) -> VolumeInfo { VolumeInfo::unknown() }
 }
 ```
 
@@ -59,8 +63,13 @@ v0.8 把方法都收 `&mut self`、并把 `read_all` 从「借用后端内部缓
 约定两条：
 
 - 方法收的是**挂载点内的相对路径**（挂载点前缀的剥离由 `MountTable::resolve` 完成）；
-- 错误一律是**负数 errno**（`-ENOENT`/`-EISDIR`/`-ENOTDIR`/`-EEXIST`/`-EINVAL`/`-ENOSPC`），
-  syscall handler 因此可以把文件系统错误直接返回用户态，中间不需要翻译层。
+- 错误一律是**负数 errno**（`-ENOENT`/`-EISDIR`/`-ENOTDIR`/`-EEXIST`/`-EINVAL`/`-ENOSPC`/`-EROFS`/`-EIO`/`-EUCLEAN`，
+  CSS 又追加 `-ENODEV`（设备消失）与 `-ENOTSUP`（盘在、格式没后端）），
+  syscall handler 因此可以把文件系统错误直接返回用户态，中间不需要翻译层；
+- **挂载接口同口径**（CSS-2）：`mount`/`mount_volume`/`alias_volume`/`umount` 返回 `Result<_, i64>`
+  （`EEXIST` 挂载点重复 / `ENOSPC` 表满 / `ENOENT` 未挂载 / `EINVAL` 卸载根），
+  `FatFs::open` 返回 `OpenError { errno, reason }` —— 原因串只进证据行，不进错误码；
+  这也把 v0.8 的「挂载失败返回 `&'static str`」修掉了（那种字符串不可断言）。
 
 ### 2.2 挂载表：路由是「可观测行为」而不是隐含逻辑
 
@@ -77,6 +86,13 @@ fs: readback /mnt/note.txt len=7 data=v0.7-ok ← 读回的确实是被路由过
 
 后端用 `Box<dyn FileSystem>` **由挂载表独占持有**（不是 `static mut`）：所有访问都经
 `resolve()` 取一次 `&mut`，不存在两个 `&mut` 同时指向同一后端的情形。
+
+CSS-2 把「后端」与「挂载点」分成两张表（`backends` / `mounts`）：**一个后端可以被多个挂载点引用**
+（同一个卷挂到 `/volumes/<label>` 与 `/media/<label>` 是同一份数据，不是两次打开），
+`MountEntry` 里存的是**后端下标**而不是后端本身。这也让卸载变得可做：
+`umount(point)` 只摘条目，后端不释放（可能还有别的挂载点引用它）；
+挂载/卸载都会把「哪个卷挂了几个点」写回 `storage` 的卷记录（偏移 56），
+`storage: mount point=… vol=…` / `storage: unmount point=… vol=…` 是它的证据行。
 
 ### 2.3 路径语义（刻意收窄）
 
@@ -215,9 +231,17 @@ fd 编号（与 Linux 一致的形状，见 syscall.md 2.7）：
 
 ```text
 fs: mount point=/disk fs=fat16 sectors=131072 cluster_bytes=1024 clusters=65264
+storage: mount point=/disk vol=fs:a2ff2e36 ro=ro-backend     ← CSS-2：卷身份 + 只读原因
 fs: mount point=/mnt/fat fs=fat32 sectors=131072 cluster_bytes=512 clusters=128992
+storage: mount point=/mnt/fat vol=fs:11102620 ro=ro-backend
 fs: route /mnt/note.txt fs=ramfs-scratch /mnt/fat/hello.txt fs=fat32
 ```
+
+`ro=` 不是写死的字面量：它来自后端自己的能力位（`FatFs::caps().read_only` → `ro-backend`；
+RAMFS 是可写后端）。CSS-2 的挂载自测（`fs::storage_mount_selftest`，每次启动都跑）还会：
+把后端报的序列号/卷标与 `storage_volumes` 记录逐字段比对（两条读同一张 BPB 的路径必须同一个答案，
+证据行 `storage: volcheck`）、给启动卷加一个别名挂载点 `/volumes/<卷标>` 并断言两个路径读到**同一段字节**
+且 `vol_id` 相同、卸载后路径变 `ENOENT` 而卷仍在表里（`mounts=1`）。
 
 这里有个容易写错的地方（实际踩过）：判断「测试盘是否已挂」不能用 `backend_name("/mnt/fat").is_some()`——
 没有第二块盘时它依然返回 `ramfs-scratch`（最长前缀落到挂在 `/mnt` 的后端），于是单盘启动会在
@@ -273,13 +297,15 @@ fs: disk selftest PASS
 ## 4. 非目标 / 后续
 
 - 页缓存/写回/一致性策略、`fsync`：非第一版目标；
-- 完整权限与挂载语义（只读挂载、挂载选项、UID/GID）：v1.0 的 `security/`；
+- 完整权限语义（UID/GID/ACL）与**盘符/卷标**：分别归 v1.0 的 `security/` 与 CSS-3；
+  CSS-2 已给出 `MountOptions { read_only }`（只读挂载的机制），但“谁能挂/谁能卸”的判定要等 CKM（判定点 8）；
 - 超大文件、高并发 IO、高性能目录索引：非第一版目标。
 
 ## 5. 修订记录
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-11 | **CSS-2 落地（VFS 收口）**：`FileSystem` 增 `caps`/`volume_info`（保守缺省；RAMFS 可写、FAT 只读+大小写不敏感+卷标）；`fs/fat.rs` 增 FAT 探测唯一入口 `probe`/`probe_sector`/`bp_identity` 并把 `FatFs::open` 改返回 `OpenError { errno, reason }`；`fs/mount.rs` 拆「后端 / 挂载点」两张表（一个后端可被多挂载点引用），条目带 `vol_id`/`options`，新增 `alias_volume`/`umount`/`route`/`sync_counts`（挂载计数写回卷记录）；`fs::mount_disks` 按卷表挂载并保留 `/disk`、`/mnt/fat` 兼容点；`fs: stat` 行尾带 `vol=`；新增 `fs::storage_mount_selftest`（只读原因来自能力位、后端与记录一致、同一卷多挂载点同字节、卸载后 `ENOENT` 且卷仍在表、`ENOENT`/`EINVAL`/`EEXIST` 反例）；本文第 2.1/2.2/3.2/4 节同步标注现状 |
 | 2026-10-06 | 第一阶段创建占位 |
 | 2026-10-07 | 补记路线细化：明确 VFS 先行/RAMFS 后端/文件描述符表与 syscall 对接顺序、补充 ELF Loader 对接关系、补充 FAT32/mkfs 后续位置 |
 | 2026-10-08 | 本次 docs 迭代统一文档顶部元信息（阶段 / 最后更新 / 状态）与修订记录，保持与 DEVELOPMENT.md 与索引文档描述一致 |
