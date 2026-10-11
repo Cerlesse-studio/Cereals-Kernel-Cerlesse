@@ -27,8 +27,11 @@
 //!   直接读内核映像地址（0x200_0000），必须被 ring3 #PF 拦下；
 //! - `/bin/sh`（`user/shell`）：**交互式 Shell** —— 命令从键盘行缓冲（`read(0)`）来，
 //!   内建命令 + **外部程序**（走 `fork`/`execve`/`wait4`）；
-//! - `/bin/hello`（`user/hello-bin`）：**外部程序**（本轮新增）—— 由 Shell `fork` +
-//!   `execve` 起来，打印自己的 PID 与 `argv`，证明「新进程 + 参数传递」真的发生了。
+//! - `/bin/hello`（`user/hello-bin`）：**外部程序** —— 由 Shell `fork` +
+//!   `execve` 起来，打印自己的 PID 与 `argv`，证明「新进程 + 参数传递」真的发生了；
+//! - `/bin/{ls,cat,echo,ps}`（`user/*`）：v0.9 第五步的**基础用户程序** —— 它们各自
+//!   只需要一条内核能力（`ls` → `getdents`，`ps` → `getprocs`，`cat` → 文件 syscall，
+//!   `echo` → `write`），因此同时是「用户态能不能真的用上 VFS/进程表」的验收。
 
 use core::arch::global_asm;
 use core::ptr::addr_of;
@@ -52,20 +55,45 @@ static USER_SHELL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_sh
 /// 内嵌的 `/bin/hello`：`user/hello-bin` 的 ELF（v0.9 第三步的**外部程序**）。
 static USER_HELLO_BIN_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_hello_bin.elf"));
 
+/// 内嵌的 `/bin/ls`：`user/ls` 的 ELF（v0.9 第五步的基础用户程序，下同）。
+static USER_LS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_ls.elf"));
+/// 内嵌的 `/bin/cat`：`user/cat` 的 ELF。
+static USER_CAT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_cat.elf"));
+/// 内嵌的 `/bin/echo`：`user/echo` 的 ELF。
+static USER_ECHO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_echo.elf"));
+/// 内嵌的 `/bin/ps`：`user/ps` 的 ELF。
+static USER_PS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_ps.elf"));
+
 /// 用户程序在 RAMFS 上的路径。
 pub const INIT_PATH: &str = "/init";
 /// 交互式 Shell 在 RAMFS 上的路径（`fs::init` 写入）。
 pub const SHELL_PATH: &str = "/bin/sh";
 /// 外部程序在 RAMFS 上的路径（`fs::init` 写入）。
 pub const HELLO_BIN_PATH: &str = "/bin/hello";
+/// v0.9 第五步的基础用户程序路径（`ls` / `cat` / `echo` / `ps`）。
+///
+/// 与 `/bin/hello` 不同，它们**不由内核直接运行**，而是由 Shell 的
+/// `fork` + `execve` 路径起来（`ls` / `ps` 没有内建命令；`cat` / `echo` 有内建
+/// 版本，要走真实程序得用 `/bin/cat` / `/bin/echo`，见 `user/shell` 的帮助文本）。
+pub const LS_PATH: &str = "/bin/ls";
+/// `cat` 程序路径（内建 `cat` 会遮蔽裸命令名）。
+pub const CAT_PATH: &str = "/bin/cat";
+/// `echo` 程序路径（内建 `echo` 会遮蔽裸命令名）。
+pub const ECHO_PATH: &str = "/bin/echo";
+/// `ps` 程序路径。
+pub const PS_PATH: &str = "/bin/ps";
 /// 用户程序写文件的路径；内核在用户态结束后读回并打印。
 pub const USER_FILE: &str = "/tmp/hello.txt";
 
 /// `fs::init` 写进 RAMFS 的用户程序清单（路径 → ELF 字节）。
-static PROGRAM_IMAGES: [(&str, &[u8]); 3] = [
+static PROGRAM_IMAGES: [(&str, &[u8]); 7] = [
     (INIT_PATH, USER_INIT_ELF),
     (SHELL_PATH, USER_SHELL_ELF),
     (HELLO_BIN_PATH, USER_HELLO_BIN_ELF),
+    (LS_PATH, USER_LS_ELF),
+    (CAT_PATH, USER_CAT_ELF),
+    (ECHO_PATH, USER_ECHO_ELF),
+    (PS_PATH, USER_PS_ELF),
 ];
 
 global_asm!(
@@ -138,6 +166,9 @@ unsafe fn run_process(
     let p = process::create(slot, pid, name, 0, NO_PROCESS).ok_or("user: process slot busy")?;
     p.frame = frame;
     p.space = Some(space);
+    // 顶层程序一旦被运行就是 RUNNING（`create` 给的是 READY）——
+    // `user/ps` 读的就是这个字段，不撒谎。
+    p.state = crate::process::process::ProcState::Running;
     // 「谁在等我」= 内核启动上下文（顶层程序退出后回到 `run_process` 的调用者）
     p.return_to = RunCtx {
         krsp: 0, // 由 run_user_frame 的汇编写入

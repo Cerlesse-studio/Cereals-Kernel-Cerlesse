@@ -277,6 +277,145 @@ pub fn wait4(pid: i64) -> isize {
     unsafe { raw(SYS_WAIT, pid as u64, 0, 0, 0, 0) }
 }
 
+// ---------------------------------------------------------------- 目录列举（getdents）
+
+/// `getdents` 的系统调用号（Linux 同名号；**记录格式与 Linux 不同**，见下）。
+pub const SYS_GETDENTS: u64 = 78;
+/// 单条目录记录的字节数（必须与内核 `syscall::dir::DIRENT_SIZE` 一致）。
+pub const DIRENT_SIZE: usize = 88;
+/// 目录记录里名字字段的容量。
+pub const DIRENT_NAME_MAX: usize = 64;
+/// 目录记录里名字字段的偏移。
+pub const DIRENT_NAME_OFFSET: usize = 24;
+
+/// `getdents(path, buf)`：把 `path` 的目录项写进 `buf`，返回**记录数**（负数 = errno）。
+///
+/// 一次调用写满整个目录（装不下就截断，每条记录都是完整的），因此不需要
+/// `lseek` 式的续读循环。记录布局（内核侧 `syscall/dir.rs` 是权威定义）：
+///
+/// ```text
+/// 0   kind(1) + reserved(7)   8   size(u64)   16  name_len(u16) + reserved(6)   24  name(64)
+/// ```
+///
+/// 用 [`dirent_name`] / [`dirent_is_dir`] / [`dirent_size`] 解析记录，
+/// 不要自己算偏移。`buf` 至少要有 [`DIRENT_SIZE`] 字节，否则内核返回 `-EINVAL`。
+pub fn getdents(path: &str, buf: &mut [u8]) -> isize {
+    unsafe {
+        raw(
+            SYS_GETDENTS,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            0,
+        )
+    }
+}
+
+/// 取第 `index` 条目录记录的原始字节（越界或缓冲过短返回 `None`）。
+fn record(buf: &[u8], index: usize, size: usize) -> Option<&[u8]> {
+    let start = index.checked_mul(size)?;
+    buf.get(start..start.checked_add(size)?)
+}
+
+/// 第 `index` 条目录项的名字（非法记录返回空串，不 panic）。
+pub fn dirent_name(buf: &[u8], index: usize) -> &str {
+    let Some(rec) = record(buf, index, DIRENT_SIZE) else {
+        return "";
+    };
+    let len = (u16::from_le_bytes([rec[16], rec[17]]) as usize).min(DIRENT_NAME_MAX);
+    let end = DIRENT_NAME_OFFSET + len;
+    match rec.get(DIRENT_NAME_OFFSET..end) {
+        Some(bytes) => core::str::from_utf8(bytes).unwrap_or("?"),
+        None => "",
+    }
+}
+
+/// 第 `index` 条目录项是否是目录。
+pub fn dirent_is_dir(buf: &[u8], index: usize) -> bool {
+    record(buf, index, DIRENT_SIZE).map_or(false, |rec| rec[0] == 1)
+}
+
+/// 第 `index` 条目录项的字节数（目录恒 0）。
+pub fn dirent_size(buf: &[u8], index: usize) -> u64 {
+    match record(buf, index, DIRENT_SIZE) {
+        Some(rec) => u64::from_le_bytes([
+            rec[8], rec[9], rec[10], rec[11], rec[12], rec[13], rec[14], rec[15],
+        ]),
+        None => 0,
+    }
+}
+
+// ---------------------------------------------------------------- 进程表（getprocs）
+
+/// `getprocs` 的系统调用号（**Cerlesse 扩展号段**，Linux x86_64 不使用 256）。
+pub const SYS_GETPROCS: u64 = 256;
+/// 单条进程记录的字节数（必须与内核 `syscall::process::PROCINFO_SIZE` 一致）。
+pub const PROCINFO_SIZE: usize = 40;
+/// 进程记录里 `comm` 字段的容量。
+pub const PROCINFO_NAME_MAX: usize = 16;
+/// 进程记录里 `comm` 字段的偏移。
+pub const PROCINFO_NAME_OFFSET: usize = 24;
+
+/// `getprocs(buf)`：把进程表快照写进 `buf`，返回**记录数**（负数 = errno）。
+///
+/// 记录布局（内核侧 `syscall/process.rs` 是权威定义）：
+///
+/// ```text
+/// 0  pid(u64)   8  ppid(u64)   16  state(1) + reserved(7)   24  comm(16)
+/// ```
+///
+/// 枚举顺序 = 进程表槽位顺序（不承诺按 PID 排序）。`buf` 至少要有
+/// [`PROCINFO_SIZE`] 字节，否则内核返回 `-EINVAL`。
+pub fn getprocs(buf: &mut [u8]) -> isize {
+    unsafe { raw(SYS_GETPROCS, buf.as_ptr() as u64, buf.len() as u64, 0, 0, 0) }
+}
+
+/// 第 `index` 条进程记录的 PID（非法记录返回 0）。
+pub fn procinfo_pid(buf: &[u8], index: usize) -> u64 {
+    match record(buf, index, PROCINFO_SIZE) {
+        Some(rec) => u64::from_le_bytes([
+            rec[0], rec[1], rec[2], rec[3], rec[4], rec[5], rec[6], rec[7],
+        ]),
+        None => 0,
+    }
+}
+
+/// 第 `index` 条进程记录的父进程 PID（0 = 内核启动上下文）。
+pub fn procinfo_ppid(buf: &[u8], index: usize) -> u64 {
+    match record(buf, index, PROCINFO_SIZE) {
+        Some(rec) => u64::from_le_bytes([
+            rec[8], rec[9], rec[10], rec[11], rec[12], rec[13], rec[14], rec[15],
+        ]),
+        None => 0,
+    }
+}
+
+/// 第 `index` 条进程记录的状态名（内核的 `ProcState::name()` 同名字串）。
+pub fn procinfo_state(buf: &[u8], index: usize) -> &'static str {
+    match record(buf, index, PROCINFO_SIZE).map(|rec| rec[16]) {
+        Some(0) => "READY",
+        Some(1) => "RUNNING",
+        Some(2) => "ZOMBIE",
+        _ => "?",
+    }
+}
+
+/// 第 `index` 条进程记录的命令名（定长 16 字节，内核已补 0）。
+pub fn procinfo_name(buf: &[u8], index: usize) -> &str {
+    let Some(rec) = record(buf, index, PROCINFO_SIZE) else {
+        return "";
+    };
+    let end = PROCINFO_NAME_OFFSET + PROCINFO_NAME_MAX;
+    match rec.get(PROCINFO_NAME_OFFSET..end) {
+        Some(bytes) => {
+            let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            core::str::from_utf8(&bytes[..len]).unwrap_or("?")
+        }
+        None => "",
+    }
+}
+
 /// `exit(code)`：结束当前进程并把退出码交回内核。
 ///
 /// 顶层程序（`/init`、`/bin/sh`）结束后控制权回到内核运行驱动；

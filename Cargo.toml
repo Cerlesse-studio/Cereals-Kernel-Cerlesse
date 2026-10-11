@@ -12,6 +12,10 @@ members = [
     "user/hello",
     "user/shell",
     "user/hello-bin",
+    "user/ls",
+    "user/cat",
+    "user/echo",
+    "user/ps",
 ]
 default-members = ["shared", "boot", "kernel"]
 

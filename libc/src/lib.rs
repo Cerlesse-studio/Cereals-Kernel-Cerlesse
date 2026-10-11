@@ -7,6 +7,9 @@
 //!   `getpid` / `nanosleep` / `exit` / `brk` / `mmap` / `munmap`）；
 //!   v0.9 第三步起 `fork` / `execve` / `wait4` 也不再是桩：它们有真实的进程对象
 //!   （独立地址空间 + 独立内核栈 + 完整用户帧）作为后端，`user/shell` 用它跑外部程序；
+//!   v0.9 第五步补上用户态读内核表的两个调用：`getdents`（目录项，`user/ls`）与
+//!   `getprocs`（进程表快照，`user/ps`）—— 两者都是**定长记录**，配套的
+//!   `dirent_*` / `procinfo_*` 解析器也在这一层（用户程序不该自己算偏移）；
 //! - [`args`]：`argc` / `argv`（由 `execve` 与内核运行驱动一起送入 `_start`）；
 //! - [`heap`]：`#[global_allocator]`（bump over `mmap`）—— 用户程序因此可以用
 //!   `Vec`/`String`/`Box`（在此之前只能把数据放在栈或静态数组里）；
@@ -52,9 +55,11 @@ pub mod syscall;
 pub use crate::args::{arg, arg_str, argc, Args};
 pub use crate::console::Writer;
 pub use crate::syscall::{
-    brk, close, execve, exit, fork, getpid, mmap, munmap, nanosleep, open, read, wait4, write,
-    ARG_MAX, EAGAIN, EBADF, ECHILD, EFAULT, EISDIR, EINVAL, ENOENT, ENOMEM, ENOSPC, ENOSYS,
-    MAP_ANONYMOUS, MAP_PRIVATE, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, PROT_EXEC, PROT_READ,
+    brk, close, dirent_is_dir, dirent_name, dirent_size, execve, exit, fork, getdents, getpid,
+    getprocs, mmap, munmap, nanosleep, open, procinfo_name, procinfo_pid, procinfo_ppid,
+    procinfo_state, read, wait4, write, ARG_MAX, DIRENT_NAME_MAX, DIRENT_SIZE, EAGAIN, EBADF,
+    ECHILD, EFAULT, EISDIR, EINVAL, ENOENT, ENOMEM, ENOSPC, ENOSYS, MAP_ANONYMOUS, MAP_PRIVATE,
+    O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, PROCINFO_NAME_MAX, PROCINFO_SIZE, PROT_EXEC, PROT_READ,
     PROT_WRITE, STDERR, STDIN, STDOUT,
 };
 

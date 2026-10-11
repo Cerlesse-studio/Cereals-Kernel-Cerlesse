@@ -1,0 +1,12 @@
+[package]
+name = "user-cat"
+version = "0.1.0"
+edition = "2021"
+description = "v0.9 第四步基础用户程序（/bin/cat）：open/read/write/close 打印文件"
+
+[dependencies]
+libc = { path = "../../libc" }
+
+[[bin]]
+name = "user-cat"
+path = "src/main.rs"

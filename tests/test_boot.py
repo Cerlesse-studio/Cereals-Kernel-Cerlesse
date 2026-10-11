@@ -44,6 +44,11 @@ def parse_args() -> argparse.Namespace:
         help="OVMF_VARS 副本路径（并行编排时按场景隔离，默认 build/OVMF_VARS.fd）",
     )
     parser.add_argument(
+        "--nic",
+        action="store_true",
+        help="v0.9 test-network：加一块 legacy virtio-net-pci 网卡（QEMU user/slirp 网络）",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=TIMEOUT_SECONDS,
@@ -101,6 +106,15 @@ def main() -> int:
         cmd[cmd.index("-serial"):cmd.index("-serial")] = [
             "-drive", f"if=none,id=blk1,format=raw,file={disk2},snapshot=on",
             "-device", "virtio-blk-pci,drive=blk1,disable-modern=on",
+        ]
+
+    if args.nic:
+        # v0.9：网络验收用 `-netdev user`（slirp）—— 它自带 DHCP 服务器与虚拟网关，
+        # 因此 ARP + DHCP 的 UDP 往返不需要主机侧跑任何服务。disable-modern=on
+        # 强制 legacy 接口（vendor 1af4 / device 0x1000），内核的 virtio-net 驱动只认它。
+        cmd[cmd.index("-serial"):cmd.index("-serial")] = [
+            "-netdev", "user,id=n0",
+            "-device", "virtio-net-pci,netdev=n0,disable-modern=on",
         ]
 
     print(f"running: {' '.join(cmd)}")

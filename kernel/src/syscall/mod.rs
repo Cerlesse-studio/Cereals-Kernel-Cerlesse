@@ -5,8 +5,8 @@
 //! - [`address_space`]：用户页表（独立 PML4 + 按段权限逐页映射 + 内核 USER 位清理）；
 //! - [`elf`]：ELF64 装载器（RAMFS 上的 `/init` → 用户地址空间）；
 //! - [`syscall_table`]：编号 → handler 的分发表；
-//! - [`process`] / [`file`] / [`memory`]：已实现的 syscall
-//!   （exit/getpid/sleep、read/write/open/close、mmap/munmap/brk）；
+//! - [`process`] / [`file`] / [`memory`] / [`dir`]：已实现的 syscall
+//!   （exit/getpid/sleep/getprocs、read/write/open/close、mmap/munmap/brk、getdents）；
 //! - [`user`]：用户程序与 ring3 运行驱动 —— `/init`（`user/hello` 的 ELF，从 RAMFS 装载）
 //!   与隔离探针（内嵌机器码）。
 //!
@@ -18,6 +18,7 @@
 //! - 错误返回：负数表示 `-errno`（如 `-ENOSYS = -38`），非负数为正常返回值。
 
 pub mod address_space;
+pub mod dir;
 pub mod elf;
 pub mod file;
 pub mod memory;

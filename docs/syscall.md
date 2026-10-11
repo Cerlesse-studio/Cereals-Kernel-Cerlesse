@@ -342,7 +342,9 @@ user/hello (Rust + libc)
       同样从 VFS 读 ELF 装载，因此「多个程序」不再需要 `argc/argv`（命令来自 stdin，见 3.6）；
 - [x] `ls`/`cd` 等**外部**用户程序 → v0.9 第三步已打通：`/bin/hello`（`user/hello-bin`）
       由 Shell `fork` + `execve` 起来，拿到 `argc/argv` 并返回退出码（`make test-proc`）；
-      `cat` 仍以 Shell **内建命令**形式跑通同样的 syscall 语义（`open/read/write/close`）。
+      v0.9 第五步起 `ls`/`cat`/`echo`/`ps` 也是真实程序（`/bin/*`，见 3.8）——
+      注意 `cat`/`echo` 的**裸命令名**仍走 Shell 内建命令（内建遮蔽同名程序，与真实 shell 一致），
+      跑程序本身要写 `/bin/cat` / `/bin/echo`。
 
 ### 3.4 仍未做（v0.9 起逐步补齐）
 
@@ -353,6 +355,8 @@ user/hello (Rust + libc)
   每进程内核栈 + 停在 syscall 里的完整用户帧，Shell 的外部程序（`/bin/hello`）已能跑；
 - ~~`argc/argv`~~ → **已做**（3.7：参数经入口寄存器 `rdi`/`rsi` 传递，`libc::args` 读出）；
   环境变量（`envp`）仍未做；
+- ~~基础用户程序与目录/进程枚举~~ → **已做**（3.8：`getdents` + `getprocs`，`/bin/{ls,cat,echo,ps}`）；
+  其余程序（`cp`/`mv`/`rm`/`mkdir`/`kill`）与 Shell 增强（`cd`、管道、重定向）仍未做；
 - `stac`/`clac` 精细控制（内核目前直接读写用户页）、内核高半区迁移；
 - 动态链接 / `PT_INTERP` / `ET_DYN`（只接受 `ET_EXEC` + 无重定位）。
 
@@ -443,11 +447,14 @@ v0.9 第三步把入口改成按进程切换（当前进程下标 + 每进程内
    内核是在 syscall 里等用户程序，若 `stdin` 永久阻塞，任何无输入的启动都会停在 Shell 上，
    `user: selftest PASS` 不再出现。注意 `wait4` 现在**真的会阻塞式地跑子进程**（3.7），
    `stdin` 的 `-EAGAIN` 是仅剩的一处“不会被唤醒的等待”；
-2. 只有内建命令（`help`/`echo`/`cat`/`pid`/`exit`）+ 外部程序（`/bin/hello`）；
-   没有 `ls`/`cd`/管道/重定向（`ls` 会被解析到 `/bin/ls`，RAMFS 上没有该程序，
-   走的是「execve 失败 → exit(127)」这条**已验收**的路径）；
-3. `argv` 由 Shell 切分后交给 `execve`（见 3.7），但**没有**引号/环境变量/globbing；
-4. 回显是“cooked”（内核侧回显），且同一串口通道上还有 `KBIRQ ENTRY/EXIT` 标记 ——
+2. 只有内建命令（`help`/`echo`/`cat`/`pid`/`exit`）+ 外部程序（`/bin/*`）；
+   没有 `cd`/管道/重定向。第三步时 `/bin/ls` 还不存在，`ls` 走的是
+   「execve 失败 → exit(127)」这条路径；第四步把 `/bin/ls`（连同 `cat`/`echo`/`ps`）
+   真的做了出来（见 3.8），负例改用 `foo`（`make test-proc` 已同步）；
+3. 内建命令**遮蔽**同名程序（与真实 shell 一致）：裸 `cat`/`echo` 走内建，
+   要跑程序本身必须写 `/bin/cat` / `/bin/echo`；`ls`/`ps` 没有内建版本，裸名字就是程序；
+4. `argv` 由 Shell 切分后交给 `execve`（见 3.7），但**没有**引号/环境变量/globbing；
+5. 回显是“cooked”（内核侧回显），且同一串口通道上还有 `KBIRQ ENTRY/EXIT` 标记 ——
    可读性靠“一次击键一段标记”的约定，将来有终端抽象后再收敛。
 
 ### 3.7 进程调用：`fork` / `execve` / `wait4` 与 `argc`/`argv`（v0.9 第三步，2026-10-11 落地）
@@ -478,6 +485,53 @@ v0.9 第三步把入口改成按进程切换（当前进程下标 + 每进程内
 - [x] `sh: hello: exit code=1` + `user: reaped pid=N exit=1`：退出码沿 `wait4` 回到父进程；
 - [x] `user: frames free before=N after=N`：父进程 + 两个子进程的地址空间**全部归还**（无页帧泄漏）。
 
+### 3.8 基础用户程序与目录/进程枚举（v0.9 第五步，2026-10-11 落地）
+
+前三步把「用户程序」与「进程」做通了，但 `/bin` 里只有一个 `hello` —— 真正的命令行
+程序一个也没有。这一步补上四个，并为此加了两个 syscall（都是**只读内核表**的调用）。
+
+| syscall | 号 | 实现位置 | 用户态使用者 | 说明 |
+| ---- | ---- | ---- | ---- | ---- |
+| `getdents(path_ptr, path_len, buf_ptr, buf_len)` | 78 | `syscall/dir.rs::sys_getdents` | `user/ls` → `/bin/ls` | 把 `vfs::list()` 的结果写成**定长 88 字节记录**（`kind`/`size`/`name_len`/`name`）到用户缓冲；返回写入的记录数，装不下就**截断**（每条都完整）；缓冲 < 1 条记录 → `-EINVAL` |
+| `getprocs(buf_ptr, buf_len)` | **256** | `syscall/process.rs::sys_getprocs` | `user/ps` → `/bin/ps` | 把进程表快照写成**定长 40 字节记录**（`pid`/`ppid`/`state`/`comm`）；按**槽位顺序**枚举，不承诺按 PID 排序 |
+
+两个号的位置是有意的：`getdents = 78` 沿用 Linux 同名号（但**记录格式不同** —— 本内核的 VFS
+没有 inode 号/硬链接，不编造 `linux_dirent64` 里的 `ino`/`off`/`d_type`）；而 Linux x86_64
+**没有**「列举进程」的调用（它的 `ps` 读 `/proc`），所以 `getprocs` 放在 **256** ——
+`syscall_table.rs` 明确把 `0..=255` 留给 Linux 语义、`>= 256` 作为 Cerlesse 扩展号段
+（`SYS_MAX` 随之 256 → 257）。解析偏移只有一处权威定义（内核侧模块文档），
+`libc` 提供 `dirent_name`/`dirent_is_dir`/`dirent_size` 与 `procinfo_pid`/`ppid`/`state`/`name`
+让用户程序不必自己算偏移。
+
+四个程序各自的「为什么值得单独存在」：
+
+| 程序 | RAMFS 路径 | 用到的内核能力 | 输出（可与串口逐条对齐） |
+| ---- | ---- | ---- | ---- |
+| `user/ls` | `/bin/ls` | `getdents` | `ls: / entries=4` + 每条 `ls: entry name=… kind=file|dir size=…` |
+| `user/ps` | `/bin/ps` | `getprocs` | 表头 + 每条 `ps: pid=… ppid=… state=RUNNING comm=…` + `ps: N process(es)` |
+| `user/cat` | `/bin/cat` | `open`/`read`/`write`/`close` | 文件内容 + `cat: /etc/motd bytes=23` |
+| `user/echo` | `/bin/echo` | `argc`/`argv` + 一次 `write` | 参数拼成一行（一次系统调用，与内建 `echo` 的每参数一次 `write` 不同） |
+
+`ps` 需要一个「这个进程现在是什么程序」的字段：`Process::comm: [u8; 16]`（定长，
+Linux `task_struct.comm` 的形状）—— `create` 用调试名填充，`execve` 成功后改写为
+程序名（`/bin/ls` → `ls`）。之前只有 `name: &'static str`（写死的 `"exec"`），
+要把它改成程序名就得泄漏一个 `String`，所以用定长字段而不是指针。
+
+验收（`make test-programs`：注入 `ls` / `ls /bin` / `ps` / `/bin/echo …` / `/bin/cat /etc/motd`，
+17 项 + 5 条正则）：
+
+- [x] `user: getdents path=/ entries=4 returned=4` + `ls: / entries=4`：`ls` 读的是 **VFS 的目录项**
+      （v0.7 起 `list()` 只有内核自测用过）；`ls: entry name=bin kind=dir size=0` 证明元数据也被读出来了；
+- [x] `ls: /bin entries=6`：`/bin` 里恰好是这次构建写进去的 6 个程序（`sh`/`hello`/`ls`/`cat`/`echo`/`ps`）——
+      同时证明 `fs::init` 的程序清单是完整的；
+- [x] `user: getprocs count=2` + `ps: pid=3 ppid=0 state=RUNNING comm=sh` + `ps: pid=N ppid=3 … comm=ps`：
+      `ps` 读的是**内核进程表**：表里恰好是 Shell 与 `ps` 自己，`ppid` 指回 Shell（`fork` 建出的父子关系）；
+- [x] `user: exec pid=N path=/bin/{ls,ps,echo,cat} segments=4 image_pages=5 entry=0x8000000000`：
+      四个程序都是**真的**被 `execve` 起来的（不是内建命令代劳）；
+- [x] `cat: /etc/motd bytes=23` + `motd: hello from ramfs`：`/bin/cat` 走完整文件 syscall；
+- [x] `echo program works`：`argv` 经内核写入新进程用户栈后被程序原样打印；
+- [x] `sh: {ls,ps,/bin/echo,/bin/cat}: exit code=0`：四个程序的退出码都沿 `wait4` 回到 Shell。
+
 ## 4. 调用链示例
 
 实际调用链（v0.7 + v0.9 用户堆）：
@@ -490,8 +544,11 @@ v0.9 第三步把入口改成按进程切换（当前进程下标 + 每进程内
   → file::sys_read/sys_write/sys_open/sys_close
        └─ fs::file（fd 表）→ fs::vfs（挂载表路由）→ fs::ramfs
   → memory::sys_mmap / sys_munmap / sys_brk（用户堆：地址空间窗口 + 页帧分配）
-  → process::sys_exit / sys_getpid / sys_sleep / sys_fork / sys_exec / sys_wait
-       └─ wait4 → trampoline::run（切到子进程的 CR3 / 内核栈 / 用户帧）→ 子进程 exit → 回收
+  → process::sys_exit / sys_getpid / sys_sleep / sys_fork / sys_exec / sys_wait / sys_getprocs
+       ├─ wait4 → trampoline::run（切到子进程的 CR3 / 内核栈 / 用户帧）→ 子进程 exit → 回收
+       └─ getprocs → 进程表快照 → 用户缓冲（`user/ps`）
+  → dir::sys_getdents
+       └─ fs::vfs::list → 定长 88 字节记录 → 用户缓冲（`user/ls`）
   → sysretq 回到用户态（恢复 rdi/rsi/rdx/r10/r8/r9；exit 与 ring3 异常走 leave_user 回内核）
 ```
 
@@ -517,3 +574,4 @@ fd ≥ 3 一律经 VFS 抽象路由，syscall 层不认识具体后端。
 | 2026-10-11 | **v0.9 第二步：交互式 Shell 与 stdin** —— `driver/keyboard.rs` 加 128 字节行缓冲 + 行编辑，回显协议由 `KB <字符>` 改为终端式原样回显（`Enter` 打印 `kbd: line ready len=N`，`make test-keyboard` 断言同步）；`syscall/file.rs` 新增 `read_stdin`（`read(0)` 整行交付、3 秒超时返回 `-EAGAIN`）；`libc` 新增 `EAGAIN` 与 `fork`/`execve`/`wait4` 包装；新增 `user/shell`（提示符 `root@cerlesse C:>`、内建 `help`/`echo`/`cat`/`pid`/`exit`、外部命令真的调 `fork()`），`kernel/build.rs`/`fs::init`/`user.rs` 按“两个用户程序”改造（`/init` + `/bin/sh`）；`syscall/mod.rs` 对已命名未实现的号打印 `syscall: ENOSYS nr=… name=…`；新增 `make test-shell`（12 项）与编排 `shell` 场景，`make test-user` 增至 61 项（含非交互路径的 Shell 步骤），`test-fs` 根目录条目数改为 4；新增 3.6，更新 3.2/3.3/3.4 |
 | 2026-10-11 | **v0.9 第三步：`fork`/`execve`/`wait4` + `argc`/`argv`（外部程序真的能跑了）** —— 新增 3.7；`syscall/process.rs` 实现三号（fork 复制地址空间与当前用户帧、execve 换映像并重建 argv 用户栈、wait4 延迟调度 + 回收），`process/process.rs` 换成真正的 PCB（每进程 64 KiB 内核栈 + 栈底哨兵、`Ready/Running/Zombie`、`return_to`），`trampoline` 改为按进程切换（CR3/TSS.RSP0/栈顶/当前进程）；`libc` 去掉「已定号未实现」的说法，新增 `libc/src/args.rs`（`rdi`/`rsi` 入口 ABI）；新增 `user/hello-bin` → `/bin/hello` 作为外部程序；Shell 的 `cmd_external` 改走 `fork`+`execve`+`wait4`（`ls` 现在是“execve 失败 → exit(127)”）；`tests/test_keyboard.py` 新增 `--expect-re`（正则 + 反向引用，用于断言 PID 一致性）；新增 `make test-proc`（8 项 + 4 条正则）并加入 `test-all`，编排场景 11 → **12**（新增 `proc`）；`make test-shell` 12 → **11 项**（去掉两条 ENOSYS 依赖证据，改为断言外部程序路径）；`make test-user` 的 `shell PASS` 断言同步 |
 | 2026-10-11 | **v0.7 落地**：第 3 节从规划改为实现记录 —— ELF Loader（解析/按段权限逐页映射/入口取 `e_entry`）、用户地址布局（映像窗口 64 KiB + 栈 4 页）、段页对齐与 `.lbss` 孤儿段的实测坑、`make user` 的独立 ELF 检查（`tools/check_user_elf.py`）；2.7 填入 `read/open/write/close`（含 fd 表与两条硬规则）；2.10 标注 v0.7 已做项；4 节更新调用链；3.4 列出仍未做项（用户堆/`argc/argv`/`fork` 系/动态链接） |
+| 2026-10-11 | **v0.9 第五步：基础用户程序（`ls`/`cat`/`echo`/`ps`）与目录/进程枚举** —— 新增 3.8；新增 `syscall/dir.rs`（`getdents = 78`，定长 88 字节记录、VFS `list()` 转发、截断语义与 `-EINVAL` 边界）与 `syscall/process.rs::sys_getprocs`（**扩展号段 256**，定长 40 字节记录）；`syscall_table.rs` 的 `SYS_MAX` 256 → 257，并写明「`0..=255` = Linux 语义、`>= 256` = Cerlesse 扩展」；`process/process.rs` 新增定长 `comm: [u8; 16]`（`create` 填充、`execve` 改写为程序名），顶层程序运行前置为 `RUNNING`；`libc` 新增 `getdents`/`getprocs` 与 `dirent_*`/`procinfo_*` 解析器；新增 `user/{ls,cat,echo,ps}` 四个程序（`kernel/build.rs`/`workspace`/`fs::init` 清单 3 → 7）；Shell 的帮助文本补上四个程序并说明「内建遮蔽同名程序」；新增 `make test-programs`（17 项 + 5 条正则）与编排 `programs` 场景（场景数 **13 → 14**）；`make test-proc` 的负例由 `ls` 改为 `foo`（`/bin/ls` 已存在，不能再当“找不到的程序”） |

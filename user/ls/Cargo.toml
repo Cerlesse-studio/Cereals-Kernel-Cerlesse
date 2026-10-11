@@ -1,0 +1,12 @@
+[package]
+name = "user-ls"
+version = "0.1.0"
+edition = "2021"
+description = "v0.9 第四步基础用户程序（/bin/ls）：getdents 列举目录"
+
+[dependencies]
+libc = { path = "../../libc" }
+
+[[bin]]
+name = "user-ls"
+path = "src/main.rs"

@@ -36,11 +36,18 @@ const USER_IMAGE_MAX_BYTES: u64 = 16 * 4096;
 /// - `user-hello` → `/init`：v0.7 起的验收基准（文件 syscall / 用户堆 / 退出码 42）；
 /// - `user-shell` → `/bin/sh`：v0.9 的交互式 Shell（键盘行缓冲 → `stdin` → 内建命令）；
 /// - `user-hello-bin` → `/bin/hello`：v0.9 第三步的**外部程序** —— 它不由内核直接运行，
-///   而是被 Shell 用 `fork` + `execve` 起来（`make test-shell` 断言这条路径）。
-const USER_PROGRAMS: [(&str, &str); 3] = [
+///   而是被 Shell 用 `fork` + `execve` 起来（`make test-proc` 断言这条路径）；
+/// - `user-ls` / `user-cat` / `user-echo` / `user-ps` → `/bin/*`：v0.9 第五步的
+///   基础用户程序（分别用到 `getdents` / 文件 syscall / `write` / `getprocs`，
+///   `make test-programs` 断言它们真的被 exec 起来并产生了正确输出）。
+const USER_PROGRAMS: [(&str, &str); 7] = [
     ("user-hello", "user_hello.elf"),
     ("user-shell", "user_shell.elf"),
     ("user-hello-bin", "user_hello_bin.elf"),
+    ("user-ls", "user_ls.elf"),
+    ("user-cat", "user_cat.elf"),
+    ("user-echo", "user_echo.elf"),
+    ("user-ps", "user_ps.elf"),
 ];
 /// 用户程序使用的 cargo profile（workspace 根定义；`lto = false`，见其注释）。
 const USER_PROFILE: &str = "user-release";
@@ -101,6 +108,18 @@ fn main() {
         "user/hello-bin/Cargo.toml",
         "user/hello-bin/src",
         "user/hello-bin/user.ld",
+        "user/ls/Cargo.toml",
+        "user/ls/src",
+        "user/ls/user.ld",
+        "user/cat/Cargo.toml",
+        "user/cat/src",
+        "user/cat/user.ld",
+        "user/echo/Cargo.toml",
+        "user/echo/src",
+        "user/echo/user.ld",
+        "user/ps/Cargo.toml",
+        "user/ps/src",
+        "user/ps/user.ld",
     ] {
         println!("cargo:rerun-if-changed={}", root.join(watched).display());
     }

@@ -165,6 +165,10 @@ fn cmd_help() {
     println!("sh: anything else runs as an external program via fork/execve/wait4");
     println!("sh:   /bin/hello      - external program (prints its pid + argv)");
     println!("sh:   <name>          - resolved to /bin/<name> (e.g. `ls` -> /bin/ls)");
+    println!("sh: external programs (v0.9 step 4): ls, ps, cat, echo");
+    println!("sh:   ls [path]       - list a directory through getdents");
+    println!("sh:   ps              - print the process table through getprocs");
+    println!("sh:   /bin/cat /bin/echo - the programs (builtins shadow the bare names)");
 }
 
 /// `echo`：逐个参数写出（每个参数一次 `write`，日志里能看到切分结果）。

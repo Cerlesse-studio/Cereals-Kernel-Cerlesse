@@ -29,12 +29,15 @@ Cerlesse/
 │   │   │                        #    ✅ v0.9 第一步：memory（brk/mmap/munmap，用户堆）
 │   │   │                        #    ✅ v0.9 第二步：file::read_stdin（键盘行缓冲 → fd 0）
 │   │   │                        #    ✅ v0.9 第三步：process 的 fork/execve/wait4 + argv 用户栈
+│   │   │                        #    ✅ v0.9 第五步：dir（getdents）+ process::getprocs（目录/进程表枚举）
 │   │   ├── fs/                  # ✅ v0.7–v0.8：vfs/inode/mount/ramfs/file + fat（FAT12/16/32 只读后端）
 │   │   ├── driver/              # ✅ v0.8：driver（注册框架）/pci/block/virtio_blk + serial（v0.1）
 │   │   │                        #    ✅ v0.9：keyboard 加行缓冲与行编辑（v0.4 起为 IRQ1 回显）
+│   │   │                        #    ✅ v0.9 第四步：net（NetworkDevice 抽象）+ virtio_net（legacy 网卡驱动）
 │   │   ├── time/                # timer/clock
 │   │   ├── ipc/                 # pipe/channel/shared_memory
-│   │   ├── network/             # ethernet/arp/ipv4/udp/tcp/socket
+│   │   ├── network/             # ✅ v0.9 第四步：ethernet/arp/ipv4/udp/dhcp + mod（Stack + selftest）
+│   │   │                        #    tcp/socket 仍为占位（完整 TCP/IP 是第一版非目标）
 │   │   ├── security/            # permission/credential/capability
 │   │   └── main.rs              # 内核入口（v0.1 ✅：_start + kernel_main）
 │   ├── link.ld                  # 链接脚本：装载到 32MiB（ADR-007）
@@ -48,13 +51,17 @@ Cerlesse/
 │   │                            #    外部命令走 fork/execve/wait4），内嵌为 RAMFS 上的 /bin/sh
 │   ├── hello-bin/               # ✅ v0.9 第三步：**外部程序**（打印 pid/argc/argv 后 exit(1)），
 │   │                            #    内嵌为 RAMFS 上的 /bin/hello —— 不由内核直接运行，只被 Shell 跑起来
-│   └── init/  ls/  cat/  echo/  ps/   # v0.9 占位（cat 先以 Shell 内建命令形式落地；
-│                                      #    ls 现在走“/bin/ls 不存在 → execve ENOENT → exit(127)”）
+│   ├── ls/                      # ✅ v0.9 第五步：/bin/ls（getdents 列举目录，带 kind/size）
+│   ├── cat/                     # ✅ v0.9 第五步：/bin/cat（open/read/write/close 打印文件）
+│   ├── echo/                    # ✅ v0.9 第五步：/bin/echo（argc/argv + 一次 write）
+│   ├── ps/                      # ✅ v0.9 第五步：/bin/ps（getprocs 打印进程表）
+│   └── init/                    # v0.9 占位（内核实际跑的 /init 是 user/hello 的构建产物）
 │
 ├── libc/                        # ✅ v0.6/v0.7：最小用户态运行时（syscall 封装 / _start / print!）
 │                                #    ✅ v0.9 第一步：heap（#[global_allocator]，bump over mmap）
 │                                #    ✅ v0.9 第二步：EAGAIN 与 read(0) 行缓冲语义
 │                                #    ✅ v0.9 第三步：args（argc/argv）与可用的 fork/execve/wait4
+│                                #    ✅ v0.9 第五步：getdents/getprocs 与 dirent_*/procinfo_* 解析器
 │
 ├── tools/                       # 主机侧工具
 │   ├── image-builder/           # Python：磁盘镜像组装
@@ -87,7 +94,7 @@ Cerlesse/
 | `kernel/src/time/` | PIT/APIC Timer、系统时钟、sleep/yield | v0.4 |
 | `kernel/src/process/` | 进程/线程模型、PID、状态机 | v0.5 |
 | `kernel/src/scheduler/` | 调度队列、Round Robin | v0.5 |
-| `kernel/src/syscall/` | 系统调用入口/分发、用户地址空间、ELF Loader、首批与文件 syscall、**用户堆（`memory.rs`：`brk`/`mmap`/`munmap`）**、**进程调用（`process.rs`：`fork`/`execve`/`wait4` + argv 用户栈）** | v0.6–v0.7 ✅ / v0.9 第一·三步 ✅ |
+| `kernel/src/syscall/` | 系统调用入口/分发、用户地址空间、ELF Loader、首批与文件 syscall、**用户堆（`memory.rs`：`brk`/`mmap`/`munmap`）**、**进程调用（`process.rs`：`fork`/`execve`/`wait4` + argv 用户栈 + `getprocs`）**、**目录枚举（`dir.rs`：`getdents`）** | v0.6–v0.7 ✅ / v0.9 第一·三·四步 ✅ |
 | `kernel/src/fs/` | VFS 抽象（trait + 路径工具）、挂载表路由、RAMFS、fd 表、**FAT12/16/32 只读后端** | v0.7 ✅ / v0.8 ✅ |
 | `kernel/src/driver/` | 串口（v0.1）、键盘（v0.4）、**驱动注册框架 / PCI 枚举 / 块设备抽象 / virtio-blk**（v0.8 ✅） | v0.4 / v0.8 |
 | `kernel/src/driver/{pci,driver,block,virtio_blk}.rs` | `pci` 只回答「总线上有什么」；`driver` 回答「谁来管它」（`Driver` trait + `probe_all`）；`block` 是上层唯一可见的按扇区接口；`virtio_blk` 是具体实现（同时实现 `Driver` 与 `BlockDevice`） | v0.8 ✅ |
@@ -98,7 +105,7 @@ Cerlesse/
 | `kernel/src/network/` | 以太网 → IP → TCP/UDP → Socket | v0.9 |
 | `kernel/src/security/` | 权限、凭证、Capability | v1.0 |
 | `libc/` | 最小用户态运行时：syscall 封装（含 `open/read/close`、`brk/mmap/munmap` 与 `fork/execve/wait4`）、`_start`（入口寄存器 `argc`/`argv`）、`print!/println!`、panic handler、`heap`（`#[global_allocator]`）、`args` | v0.6 ✅ / v0.7 ✅ / v0.9 ✅ |
-| `user/` | 用户程序（`hello` ✅ v0.6/v0.7 → `/init`；`shell` ✅ v0.9 → `/bin/sh`；**`hello-bin` ✅ v0.9 第三步 → `/bin/hello`（外部程序）**；init/ls/cat/echo/ps 仍为占位） | v0.6–v0.9 |
+| `user/` | 用户程序（`hello` ✅ v0.6/v0.7 → `/init`；`shell` ✅ v0.9 → `/bin/sh`；`hello-bin` ✅ v0.9 第三步 → `/bin/hello`（外部程序）；**`ls` / `cat` / `echo` / `ps` ✅ v0.9 第五步 → `/bin/*`**；`init/` 仍为占位） | v0.6–v0.9 |
 | `tools/`（Python） | 镜像构建、用户程序 ELF 检查（v0.7）、`mkfs/` FAT 镜像生成（v0.8 ✅）、**`pkgmgr/ckc.py`（CKC 包容器 `.ckc`，H-06 P0a ✅）** | v0.1 起 |
 | `tools-go/`（Go） | 测试编排、串口日志服务 | v0.4 起 |
 | `tests/` | QEMU 集成测试 | v0.1 起 |
@@ -107,6 +114,7 @@ Cerlesse/
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-11 | v0.9 第五步（基础用户程序）：`kernel/src/syscall/dir.rs`（`getdents`）与 `process.rs::sys_getprocs` 落地；`user/{ls,cat,echo,ps}` 从占位变为实现（RAMFS `/bin/*`），`kernel/build.rs` 的程序清单 3 → 7；`libc/` 新增 `getdents`/`getprocs` 与 `dirent_*`/`procinfo_*` 解析器 —— 目录树、模块表与 `libc/` 描述同步 |
 | 2026-10-11 | v0.9 第三步（进程对象与外部程序）：`kernel/src/syscall/process.rs` 的 `fork`/`execve`/`wait4` 落地，`process/process.rs` 换成真正的 PCB（每进程内核栈），`trampoline` 改为按进程切换；`libc/` 新增 `args.rs`；新增 `user/hello-bin`（RAMFS `/bin/hello`）—— 目录树、模块表与 `libc/` 描述同步 |
 | 2026-10-11 | v0.9 第二步（交互式 Shell）：`user/shell` 从占位变为实现（首个 `/init` 之外的用户程序，RAMFS 上的 `/bin/sh`），`kernel/build.rs` 由「单个用户程序」改为「按列表构建/校验/内嵌」，`fs::init` 增加 `/bin`；`driver/keyboard.rs` 加行缓冲（目录树注释同步） |
 | 2026-10-06 | 第一阶段初稿，同步创建代码文件框架占位 |

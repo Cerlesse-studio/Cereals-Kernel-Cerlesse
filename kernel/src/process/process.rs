@@ -49,6 +49,12 @@ use crate::syscall::trampoline::{RunCtx, UserFrame, NO_PROCESS as TRAMPOLINE_NO_
 
 /// 进程表容量（同时决定静态内核栈的总量）。
 pub const MAX_PROC: usize = 8;
+/// `comm` 字段的容量（16 字节，与 Linux `task_struct.comm` 同宽）。
+///
+/// `ps` 读的就是它：`name` 是给串口日志看的 `&'static str`（`"fork-child"` /
+/// `"exec"`），而 `comm` 是**定长**、可随 `execve` 改写为程序名（`"ls"`）的
+/// 字段 —— 后者才是「这个进程现在是什么程序」的正确答案。
+pub const PROC_COMM_LEN: usize = 16;
 /// 「无当前进程」哨兵值（与 `trampoline::NO_PROCESS` 同值）。
 pub const NO_PROCESS: usize = usize::MAX;
 /// 每个进程的内核栈大小。
@@ -100,6 +106,8 @@ pub struct Process {
     pub pid: u64,
     /// 调试名（`/bin/sh`、`fork:/bin/ls` 之类）
     pub name: &'static str,
+    /// 定长命令名（`ps` 读它；`create` 用 `name` 填充，`execve` 改写为程序名）。
+    pub comm: [u8; PROC_COMM_LEN],
     /// 父进程 pid（0 = 内核启动上下文）
     pub parent_pid: u64,
     /// 父进程在进程表中的下标（[`NO_PROCESS`] = 内核启动上下文）
@@ -128,6 +136,22 @@ impl Process {
     pub fn stack_intact(&self) -> bool {
         stack_intact(self.slot)
     }
+
+    /// 用 `name`（超出 [`PROC_COMM_LEN`] 的部分截断）改写 [`Process::comm`]。
+    ///
+    /// `execve` 成功后调用它，于是 `ps` 看到的是程序名而不是 `"exec"`。
+    pub fn set_comm(&mut self, name: &str) {
+        self.comm = comm_of(name);
+    }
+}
+
+/// 把名字编码成定长 `comm`（不足部分补 0；不使用 NUL 终止符，长度固定 16）。
+pub fn comm_of(name: &str) -> [u8; PROC_COMM_LEN] {
+    let mut comm = [0u8; PROC_COMM_LEN];
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(PROC_COMM_LEN);
+    comm[..n].copy_from_slice(&bytes[..n]);
+    comm
 }
 
 /// 进程表（`None` = 空闲槽位）。
@@ -276,6 +300,7 @@ pub fn create(
         entry.write(Some(Process {
             pid,
             name,
+            comm: comm_of(name),
             parent_pid,
             parent,
             slot,

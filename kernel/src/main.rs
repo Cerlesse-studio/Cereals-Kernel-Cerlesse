@@ -21,6 +21,7 @@ mod fs;
 mod interrupt;
 mod ipc;
 mod memory;
+mod network;
 mod process;
 mod scheduler;
 mod time;
@@ -257,6 +258,23 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
         driver::serial::print("fs: disk FAIL: ");
         driver::serial::println(err);
         halt();
+    }
+
+    // v0.9：简化网络栈验收（Ethernet → ARP → IPv4 → UDP）。
+    //
+    // 只有在总线上真的挂了一块网卡（`make test-network` 的 QEMU 加了 virtio-net-pci）
+    // 时才跑；其它测试不带网卡，走到这里就跳过 —— 不把「没有网卡」当成失败。
+    // 断言的是网络里回来的真实内容（ARP 应答的 MAC、DHCP OFFER 的 yiaddr/server），
+    // 见 `network::selftest`。
+    if driver::net::count() == 0 {
+        driver::serial::println("net: no network device present; skipping network selftest");
+    } else if let Some(dev) = driver::net::first() {
+        driver::net::report();
+        if let Err(err) = network::selftest(dev) {
+            driver::serial::print("net: FAIL: ");
+            driver::serial::println(err);
+            halt();
+        }
     }
 
 

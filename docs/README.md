@@ -2,7 +2,7 @@
 
 - 阶段：第一阶段 / 文档中心
 - 最后更新：2026-10-11
-- 状态：🟡 持续更新（2026-10-11 同步 v0.9 第二步（**`stdin` + 交互式 Shell `/bin/sh`**）实现记录；同日已同步 v0.8 收官、v0.9 第一步用户堆与 H-06 包管理器 `.ckc` 提案 P0a）
+- 状态：🟡 持续更新（2026-10-11 同步 v0.9 第五步（**基础用户程序 `ls`/`cat`/`echo`/`ps` + `getdents`/`getprocs`**）实现记录；同日已同步 v0.9 第四步简化网络栈、第三步进程对象、第二步交互式 Shell、第一步用户堆、v0.8 收官与 H-06 包管理器 `.ckc` 提案 P0a）
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
 
@@ -23,9 +23,9 @@
 | [software-development.md](./software-development.md) | **软件开发文档**：环境与工具链、构建/测试/调试、代码与文档规范、协作流程、质量门禁、扩展步骤 | 🟡 持续更新（2026-10-11 新建） |
 | [boot.md](./boot.md) | 阶段：Bootloader / UEFI / Kernel Entry / GDT / IDT | ✅ v0.1 + v0.2 已完成 |
 | [memory.md](./memory.md) | 阶段：物理/虚拟内存 / Heap / Allocator | ✅ v0.3 已完成 |
-| [drivers.md](./drivers.md) | 阶段：驱动框架 / PCI / 磁盘（含 v0.4 中断/时钟/键盘/上下文切换） | ✅ v0.8 已完成（驱动注册框架 + PCI 枚举 + 块设备抽象 + **legacy virtio-blk**，`make test-driver` 22 项 PASS；启动盘已改为 virtio-blk）；v0.4（PIC + PIT 100Hz + PS/2 键盘 + 上下文切换原语）已完成；v0.9 键盘加**行缓冲 + 终端式回显**（`make test-keyboard` 断言同步） |
+| [drivers.md](./drivers.md) | 阶段：驱动框架 / PCI / 磁盘（含 v0.4 中断/时钟/键盘/上下文切换） | ✅ v0.8 已完成（驱动注册框架 + PCI 枚举 + 块设备抽象 + **legacy virtio-blk**，`make test-driver` 22 项 PASS；启动盘已改为 virtio-blk）；v0.4（PIC + PIT 100Hz + PS/2 键盘 + 上下文切换原语）已完成；v0.9 键盘加**行缓冲 + 终端式回显**（`make test-keyboard` 断言同步）；**v0.9 第四步：简化网络栈（virtio-net + Ethernet → ARP → IPv4 → UDP）已落地**（`make test-network` 13 项，见 1.8） |
 | [process.md](./process.md) | 阶段：进程/线程 / 上下文切换 / 调度器 / IPC | ✅ v0.5 已完成（线程模型 + 上下文切换 + Round Robin 时间片调度 `make test-scheduler`；IPC pipe 骨架 `make test-ipc`）；channel / shared_memory 仍为占位；v0.6 追加了 `scheduler::suspend()`；**v0.9 第三步：进程对象与 `fork`/`execve`/`wait4` 已落地**（每进程地址空间 + 每进程 64 KiB 内核栈 + 完整用户帧，`make test-proc`，见 1.4） |
-| [syscall.md](./syscall.md) | 阶段：系统调用 / 用户空间 / ELF | 🟡 v0.7 核心已完成（`syscall`/`sysret` 入口 + ring3 隔离 + `read/write/open/close`+ `write/exit/getpid/sleep` + **ELF Loader** 从 RAMFS `/init` 按段权限装载），v0.9 已落地三步：**用户堆**（3.5）、**`stdin` + 交互式 Shell**（3.6）、**`fork`/`execve`/`wait4` + `argc`/`argv`**（3.7，外部程序 `/bin/hello` 真的能跑）；`make test-user` 61 项 / `make test-shell` 11 项 / `make test-proc` 8 项 + 4 正则 PASS；只剩 `mprotect`/环境变量/动态链接未做（见 3.4） |
+| [syscall.md](./syscall.md) | 阶段：系统调用 / 用户空间 / ELF | 🟡 v0.7 核心已完成（`syscall`/`sysret` 入口 + ring3 隔离 + `read/write/open/close`+ `write/exit/getpid/sleep` + **ELF Loader** 从 RAMFS `/init` 按段权限装载），v0.9 已落地四步：**用户堆**（3.5）、**`stdin` + 交互式 Shell**（3.6）、**`fork`/`execve`/`wait4` + `argc`/`argv`**（3.7，外部程序 `/bin/hello` 真的能跑）、**基础用户程序 + `getdents`/`getprocs`**（3.8，`/bin/{ls,cat,echo,ps}`）；`make test-user` 61 项 / `make test-shell` 11 项 / `make test-proc` 8 项 + 4 正则 / `make test-programs` 17 项 + 5 正则 PASS；只剩 `mprotect`/环境变量/动态链接未做（见 3.4） |
 | [filesystem.md](./filesystem.md) | 阶段：VFS / RAMFS / 磁盘文件系统 | ✅ v0.7 + **v0.8 磁盘后端**已完成（VFS trait + 挂载表最长前缀路由 + RAMFS + fd 表；**FAT12/16/32 只读后端** + `tools/mkfs/mkfs.py`，`make test-fs` 20 项 / `make test-fat` 21 项 PASS） |
 
 ## 阶段说明
@@ -45,10 +45,28 @@
   已落地并验收 —— 键盘行缓冲 → `read(0)` 整行 → `/bin/sh`（`make test-shell` 11 项，见 syscall.md 3.6）；
   第三步 **进程对象 + `fork`/`execve`/`wait4` + `argc`/`argv`** 已落地并验收 ——
   Shell 能真的跑起外部程序（`/bin/hello`，`make test-proc`，见 syscall.md 3.7 与 process.md 1.4）；
-  网络仍为占位。
+  第四步 **简化网络栈**（virtio-net + Ethernet → ARP → IPv4 → UDP，`make test-network` 13 项，见 drivers.md 1.8）已落地；
+  第五步 **基础用户程序**（`ls`/`ps`/`cat`/`echo` → `/bin/*`，含新增的目录枚举 `getdents` 与进程表 `getprocs`，
+  `make test-programs` 17 项 + 5 正则，见 syscall.md 3.8）已落地；
+  仅**动态链接**仍未做。
 - **后续**：每进入一个新阶段就编写/修订对应的主题文档；阶段内已落地部分也要及时补记当前状态（例如 v0.4 中断控制器）。
 - 本套文档**会在开发过程中被反复修改**——修改前请在对应文档顶部记录修订日期与变更点。
--  本次（2026-10-11，第八轮）修订重点：**文档重构（本轮）** —— README 改为项目入口页；DEVELOPMENT.md 按「需求/依赖/workspace/目录/版本任务/缺陷汇总/测试/QEMU/Issue/文档约定/修订」重组并新增 v0.6–v0.9 任务清单与 B-01…B-17 汇总；**新增 [api.md](./api.md)（系统调用 ABI / `libc` API / 内核 trait / 工具 CLI / Make 目标）与 [software-development.md](./software-development.md)（环境 / 构建测试调试 / 规范 / 协作 / 质量门禁 / 扩展步骤）**；同步 docs/README 索引。
+-  本次（2026-10-11，第十轮）修订重点：**v0.9 第五步（基础用户程序与目录/进程枚举）落地** ——
+  新增 `syscall/dir.rs`（`getdents`：VFS `list()` → 定长 88 字节记录，号 78 沿用 Linux 但格式不同）与
+  `syscall/process.rs::sys_getprocs`（定长 40 字节记录，号 **256**）；`syscall_table.rs` 确立
+  「`0..=255` Linux 语义 / `>= 256` Cerlesse 扩展」并把 `SYS_MAX` 改 257；`process/process.rs` 新增定长 `comm`
+  （`execve` 改写为程序名）；`libc` 新增 `getdents`/`getprocs` + `dirent_*`/`procinfo_*` 解析器；
+  新增 `user/{ls,cat,echo,ps}` → RAMFS `/bin/*`（构建/内嵌清单 3 → 7）；新增 `make test-programs`（17 项 + 5 正则）
+  与编排 `programs` 场景（13 → **14 场景**）；`make test-proc` 负例由 `ls` 改 `foo`；
+  同步 syscall.md（新增 3.8、3.6 未做项修正与修订记录）、project-structure.md、roadmap.md、DEVELOPMENT.md、README.md。
+-  本次（2026-10-11，第九轮）修订重点：**v0.9 第四步（简化网络栈）落地** ——
+  新增 `driver/net.rs`（`NetworkDevice` trait + 注册表）与 `driver/virtio_net.rs`（legacy virtio-net 0.9.5：
+  RX/TX 双队列、10 字节 virtio-net 头、MAC 读自设备配置空间、同步轮询），`network/{ethernet,arp,ipv4,udp,dhcp}.rs`
+  与 `network/mod.rs`（`Stack` + `selftest`：Ethernet II → ARP → IPv4 → UDP 的组帧/解析与校验和）；
+  `driver::register_builtin` 追加 virtio-net、`main.rs` 在磁盘验收后接入网络自测（**无网卡时跳过**）；
+  新增 `make test-network`（13 项，QEMU 加 legacy virtio-net-pci + `-netdev user` = slirp）与编排 `network` 场景
+  （12 → **13 场景**）；`tests/test_boot.py` 增 `--nic`；同步 drivers.md（新增 1.8 节 + 状态行 + 驱动列表/限制）、
+  roadmap.md、DEVELOPMENT.md、README.md、project-structure.md。
 -  本次（2026-10-11，第八轮）修订重点：**v0.9 第三步（进程对象 + `fork`/`execve`/`wait4`）落地** ——
   进程表从「最小登记」换成真正的 PCB（每进程地址空间 + 每进程 64 KiB 内核栈 + 栈底哨兵
   + 停在 syscall 里的完整用户帧）、新增 `syscall/process.rs`（fork 复制地址空间与当前帧、
