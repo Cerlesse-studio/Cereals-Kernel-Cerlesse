@@ -94,6 +94,10 @@ fn main() {
             .unwrap_or_else(|err| panic!("写入用户程序 ELF 失败 {}: {err}", elf_out.display()));
     }
 
+    // v0.9：动态链接夹具（PIE 主程序 + 共享库 + 解释器）。它们不走上面的
+    // Rust 用户程序路径（裸目标不支持 cdylib），而是用 binutils 现编现链。
+    build_dynamic_fixtures(&root, &out_dir);
+
     // 用户程序源码变化时重跑本脚本（否则内核会装载旧映像）。
     for watched in [
         "Cargo.toml",
@@ -120,9 +124,152 @@ fn main() {
         "user/ps/Cargo.toml",
         "user/ps/src",
         "user/ps/user.ld",
+        // 动态链接夹具（binutils 直接消费的汇编源）
+        "user/dynhello/dynhello.s",
+        "user/dynhello/libgreet.s",
+        "user/dynhello/ldso.s",
     ] {
         println!("cargo:rerun-if-changed={}", root.join(watched).display());
     }
+}
+
+/// PT_INTERP 路径：内核按这个名字去 RAMFS 里找解释器（见 `dynamic.rs`）。
+const DYN_INTERP: &str = "/lib/ld.so";
+
+/// 构建 v0.9 动态链接夹具。
+///
+/// 产物写进 `$OUT_DIR/dyn/`（用**真实文件名**，因为 `ld -lgreet` 要靠
+/// `libgreet.so` 这个名字找到共享库）：
+///
+/// ```text
+/// dyn/dynhello     ET_DYN PIE：PT_INTERP=/lib/ld.so + DT_NEEDED=libgreet.so
+/// dyn/libgreet.so  ET_DYN 共享库：导出 greet
+/// dyn/ld.so        ET_DYN 解释器占位（PT_INTERP 的落点）
+/// ```
+///
+/// ## 为什么用 binutils 而不是 Rust
+///
+/// 本项目的裸目标 `x86_64-unknown-none` **不支持 `cdylib`**（rustc 直接拒绝），
+/// 而动态链接恰恰需要「共享库 + 带 PLT/GOT 的 PIE」。`as`/`ld` 是验证过的路径，
+/// 且产出的 ELF 能被宿主机的 glibc `ld.so` 独立复核（`make dyn-hostcheck`）。
+/// 代价是构建内核需要 binutils —— 报错信息会指明这一点。
+fn build_dynamic_fixtures(root: &Path, out_dir: &Path) {
+    let dyn_dir = out_dir.join("dyn");
+    fs::create_dir_all(&dyn_dir).expect("无法创建动态链接夹具目录");
+    let as_tool = env::var("AS").unwrap_or_else(|_| "as".to_string());
+    let ld_tool = env::var("LD").unwrap_or_else(|_| "ld".to_string());
+
+    // 1. 共享库（先于主程序：主程序 `-lgreet` 依赖它）
+    run_tool(&as_tool, &[
+        "-o",
+        dyn_dir.join("libgreet.o").to_str().unwrap(),
+        root.join("user/dynhello/libgreet.s").to_str().unwrap(),
+    ]);
+    run_tool(&ld_tool, &[
+        "-shared",
+        "-soname",
+        "libgreet.so",
+        "-o",
+        dyn_dir.join("libgreet.so").to_str().unwrap(),
+        dyn_dir.join("libgreet.o").to_str().unwrap(),
+    ]);
+
+    // 2. 解释器占位（PT_INTERP 的落点；内核会像共享对象一样装载它）
+    run_tool(&as_tool, &[
+        "-o",
+        dyn_dir.join("ldso.o").to_str().unwrap(),
+        root.join("user/dynhello/ldso.s").to_str().unwrap(),
+    ]);
+    run_tool(&ld_tool, &[
+        "-shared",
+        "-o",
+        dyn_dir.join("ld.so").to_str().unwrap(),
+        dyn_dir.join("ldso.o").to_str().unwrap(),
+    ]);
+
+    // 3. 主程序：PIE + PT_INTERP + `-lgreet`（产生 DT_NEEDED 与 PLT/GOT 重定位）
+    run_tool(&as_tool, &[
+        "-o",
+        dyn_dir.join("dynhello.o").to_str().unwrap(),
+        root.join("user/dynhello/dynhello.s").to_str().unwrap(),
+    ]);
+    run_tool(&ld_tool, &[
+        "-pie",
+        &format!("--dynamic-linker={DYN_INTERP}"),
+        &format!("-L{}", dyn_dir.display()),
+        "-lgreet",
+        "-o",
+        dyn_dir.join("dynhello").to_str().unwrap(),
+        dyn_dir.join("dynhello.o").to_str().unwrap(),
+    ]);
+
+    // 结构自检：主程序必须真的带 PT_INTERP / DT_NEEDED（改链接命令时立刻暴露）
+    let main_elf = fs::read(dyn_dir.join("dynhello")).expect("读取 dynhello 失败");
+    assert!(
+        main_elf.len() > 64 && &main_elf[..4] == b"\x7fELF",
+        "dynhello: 不是 ELF"
+    );
+    assert_eq!(u16_at(&main_elf, 16), 3, "dynhello: 不是 ET_DYN（缺 -pie？）");
+    assert!(
+        has_program_header(&main_elf, 3),
+        "dynhello: 缺 PT_INTERP（缺 --dynamic-linker？）"
+    );
+    assert!(
+        has_dynamic_tag(&main_elf, 1),
+        "dynhello: 缺 DT_NEEDED（缺 -lgreet？）"
+    );
+    println!(
+        "cargo:warning=v0.9 dyn fixtures: {}/dyn (dynhello + libgreet.so + ld.so)",
+        out_dir.display()
+    );
+}
+
+/// 运行一个主机工具；失败时给出「需要什么工具」的明确提示。
+fn run_tool(tool: &str, args: &[&str]) {
+    let status = Command::new(tool)
+        .args(args)
+        .status()
+        .unwrap_or_else(|err| {
+            panic!(
+                "无法启动 `{tool}`（{err}）：v0.9 动态链接夹具需要 binutils（as/ld）。\n"
+            )
+        });
+    assert!(status.success(), "`{tool} {}` 失败", args.join(" "));
+}
+
+/// ELF 里是否存在某个 `p_type` 的程序头。
+fn has_program_header(elf: &[u8], want: u32) -> bool {
+    let phoff = u64_at(elf, 32) as usize;
+    let phentsize = u16_at(elf, 54) as usize;
+    let phnum = u16_at(elf, 56) as usize;
+    (0..phnum).any(|i| u32_at(elf, phoff + i * phentsize) == want)
+}
+
+/// 是否存在某个 `d_tag` 的 `.dynamic` 项（先找 PT_DYNAMIC，再线性扫 16 字节项）。
+fn has_dynamic_tag(elf: &[u8], want: u64) -> bool {
+    let phoff = u64_at(elf, 32) as usize;
+    let phentsize = u16_at(elf, 54) as usize;
+    let phnum = u16_at(elf, 56) as usize;
+    for i in 0..phnum {
+        let ph = phoff + i * phentsize;
+        if u32_at(elf, ph) != 2 {
+            continue; // 只要 PT_DYNAMIC
+        }
+        let off = u64_at(elf, ph + 8) as usize;
+        let size = u64_at(elf, ph + 32) as usize;
+        let mut at = off;
+        while at + 16 <= off + size {
+            let tag = u64_at(elf, at);
+            if tag == want {
+                return true;
+            }
+            if tag == 0 {
+                break;
+            }
+            at += 16;
+        }
+    }
+    false
 }
 
 /// 构建一个用户程序（独立 target 目录，避免与外层构建抢 target 锁）。

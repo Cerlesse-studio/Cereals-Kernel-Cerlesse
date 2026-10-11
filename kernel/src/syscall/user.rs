@@ -64,6 +64,15 @@ static USER_ECHO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_ech
 /// 内嵌的 `/bin/ps`：`user/ps` 的 ELF。
 static USER_PS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/user_ps.elf"));
 
+// ---- v0.9 动态链接夹具（由 `kernel/build.rs` 用 as/ld 产出，见 user/dynhello/） ----
+
+/// `/bin/dynhello`：ET_DYN PIE，`PT_INTERP=/lib/ld.so` + `DT_NEEDED=libgreet.so`。
+static USER_DYNHELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn/dynhello"));
+/// `/lib/libgreet.so`：共享库，导出 `greet`（`DT_NEEDED` 的落点）。
+static USER_LIBGREET_SO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn/libgreet.so"));
+/// `/lib/ld.so`：`PT_INTERP` 指向的解释器占位对象。
+static USER_LDSO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dyn/ld.so"));
+
 /// 用户程序在 RAMFS 上的路径。
 pub const INIT_PATH: &str = "/init";
 /// 交互式 Shell 在 RAMFS 上的路径（`fs::init` 写入）。
@@ -84,9 +93,15 @@ pub const ECHO_PATH: &str = "/bin/echo";
 pub const PS_PATH: &str = "/bin/ps";
 /// 用户程序写文件的路径；内核在用户态结束后读回并打印。
 pub const USER_FILE: &str = "/tmp/hello.txt";
+/// v0.9 动态链接主程序路径（ET_DYN PIE，见 user/dynhello/）。
+pub const DYNHELLO_PATH: &str = "/bin/dynhello";
+/// 解释器路径（必须等于 `kernel/build.rs::DYN_INTERP` 与 `PT_INTERP`）。
+pub const LDSO_PATH: &str = "/lib/ld.so";
+/// 共享库路径（`DT_NEEDED=libgreet.so` → `/lib/libgreet.so`）。
+pub const LIBGREET_PATH: &str = "/lib/libgreet.so";
 
 /// `fs::init` 写进 RAMFS 的用户程序清单（路径 → ELF 字节）。
-static PROGRAM_IMAGES: [(&str, &[u8]); 7] = [
+static PROGRAM_IMAGES: [(&str, &[u8]); 8] = [
     (INIT_PATH, USER_INIT_ELF),
     (SHELL_PATH, USER_SHELL_ELF),
     (HELLO_BIN_PATH, USER_HELLO_BIN_ELF),
@@ -94,6 +109,17 @@ static PROGRAM_IMAGES: [(&str, &[u8]); 7] = [
     (CAT_PATH, USER_CAT_ELF),
     (ECHO_PATH, USER_ECHO_ELF),
     (PS_PATH, USER_PS_ELF),
+    (DYNHELLO_PATH, USER_DYNHELLO_ELF),
+];
+
+/// `fs::init` 写进 RAMFS 的 `/lib` 清单（解释器 + 共享库）。
+///
+/// 与 [`PROGRAM_IMAGES`] 分开：它们不是「被直接运行的程序」，而是**被装载的对象**
+/// —— 内核按 `PT_INTERP`/`DT_NEEDED` 里的路径名去 VFS 找它们，与真实系统
+/// 「解释器与 .so 就是文件系统里的普通文件」一致。
+static LIBRARY_IMAGES: [(&str, &[u8]); 2] = [
+    (LDSO_PATH, USER_LDSO_ELF),
+    (LIBGREET_PATH, USER_LIBGREET_SO),
 ];
 
 global_asm!(
@@ -126,6 +152,11 @@ static mut EXIT_CODE: i64 = -1;
 /// 要写进 RAMFS 的用户程序清单（见 [`PROGRAM_IMAGES`]）。
 pub fn program_images() -> &'static [(&'static str, &'static [u8])] {
     &PROGRAM_IMAGES
+}
+
+/// 要写进 RAMFS `/lib` 的解释器与共享库清单（见 [`LIBRARY_IMAGES`]）。
+pub fn library_images() -> &'static [(&'static str, &'static [u8])] {
+    &LIBRARY_IMAGES
 }
 
 /// 记录退出码（由 `syscall::process::sys_exit` / 异常终止路径调用）。
@@ -328,7 +359,21 @@ pub fn selftest() -> Result<(), &'static str> {
     }
     serial::println("user: shell PASS (keyboard line buffer -> stdin -> builtins + external program)");
 
-    // 5) 每个进程的地址空间（含用户堆与 fork 出的子进程）都必须整棵归还
+    // 5) v0.9 动态链接：`/bin/dynhello` 是 ET_DYN PIE —— `PT_INTERP=/lib/ld.so`、
+    //    `DT_NEEDED=libgreet.so`。内核解析这两个路径、把解释器与共享库装进共享库窗口、
+    //    应用 `R_X86_64_RELATIVE`（数据指针）与 `R_X86_64_JUMP_SLOT`（`greet` 的 GOT），
+    //    然后进入程序。退出码 = 共享库 `greet()` 的返回值（42）。
+    run_from_vfs("dynhello", DYNHELLO_PATH, 4)?;
+    let code = last_exit_code();
+    if code != 42 {
+        serial::print("user: dynhello FAIL exit=");
+        serial::print_dec(code as u64);
+        serial::println("");
+        return Err("dynhello did not exit(42)");
+    }
+    serial::println("user: dynamic link PASS (PT_INTERP + libgreet.so + RELATIVE/JUMP_SLOT)");
+
+    // 6) 每个进程的地址空间（含用户堆、共享库与 fork 出的子进程）都必须整棵归还
     let free_after = frame::stats().free_frames;
     serial::print("user: frames free before=");
     serial::print_dec(free_before as u64);

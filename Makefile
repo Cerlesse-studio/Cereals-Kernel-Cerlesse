@@ -37,7 +37,7 @@ USER_CAT_ELF  := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-cat
 USER_ECHO_ELF := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-echo
 USER_PS_ELF   := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-ps
 
-.PHONY: help build boot kernel image image-exception image-pagefault fat-image run test test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-scheduler test-ipc test-fs test-user test-driver test-fat test-network test-all user test-pkg go-test test-orch clean
+.PHONY: help build boot kernel image image-exception image-pagefault fat-image run test test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn dyn-hostcheck test-scheduler test-ipc test-fs test-user test-driver test-fat test-network test-all user test-pkg go-test test-orch clean
 
 help:
 	@echo "targets:"
@@ -51,6 +51,8 @@ help:
 	@echo "  test-shell - v0.9: inject keys into the interactive shell (help / cat /etc/motd / exit) via QEMU monitor"
 	@echo "  test-proc - v0.9: fork/execve/wait4 through the shell: external program + argv + missing program + reap"
 	@echo "  test-programs - v0.9: run /bin/{ls,cat,echo,ps} from the shell (getdents + getprocs + file syscalls)"
+	@echo "  test-dyn - v0.9: dynamic linking loop (PT_INTERP + libgreet.so + RELATIVE/JUMP_SLOT)"
+	@echo "  dyn-hostcheck - v0.9: cross-check the same dynamic fixture with the host glibc ld.so (binutils)"
 	@echo "  test-scheduler - v0.5: assert >=3 kernel tasks rotate under PIT time slices"
 	@echo "  test-ipc - v0.5: assert pipe create/write/read summary logs + selftest"
 	@echo "  test-fs - v0.7: assert VFS mount routing + RAMFS read/write/ls + negative errno cases"
@@ -134,7 +136,7 @@ test-pagefault: image-pagefault
 		--expect "CR2=0x500000000000" \
 		--expect "KERNEL PANIC: unhandled exception"
 
-test-all: test test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-scheduler test-ipc test-fs test-user test-driver test-fat test-network
+test-all: test test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn test-scheduler test-ipc test-fs test-user test-driver test-fat test-network
 
 # v0.5 验收：≥3 个内核任务在 PIT 时间片驱动下轮转（Round Robin）
 test-scheduler: image
@@ -169,9 +171,10 @@ test-fs: image
 		--expect "fs: mount point=/mnt fs=ramfs-scratch" \
 		--expect "fs: route /mnt/note.txt fs=ramfs-scratch" \
 		--expect "fs: readback /mnt/note.txt len=7 data=v0.7-ok" \
-		--expect "fs: ls / entries=4" \
+		--expect "fs: ls / entries=5" \
 		--expect "fs: ls / name=init kind=file size=" \
 		--expect "fs: ls / name=bin kind=dir size=0 perms=drwxr-xr-x" \
+		--expect "fs: ls / name=lib kind=dir size=0 perms=drwxr-xr-x" \
 		--expect "fs: ls / name=etc kind=dir size=0 perms=drwxr-xr-x" \
 		--expect "fs: ls / name=tmp kind=dir size=0 perms=drwxr-xr-x" \
 		--expect "fs: negative cases PASS" \
@@ -489,10 +492,10 @@ test-proc: image
 # v0.9 第五步验收：**基础用户程序**（`/bin/ls`、`/bin/ps`、`/bin/cat`、`/bin/echo`）——
 # 全部从 Shell 交互触发，走 `fork` + `execve` + `wait4`，断言的是程序**自己产出的内容**
 # 与「它们各自用到的内核能力真的通了」：
-#   - `user: getdents path=/ entries=4 returned=4` + `ls: / entries=4`：
+#   - `user: getdents path=/ entries=5 returned=5` + `ls: / entries=5`：
 #     `ls` 读的是 **VFS 的目录项**（v0.7 起只有内核自测用过 `list()`）；
-#   - `ls: /bin entries=6`：`/bin` 里恰好是这次构建写进去的 6 个程序
-#     （sh / hello / ls / cat / echo / ps）—— 同时证明 `fs::init` 的清单是完整的；
+#   - `ls: /bin entries=7`：`/bin` 里恰好是这次构建写进去的 7 个程序
+#     （sh / hello / ls / cat / echo / ps / dynhello）—— 同时证明 `fs::init` 的清单是完整的；
 #   - `user: getprocs count=2` + `ps: pid=3 ppid=0 state=RUNNING comm=sh`：
 #     `ps` 读的是**内核进程表**（本轮新增的 `getprocs`）：表里恰好是 Shell 与 ps 自己，
 #     且 `ppid` 指回 Shell —— 这正是 `fork` 建出来的父子关系；
@@ -519,11 +522,11 @@ test-programs: image
 		--key spc --key slash --key e --key t --key c --key slash --key m --key o \
 		--key t --key d --key ret \
 		--expect "user: program=/bin/sh source=elf" \
-		--expect "user: getdents path=/ entries=4 returned=4" \
-		--expect "ls: / entries=4" \
+		--expect "user: getdents path=/ entries=5 returned=5" \
+		--expect "ls: / entries=5" \
 		--expect "ls: entry name=init kind=file size=" \
 		--expect "ls: entry name=bin kind=dir size=0" \
-		--expect "ls: /bin entries=6" \
+		--expect "ls: /bin entries=7" \
 		--expect "ls: entry name=ls kind=file size=" \
 		--expect "user: getprocs count=2" \
 		--expect "ps: pid ppid state comm" \
@@ -540,6 +543,54 @@ test-programs: image
 		--expect-re "user: exec pid=([0-9]+) path=/bin/echo segments=[0-9]+ image_pages=[0-9]+ entry=0x8000000000.*?echo program works" \
 		--expect-re "user: exec pid=([0-9]+) path=/bin/cat segments=[0-9]+ image_pages=[0-9]+ entry=0x8000000000.*?motd: hello from ramfs.*?cat: /etc/motd bytes=23" \
 		--expect-re "user: getprocs count=2.*?ps: pid=([0-9]+) ppid=3 state=RUNNING comm=ps"
+
+# v0.9 动态链接验收：**内核侧最小动态链接器**（`kernel/src/syscall/dynamic.rs`）。
+#
+# 夹具（`user/dynhello/*.s`，由 `kernel/build.rs` 用 as/ld 现编）里放了三样东西，
+# 断言逐条对应它们真的发生了：
+#   - `dyn: PT_INTERP=/lib/ld.so`：内核从主程序的 PT_INTERP 里读出了解释器路径；
+#   - `dyn: load <main> base=0x8000000000`：ET_DYN（PIE）被装载在映像窗口（同静态程序基址）；
+#   - `dyn: NEEDED libgreet.so -> /lib/libgreet.so`：DT_NEEDED 被解析成 VFS 路径；
+#   - `dyn: load /lib/libgreet.so base=0x8000103000`：共享库被装进了**共享库窗口**；
+#   - `dyn: reloc R_X86_64_JUMP_SLOT sym=greet -> obj=/lib/libgreet.so`：跨对象符号被解析，
+#     GOT 槽被填成共享库里的地址（另外一条 R_X86_64_RELATIVE 也在 relocs=2 里）；
+#   - `main: dynamic link ok` + `greet: hello from libgreet.so`：**ring3 里两条路径都真跑了**
+#     （主程序自己的 .rodata 与共享库的 .rodata 各发一次 write）；
+#   - `user: exit code=42`：退出码 = 共享库 `greet()` 的返回值；
+#   - `user: dynamic link PASS` + `frames free before=… after=…`：地址空间（含共享库窗口）无泄漏。
+test-dyn: image
+	$(PYTHON) tests/test_boot.py \
+		--serial-log $(BUILD)/serial-dyn.log \
+		--expect "dyn: PT_INTERP=/lib/ld.so" \
+		--expect "dyn: load <main> base=0x8000000000" \
+		--expect "dyn: NEEDED libgreet.so -> /lib/libgreet.so" \
+		--expect "dyn: load /lib/libgreet.so base=" \
+		--expect "dyn: reloc R_X86_64_JUMP_SLOT sym=greet -> obj=/lib/libgreet.so" \
+		--expect "dyn: link PASS objects=3 relocs=2 entry=0x8000001020" \
+		--expect "main: dynamic link ok" \
+		--expect "greet: hello from libgreet.so" \
+		--expect "user: exit code=42" \
+		--expect "user: dynamic link PASS"
+
+# v0.9 动态链接的**独立复核**（不是自己验自己）：用宿主机的 glibc ld.so
+# 跑同一份 `user/dynhello/*.s` —— 如果两个完全不同的装载器（内核 vs glibc）
+# 都能把它跑出相同输出与退出码，说明 ELF 结构 / 机器码 / 重定位语义都是对的。
+# 需要 binutils 与 Linux/glibc；环境不满足时**跳过**（不把“没工具”当失败）。
+dyn-hostcheck:
+	@command -v as >/dev/null 2>&1 && command -v ld >/dev/null 2>&1 || { echo "dyn-hostcheck SKIP (binutils not found)"; exit 0; }
+	@LD_SO=$$(ls /lib64/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2 2>/dev/null | head -1); \
+	test -n "$$LD_SO" || { echo "dyn-hostcheck SKIP (no glibc ld.so)"; exit 0; }; \
+	echo "dyn-hostcheck: host ld.so = $$LD_SO"; \
+	mkdir -p $(BUILD)/dynhost && \
+	as -o $(BUILD)/dynhost/libgreet.o user/dynhello/libgreet.s && \
+	ld -shared -soname libgreet.so -o $(BUILD)/dynhost/libgreet.so $(BUILD)/dynhost/libgreet.o && \
+	as -o $(BUILD)/dynhost/dynhello.o user/dynhello/dynhello.s && \
+	ld -pie --dynamic-linker=$$LD_SO -L$(BUILD)/dynhost -lgreet -o $(BUILD)/dynhost/dynhello $(BUILD)/dynhost/dynhello.o && \
+	LD_LIBRARY_PATH=$(BUILD)/dynhost $(BUILD)/dynhost/dynhello > $(BUILD)/dynhost/out.txt; \
+	status=$$?; cat $(BUILD)/dynhost/out.txt; \
+	grep -q "main: dynamic link ok" $(BUILD)/dynhost/out.txt && \
+	grep -q "greet: hello from libgreet.so" $(BUILD)/dynhost/out.txt && \
+	test $$status -eq 42 && echo "dyn-hostcheck PASS (glibc ld.so, exit=42)" || { echo "dyn-hostcheck FAIL (status=$$status)"; exit 1; }
 
 # v0.7 用户态脚手架：单独构建 libc + user/*（内核构建时会自动重建同一批程序，
 # 这个目标用于在不启动 QEMU 的情况下验证脚手架可编译、可链接、**段布局合法**）。

@@ -351,7 +351,9 @@ pub trait BlockDevice {
 
 - 用嵌套 `cargo` 构建 `USER_PROGRAMS` 列表中的用户程序（large 代码模型 + `user-release`）；
 - 校验 ELF（装载基址 = `USER_VIRT_BASE`、段页对齐、`W^X`、映像窗口、无重定位）后**原样内嵌**；
-- `kernel/src/syscall/user.rs` 以 `include_bytes!` 取回并写入 RAMFS 对应路径。
+- v0.9 动态链接：用 `as` + `ld` 现编 `user/dynhello/*.s`（`$OUT_DIR/dyn/` 下的 `dynhello`/`libgreet.so`/`ld.so`），
+  与用户程序一样内嵌（因此构建内核需要 binutils 在 `PATH` 上；`make dyn-hostcheck` 缺工具时会明确跳过）；
+- `kernel/src/syscall/user.rs` 以 `include_bytes!` 取回并写入 RAMFS 对应路径（程序 8 个 + `/lib` 2 个）。
 
 ## 6. 主机侧工具 CLI
 
@@ -376,10 +378,11 @@ serialmon 退出码：`0` 通过、`1` 异常/缺失、`2` 用法或 IO 错误�
 
 ```bash
 make build / make run            # 构建镜像 / QEMU + OVMF 启动
-make test ... test-fat           # 各集成测试（断言串口日志）
-make test-all                    # test + exception + memory + pagefault + keyboard
-                                 #   + shell + proc + scheduler + ipc + fs + user + driver + fat
-make user                        # 单独构建并校验三个用户程序（不启 QEMU）
+make test ... test-network       # 各集成测试（断言串口日志）
+make test-all                    # test + exception + memory + pagefault + keyboard + shell + proc
+                                 #   + programs + dyn + scheduler + ipc + fs + user + driver + fat + network
+make dyn-hostcheck               # 动态链接夹具的宿主 glibc 独立复核（需 binutils，缺则跳过）
+make user                        # 单独构建并校验全部用户程序（不启 QEMU）
 make test-pkg                    # CKC 包容器测试（主机侧，不启 QEMU）
 make go-test / make test-orch    # Go 单元测试 / 编排器并行跑全部场景
 make fat-image                   # 生成 FAT32 测试盘
@@ -395,10 +398,13 @@ make clean
 | `test-keyboard` | IRQ1 行缓冲整行交付 + PIT 心跳 | — |
 | `test-scheduler` | Round Robin 轮转 | — |
 | `test-ipc` | pipe 创建/写/读 | — |
-| `test-fs` | VFS 路由 + RAMFS 读/写/ls + 负例 | 20 |
-| `test-user` | ELF 装载 + 文件 syscall + 用户堆 + 隔离 + Shell | 61 |
+| `test-fs` | VFS 路由 + RAMFS 读/写/ls + 负例 | 21 |
+| `test-user` | ELF 装载 + 文件 syscall + 用户堆 + 隔离 + Shell + 动态链接 | 61 |
 | `test-shell` | 交互式 Shell（注入按键） | 11 |
 | `test-proc` | fork/execve/wait4 全链路 + PID 一致性 | 8 + 4 正则 |
+| `test-programs` | getdents/getprocs + 四个基础用户程序真的被 exec | 17 + 5 正则 |
+| `test-network` | virtio-net → Ethernet/ARP/IPv4/UDP（DHCP 往返） | 13 |
+| `test-dyn` | PT_INTERP + DT_NEEDED + RELATIVE/JUMP_SLOT（内核侧最小动态链接） | 10 |
 | `test-driver` | PCI 枚举 + 驱动挂接 + 扇区读写/负例 | 22 |
 | `test-fat` | 双盘 FAT16/32 读/LFN/跨簇/偏移/EROFS | 21 |
 | `test-pkg` | `.ckc` 容器规则 + `tar` 独立复核 | 37 |
@@ -409,3 +415,4 @@ make clean
 | ---- | ---- |
 | 2026-10-11 | 创建本文档：汇总系统调用 ABI（寄存器约定/号表/逐条语义）、errno 表、`libc` API、
 内核内部 trait（`FileSystem`/`Driver`/`BlockDevice`）、主机侧工具 CLI 与 Makefile 目标 |
+| 2026-10-11 | 补记 v0.9 第六步（最小动态链接）：5.5 构建期接口新增 `as`+`ld` 夹具说明；第 7 节新增 `test-dyn`（10 项）与 `dyn-hostcheck`、补上漏记的 `test-programs`/`test-network` 行，`test-fs` 20 → 21 |

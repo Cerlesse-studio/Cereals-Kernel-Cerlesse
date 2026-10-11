@@ -153,9 +153,13 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
     driver::serial::println("context: switch PASS");
 
     // v0.7：VFS + RAMFS（RAMFS 用内核堆保存文件内容，因此必须在 memory::init 之后）。
-    // `/init` 与 `/bin/sh` 的内容都是内嵌的用户程序 ELF，`syscall::user` 稍后
+    // `/init` 与 `/bin/*` 的内容都是内嵌的用户程序 ELF，`syscall::user` 稍后
     // 从 VFS 读它们并交给 ELF Loader（v0.9 的 Shell 走的也是这条普通路径）。
-    if let Err(errno) = fs::init(syscall::user::program_images()) {
+    // `library_images()` 是 v0.9 动态链接的解释器与共享库（落在 `/lib`）。
+    if let Err(errno) = fs::init(
+        syscall::user::program_images(),
+        syscall::user::library_images(),
+    ) {
         driver::serial::print("fs: FAIL errno=");
         driver::serial::print_dec(errno.unsigned_abs());
         driver::serial::println("");

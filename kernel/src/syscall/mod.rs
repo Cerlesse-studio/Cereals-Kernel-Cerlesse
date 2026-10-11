@@ -19,6 +19,7 @@
 
 pub mod address_space;
 pub mod dir;
+pub mod dynamic;
 pub mod elf;
 pub mod file;
 pub mod memory;

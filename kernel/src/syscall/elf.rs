@@ -37,7 +37,7 @@ use crate::memory::page::{align_down, align_up, PAGE_SIZE};
 use crate::syscall::address_space::{LoadStats, UserSpace, USER_IMAGE_MAX, USER_VIRT_BASE};
 
 /// `p_type`：可装载段。
-const PT_LOAD: u32 = 1;
+pub(crate) const PT_LOAD: u32 = 1;
 /// `p_flags`：可执行。
 const PF_X: u32 = 1;
 /// `p_flags`：可写。
@@ -45,9 +45,9 @@ const PF_W: u32 = 2;
 /// 段数上限（`user/*` 实测 4 段；上限只为挡住畸形 ELF）。
 const MAX_SEGMENTS: usize = 8;
 /// ELF64 文件头大小。
-const EHDR_SIZE: usize = 64;
+pub(crate) const EHDR_SIZE: usize = 64;
 /// ELF64 程序头大小。
-const PHDR_SIZE: usize = 56;
+pub(crate) const PHDR_SIZE: usize = 56;
 
 /// 一个可装载段。
 #[derive(Clone, Copy, Debug)]
@@ -65,7 +65,15 @@ struct Segment {
 }
 
 /// 解析 ELF 并把它装进 `space`。
+///
+/// 入口按 `e_type` 分流：
+/// - `ET_EXEC`（2）：v0.7 起的静态用户程序，走下面的固定地址装载路径；
+/// - `ET_DYN`（3）：v0.9 的动态链接对象（PIE 主程序 / 共享库），交给
+///   [`crate::syscall::dynamic::load`]（`PT_INTERP` + `DT_NEEDED` + 重定位）。
 pub fn load(space: &mut UserSpace, elf: &[u8]) -> Result<LoadStats, i64> {
+    if elf.len() >= EHDR_SIZE && &elf[..4] == b"\x7fELF" && u16_at(elf, 16) == Some(3) {
+        return crate::syscall::dynamic::load(space, elf);
+    }
     let header = parse_header(elf)?;
     let segments = parse_segments(elf, header.phoff, header.phentsize, header.phnum)?;
 
@@ -311,17 +319,17 @@ fn reject(reason: &str) -> i64 {
 
 // ---- 小端读取（越界返回 `None`，绝不 panic：输入是不可信的文件字节） ----
 
-fn u16_at(buf: &[u8], off: usize) -> Option<u16> {
+pub(crate) fn u16_at(buf: &[u8], off: usize) -> Option<u16> {
     let bytes = buf.get(off..off + 2)?;
     Some(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
-fn u32_at(buf: &[u8], off: usize) -> Option<u32> {
+pub(crate) fn u32_at(buf: &[u8], off: usize) -> Option<u32> {
     let bytes = buf.get(off..off + 4)?;
     Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-fn u64_at(buf: &[u8], off: usize) -> Option<u64> {
+pub(crate) fn u64_at(buf: &[u8], off: usize) -> Option<u64> {
     let bytes = buf.get(off..off + 8)?;
     let mut raw = [0u8; 8];
     raw.copy_from_slice(bytes);

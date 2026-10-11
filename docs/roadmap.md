@@ -3,10 +3,13 @@
 - 阶段：第一阶段 / 路线规划
 - 最后更新：2026-10-11
 - 状态：🟡 持续更新（2026-10-11 补记 v0.6/v0.7 实际进度、v0.8 前半落地与 v0.8 收官、
-  v0.9 第一步（用户堆）、第二步（`stdin` + 交互式 Shell）与第三步（**进程对象 + `fork`/`execve`/`wait4`**）；
-  第四步（**简化网络栈**：virtio-net + Ethernet → ARP → IPv4 → UDP）与第五步
-  （**基础用户程序 `ls`/`cat`/`echo`/`ps`** + `getdents`/`getprocs`）已落地；
-  v0.9 剩余：动态链接）
+  **v0.9 六步全部落地**：第一步（用户堆）、第二步（`stdin` + 交互式 Shell）、第三步
+  （**进程对象 + `fork`/`execve`/`wait4`**）、第四步（**简化网络栈**：virtio-net + Ethernet → ARP → IPv4 → UDP）、
+  第五步（**基础用户程序 `ls`/`cat`/`echo`/`ps`** + `getdents`/`getprocs`）、
+  第六步（**内核侧最小动态链接**：`PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`）；
+  v0.9 范围内的目标已全部完成；剩余项（`mprotect`、完整动态链接（用户态 `ld.so`）、
+  TCP/ICMP 与 socket、更多用户程序）归 v1.0；**v1.0 之后新增「桌面环境兼容路线」（规划）**：
+  D0 地基 → D1 输入 → D2 显示 → D3 音频 → D4 会话/电源 → D5 收尾，见 [desktop.md](desktop.md)）
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
 
@@ -46,7 +49,8 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 → ⑳ RAMFS → ㉑ Disk Driver → ㉒ PCI → ㉓ Network → ㉔ Shell → ㉕ User Applications
 ```
 
-**禁止提前做的内容**：GUI、网络、USB、GPU —— 这些都建立在前面的内核基础设施之上。
+**禁止提前做的内容**：GUI / GPU（其地基在桌面路线的 D2 之后，见 [desktop.md](desktop.md)）、USB ——
+这些都建立在前面的内核基础设施之上（网络已按计划在 v0.9 落地）。
 
 ## 3. 里程碑（v0.1 – v1.0）
 
@@ -60,8 +64,13 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 | **v0.6 🟡** | Syscall + User Space（2026-10-10 核心已验收：`syscall`/`sysret` 入口 + ring3 + 用户地址空间隔离 + `write/exit/getpid/sleep`；2026-10-11 用户态脚手架可用：`libc/` + `user/hello` 真实用户程序跑在 ring3，`make user` / `make test-user` PASS）；ELF Loader / VFS 文件语义 / 进程对象留到 v0.7 | syscall.md |
 | **v0.7 🟡** | VFS + RAMFS + ELF（2026-10-11 核心已验收：`FileSystem` trait + 挂载表最长前缀路由 + RAMFS 后端 + fd 表 + `open/read/write/close` + **ELF Loader**（RAMFS `/init` 按段权限逐页装载，`RW` 段对 ring3 可写）；`make test-fs` 19 项 / `make test-user` 32 项 PASS）。Shell 里 `ls/cat/cd` 属 v0.9、磁盘 FS（FAT32）与 `mkfs` 属 v0.8 | filesystem.md / syscall.md |
 | **v0.8 ✅** | Driver + PCI + Disk（2026-10-11 验收：驱动注册框架 + PCI 枚举 + 块设备 + **legacy virtio-blk**（`make test-driver` 22 项）；**FAT12/16/32 只读后端挂到 VFS** + H-03 `mkfs`（`make test-fat` 21 项），双盘启动读 `/disk`（启动盘）与 `/mnt/fat`（测试盘）） | drivers.md / filesystem.md |
-| **v0.9** 🟡 | Shell + User Programs + Network（**已落地五步**：第一步 **用户堆**（`brk`/`mmap`/`munmap` + `libc` 全局分配器）；第二步 **`stdin` + 交互式 Shell**（键盘行缓冲 → `read(0)` 整行 → `/bin/sh`）；第三步 **进程对象 + `fork`/`execve`/`wait4` + `argc`/`argv`** —— Shell 的外部程序 `/bin/hello` 真的能跑起来（`make test-shell` 11 项 / `make test-proc` 8 项 + 4 正则 / `make test-user` 61 项）；第四步 **简化网络栈**（virtio-net + Ethernet/ARP/IPv4/UDP，`make test-network` 13 项）；第五步 **基础用户程序**（`ls`/`cat`/`echo`/`ps` → `/bin/*`，含新增的目录枚举 `getdents` 与进程表 `getprocs`，`make test-programs` 17 项 + 5 正则））。**剩余：动态链接** | syscall.md / process.md / drivers.md / filesystem.md |
+| **v0.9 ✅** | Shell + User Programs + Network（**六步全部落地**：第一步 **用户堆**（`brk`/`mmap`/`munmap` + `libc` 全局分配器）；第二步 **`stdin` + 交互式 Shell**（键盘行缓冲 → `read(0)` 整行 → `/bin/sh`）；第三步 **进程对象 + `fork`/`execve`/`wait4` + `argc`/`argv`** —— Shell 的外部程序 `/bin/hello` 真的能跑起来（`make test-shell` 11 项 / `make test-proc` 8 项 + 4 正则 / `make test-user` 61 项）；第四步 **简化网络栈**（virtio-net + Ethernet/ARP/IPv4/UDP，`make test-network` 13 项）；第五步 **基础用户程序**（`ls`/`cat`/`echo`/`ps` → `/bin/*`，含新增的目录枚举 `getdents` 与进程表 `getprocs`，`make test-programs` 17 项 + 5 正则）；第六步 **内核侧最小动态链接**（`PT_INTERP` + `DT_NEEDED` + `RELATIVE`/`JUMP_SLOT`，`/bin/dynhello` + `/lib/{ld.so,libgreet.so}`，`make test-dyn` 10 项 + `make dyn-hostcheck` glibc 独立复核）。**仍不做（归 v1.0）：`mprotect`、完整动态链接（用户态 `ld.so`）、TCP/ICMP 与 socket、更多用户程序**） | syscall.md / process.md / drivers.md / filesystem.md |
 | **v1.0** | 完整可启动的类 Linux 小型 OS | — |
+
+> **v1.0 之后（规划）**：桌面环境兼容路线（内核侧地基与接口对齐）——
+> D0 地基（设备模型 + `ioctl` + `poll`）→ D1 输入（evdev/uinput）→ D2 显示（fbdev → DRM/KMS）
+> → D3 音频（ALSA 子集）→ D4 会话/电源（ACPI 子集 + cgroup）→ D5 收尾；
+> 里程碑 v1.1–v1.6 与逐项验收见 [desktop.md](desktop.md)。
 
 每个版本的详细任务清单见 [../DEVELOPMENT.md](../DEVELOPMENT.md)。
 
@@ -78,8 +87,10 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
    **进程对象 + `fork`/`execve`/`wait4`**（外部程序 `/bin/hello`）与 **基础用户程序**
    （`ls`/`ps`/`cat`/`echo` → `/bin/*`，含 `getdents`/`getprocs`）均已落地
    （见 syscall.md 3.5/3.6/3.7/3.8 与 process.md 1.4）；**简化网络栈**（virtio-net + Ethernet → ARP → IPv4 → UDP，
-   见 drivers.md 1.8）亦已落地；仅**动态链接**仍未做。
+   见 drivers.md 1.8）亦已落地；最后一块**动态链接**（内核侧最小闭环：`PT_INTERP` + `DT_NEEDED` +
+   `RELATIVE`/`JUMP_SLOT`，见 syscall.md 3.9）于 2026-10-11 落地 —— v0.9 至此收官。
 8. **第八阶段（v1.0）**：整合、安全机制、发布。
+9. **第九阶段（v1.0 之后，规划）**：桌面环境兼容 —— 内核侧地基与接口对齐（D0–D5），见 [desktop.md](desktop.md)。
 
 ## 5. 修订记录
 
@@ -103,3 +114,5 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 | 2026-10-11 | **v0.9 开局（运行时前置条件第一步：用户堆）**：`syscall/memory.rs` 实现 `brk`/`mmap`/`munmap`（256 KiB 堆窗口 + 256 KiB 匿名 mmap 窗口、按需映射、新页全零、W^X、`invlpg`），`libc` 提供 `#[global_allocator]`（bump over mmap）与封装，`user/hello` 加入堆自测，`user.rs` 新增页帧泄漏检查；`make test-user` 32 → **59 项** PASS，`make test-orch` 10 场景 PASS；v0.9 里程碑标记 🟡（Shell/网络仍未做） |
 | 2026-10-11 | **v0.8 收官**（FAT 磁盘后端 + H-03 `mkfs`）：`fs/fat.rs`（FAT12/16/32 只读：BPB 按簇数定类型、固定根目录区/簇链目录、8.3 + NT 标志 + LFN 校验和、任意偏移读、`EROFS`/`EUCLEAN`）挂到 VFS（`fs::mount_disks` → `/disk` 启动盘、`/mnt/fat` 测试盘，验证最长前缀路由）；`FileSystem` trait 改为 `&mut self` + `read_all -> Vec<u8>`；`tools/mkfs/mkfs.py` 自己生成 FAT12/16/32 镜像并由 mtools 独立复核；新增 `make fat-image` / `make test-fat`（21 项，双盘）与编排第 10 个场景；v0.8 里程碑标记 ✅ |
 | 2026-10-11 | **v0.9 第五步：基础用户程序（`ls`/`cat`/`echo`/`ps`）与目录/进程枚举** —— 新增 `syscall/dir.rs`（`getdents`：VFS `list()` → 定长 88 字节记录；号 78 沿用 Linux 但格式不同）与 `syscall/process.rs::sys_getprocs`（定长 40 字节记录；号 **256**，`syscall_table.rs` 确立「`0..=255` Linux 语义 / `>= 256` Cerlesse 扩展」并把 `SYS_MAX` 改为 257）；`process/process.rs` 新增定长 `comm`（`create` 填充、`execve` 改写为程序名）；`libc` 新增 `getdents`/`getprocs` + `dirent_*`/`procinfo_*` 解析器；新增 `user/{ls,cat,echo,ps}`（`kernel/build.rs`、workspace、`fs::init` 清单 3 → 7），Shell 帮助文本同步；新增 `make test-programs`（17 项 + 5 正则）与编排场景 `programs`（13 → **14 场景**）；`make test-proc` 的负例由 `ls` 改 `foo` |
+| 2026-10-11 | **v0.9 第六步（收官）：内核侧最小动态链接** —— 新增 `syscall/dynamic.rs`（`ET_DYN` 分流：`PT_INTERP` + `DT_NEEDED` → `/lib/<name>` 递归装载，应用 `R_X86_64_RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`64`；`DT_PLTREL=REL` 明确拒绝）；`address_space.rs` 新增共享库窗口（基址 + 1 MiB、32 页）与 `map_dyn_page`/`phys_of`；新增夹具 `user/dynhello/`（`as`+`ld` 现编）与 RAMFS `/lib`（清单 7 → 8）；新增 `make test-dyn`（10 项）与 `make dyn-hostcheck`（宿主机 glibc 独立复核）；`test-fs` 20 → 21、`test-programs` 条目数 5/7；v0.9 里程碑标记 ✅（见 syscall.md 3.9） |
+| 2026-10-11 | **新增「桌面环境兼容路线」（v1.0 之后，规划）**：新建 docs/desktop.md —— 现状审计（显示/输入/ioctl/设备模型/`/proc`/futex/音频/ACPI 等逐项有据）、用户态与内核侧归属纠正（logind/D-Bus/PipeWire 是用户态，KVM 与桌面前置无关）、被遗漏的地基清单、D0–D5 分层与 QEMU 可断言验收（monitor `sendkey`/`screendump` 实测可用）、里程碑 v1.1–v1.6；同步 roadmap（第九阶段 + 「禁止提前做」项修正）、DEVELOPMENT（5.10）、architecture 第 5 节、project-structure（规划新增目录）与 README |
