@@ -43,23 +43,37 @@ pub const EISDIR: i64 = -21;
 pub const ENOTDIR: i64 = -20;
 /// 空间不足（用在了「文件超过 RAMFS 单文件上限」）。
 pub const ENOSPC: i64 = -28;
+/// 只读文件系统（写操作落到 [`FileSystem::write`] 等写接口上时返回它）。
+pub const EROFS: i64 = -30;
+/// `-EIO`：块设备读写失败。
+pub const EIO: i64 = -5;
+/// `-EUCLEAN`：磁盘上的结构损坏（簇链断/越界、目录项非法）。
+pub const EUCLEAN: i64 = -117;
 
 /// 后端文件系统必须实现的操作。
 ///
 /// 方法都收**挂载点内的相对路径**（`/a/b`；挂载点本身是 `/`），
 /// 挂载点前缀的剥离由 [`crate::fs::mount::MountTable::resolve`] 完成。
+///
+/// v0.8 起所有路径操作收 `&mut self`：挂载表本来就用 `&'static mut` **独占**持有后端
+/// （[`crate::fs::mount::MountTable::resolve`]），而磁盘后端需要修改自己的扇区缓冲、
+/// 甚至直接访问块设备。用 `&self` + 内部可变性只是把这件事实藏起来。
 pub trait FileSystem {
     /// 后端名字（出现在 `fs: mount point=... fs=<name>` 与路由日志里）。
     fn name(&self) -> &'static str;
 
     /// 取元数据。
-    fn stat(&self, path: &str) -> Result<Metadata, i64>;
+    fn stat(&mut self, path: &str) -> Result<Metadata, i64>;
 
     /// 从 `offset` 起读最多 `buf.len()` 字节，返回实际读到字节数（EOF 为 0）。
-    fn read<'a>(&'a self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64>;
+    fn read(&mut self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64>;
 
-    /// 读整个文件（零拷贝借用后端内部缓冲）。
-    fn read_all<'a>(&'a self, path: &str) -> Result<&'a [u8], i64>;
+    /// 读整个文件（**所有权版本**）。
+    ///
+    /// v0.7 曾是「零拷贝借用后端内部缓冲」（`&'a [u8]`），v0.8 改成返回 `Vec<u8>`：
+    /// 磁盘后端的文件内容根本不在内存里，要「借用」就得先把整个文件读进一个缓存 ——
+    /// 那还不如直接把这次读的结果交出去。代价是比 RAMFS 多一次拷贝（小文件可忽略）。
+    fn read_all(&mut self, path: &str) -> Result<Vec<u8>, i64>;
 
     /// 从 `offset` 起写 `data`；`offset == len` 表示追加。
     fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<usize, i64>;
@@ -70,8 +84,8 @@ pub trait FileSystem {
     /// 创建目录（父目录必须存在）。
     fn mkdir(&mut self, path: &str) -> Result<(), i64>;
 
-    /// 列举目录（插入顺序，v0.7 不排序）。
-    fn list(&self, path: &str) -> Result<Vec<DirEntry>, i64>;
+    /// 列举目录（后端自己的顺序；v0.7 的 RAMFS 是插入顺序，FAT 是磁盘上的顺序）。
+    fn list(&mut self, path: &str) -> Result<Vec<DirEntry>, i64>;
 
     /// 后端统计 `(文件数, 占用字节数)`。
     ///
@@ -132,10 +146,10 @@ pub fn stat(path: &str) -> Result<Metadata, i64> {
     fs.stat(&rel)
 }
 
-/// 读整个文件（所有权版本：调用方拿到 `Vec`，后端缓冲不复用）。
+/// 读整个文件（所有权版本：调用方拿到 `Vec`）。
 pub fn read_all(path: &str) -> Result<Vec<u8>, i64> {
     let (fs, rel) = crate::fs::mount::table().resolve(path)?;
-    Ok(fs.read_all(&rel)?.to_vec())
+    fs.read_all(&rel)
 }
 
 /// 从 `offset` 起读入 `buf`。
@@ -172,6 +186,15 @@ pub fn list(path: &str) -> Result<Vec<DirEntry>, i64> {
 pub fn usage(path: &str) -> Result<(usize, usize), i64> {
     let (fs, _) = crate::fs::mount::table().resolve(path)?;
     Ok(fs.usage())
+}
+
+/// 某个路径是否是**挂载点本身**。
+///
+/// 与 [`backend_name`] 的区别很关键：`backend_name("/mnt/fat")` 在没有第二块盘时
+/// 也会返回 `Some("ramfs-scratch")`（最长前缀落到挂在 `/mnt` 的后端），
+/// 因此不能用它当作「FAT 卷已挂载」的证据。
+pub fn is_mount_point(path: &str) -> bool {
+    crate::fs::mount::table().is_mount_point(path)
 }
 
 /// 后端名字（日志用；路由到哪个文件系统是挂载表的可观测证据）。

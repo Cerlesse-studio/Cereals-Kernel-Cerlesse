@@ -2,7 +2,7 @@
 
 - 阶段：第八阶段（v0.8 驱动框架 / PCI / 块设备；v0.4 中断控制时钟键盘已完成）
 - 最后更新：2026-10-11
-- 状态：🟡 v0.8 前半已完成（**驱动注册框架 + PCI 枚举 + 块设备抽象 + virtio-blk（legacy）**，`make test-driver` 22 项 PASS）；**磁盘文件系统（FAT32 挂到 VFS）仍待做**；v0.4（中断控制器 + PIT + PS/2 键盘 + 上下文切换原语 + H-04/H-05 Go 工具）已完成
+- 状态：✅ v0.8 已完成（**驱动注册框架 + PCI 枚举 + 块设备抽象 + virtio-blk（legacy）**，`make test-driver` 22 项 PASS；**磁盘文件系统 FAT12/16/32 已挂到 VFS**，`make test-fat` 21 项 PASS）；v0.4（中断控制器 + PIT + PS/2 键盘 + 上下文切换原语 + H-04/H-05 Go 工具）已完成
 - 依赖：interrupt（IRQ 分发）、memory（连续物理帧 → DMA / virtqueue）、arch::port（端口 I/O）
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
@@ -30,7 +30,13 @@ find_by_id(1af4,1001)   → 断言启动盘所在的 legacy virtio-blk 确实在
 driver::register_builtin() → 注册表里放入 virtio-blk-pci
 driver::probe_all()    → 逐设备匹配（注册顺序优先）→ attach → 统计 matched/attached/failed
 block::selftest(disk)  → 引导扇区 / 分块读 / 写回读 / 负例
+fs::mount_disks()      → 把 FAT 卷挂到 /disk（启动盘）与 /mnt/fat（mkfs 测试盘，最长前缀路由）
+fs::disk_selftest()    → 磁盘文件系统验收（读内核自己的映像 / 跨簇公式 / LFN / 偏移读 / EROFS）
 ```
+
+最后两行是 v0.8 收官部分：磁盘的文件系统层（`kernel/src/fs/fat.rs`）与驱动层 1.1 表格里的其它模块
+同属一个启动链 —— 驱动只是把扇区搬进内存，**FAT 与 VFS 才是「文件」的落点**，
+详见 [filesystem.md](./filesystem.md) 第 3 节。
 
 ### 1.2 关键设计决策（为什么是这样）
 
@@ -103,12 +109,14 @@ block: selftest PASS
 
 ### 1.4 已知限制（明确未做，不要读成已完成）
 
-- **磁盘文件系统（FAT32）尚未挂到 VFS**：v0.8 只做到「块设备可用」，`block.rs` 之上还没有 FAT 后端；
-  因此 `docs/filesystem.md` 里的磁盘后端、以及 H-03（Python `mkfs`）仍未落地。
+- **磁盘文件系统是只读的**：FAT12/16/32 后端已挂到 VFS（`fs/fat.rs`），但 `write`/`create`/`mkdir`
+  一律返回 `EROFS` —— 分配器与目录项改写属后续版本；也没有扇区缓存（每次访问都真读设备）。
+  详情与限制清单见 [filesystem.md](./filesystem.md) 3.1。
 - **不分配/重定位 BAR**：直接使用固件分配的地址。真实平台上若出现未分配窗口（全 0）会打日志而不是猜测
   （v0.8 的实现里 `read_bar` 对全 0 返回「未实现」）。
 - **不解析 capability 链、不配置中断**：MSI-X/INTx、设备特定能力结构都留给 v0.9 与网络驱动一起做。
-- **只支持一块 virtio-blk 盘**（`block` 注册表容量 2，驱动状态是单个实例）。
+- **最多两块 virtio-blk 盘**（`block` 注册表容量 2，每块盘各自的队列状态在实例里、请求缓冲共用）：
+  启动盘 + 测试盘刚好够用，更多盘位留给后续版本。
 - **不实现 modern（virtio 1.0）接口**：见 1.2；遇到 modern 设备时明确报错。
 - **queue 只支持 0 号队列**：块设备只有一个 virtqueue，够用；多队列留给 v0.9+。
 - 端口 I/O 的新统一入口（`arch/x86_64/port.rs`）只被 PCI / virtio 使用；早期驱动（serial/keyboard/PIC）
@@ -153,14 +161,15 @@ IMAGE UNCHANGED (write test restored the scratch sector)
 1. [x] 驱动框架：`Driver` trait + 注册表 + 匹配/挂接统计（`driver/driver.rs`）。
 2. [x] PCI 枚举：遍历总线、解析类别/BAR、按 Vendor/Device ID 匹配。
 3. [x] 块设备抽象（`block.rs`）与 virtio-blk（legacy）驱动（`virtio_blk.rs`）。
-4. [ ] **磁盘文件系统后端：FAT32 挂载进 VFS**（见 `docs/filesystem.md`）—— v0.8 剩余部分。
-5. [ ] 验收补齐：`ls`/`cat` 能读到磁盘上的文件（依赖 4）。
+4. [x] **磁盘文件系统后端：FAT12/16/32 只读挂载进 VFS**（`fs/fat.rs` + `fs::mount_disks`，见 `docs/filesystem.md`）。
+5. [x] 验收补齐：`make test-fat` 从磁盘读到文件（内核自己的 `/disk/…KERNEL.ELF` 与测试盘上的各文件）。
+     注：Shell 里的 `ls`/`cat` 属 v0.9；VFS 层的磁盘读取已在 v0.8 验收。
 
 验收（v0.8）：
 
 - [x] PCI 列表输出，包含 Vendor/Device ID（`make test-driver`）
 - [x] 磁盘读写可验证（引导扇区读 + 最后扇区写回读 + 分块读一致性 + 负例）
-- [ ] FAT32 挂载完成，可在 VFS 层访问磁盘文件
+- [x] FAT 挂载完成，可在 VFS 层访问磁盘文件（`make test-fat` 21 项：读内核映像 / 跨簇逐字节公式 / LFN / 空文件 / 偏移读 / `EROFS` 负例）
 
 ### 2.2 v0.9（网络栈顺序 + Socket syscall 最小集）
 
@@ -183,6 +192,7 @@ IMAGE UNCHANGED (write test restored the scratch sector)
 | Timer（PIT） | v0.4 | 100Hz tick：调度时间片与块 I/O 超时基准 |
 | PCI | v0.8 | 枚举与 BAR 探测（配置机制 #1） |
 | Disk（virtio-blk legacy） | v0.8 | 块设备：`BlockDevice` trait 的实现者 |
+| Disk FS（FAT12/16/32） | v0.8 | 不是 PCI 驱动，而是 `FileSystem` 后端（`fs/fat.rs`）：消费 `BlockDevice` 提供的扇区 |
 
 ### 3.2 后续（按需补）
 
@@ -204,4 +214,5 @@ IMAGE UNCHANGED (write test restored the scratch sector)
 | 2026-10-08 | v0.4 完成：IRQ stub 修正（B-08）、IRQ 入口保存寄存器（B-09）、PIT 100Hz、PS/2 键盘回显、上下文切换原语；新增 `make test-keyboard` |
 | 2026-10-08 | v0.4 最后一项 H-04/H-05 落地：Go 编排器 + 串口分析器；`make go-test` / `make test-orch` 通过 |
 | 2026-10-08 | 统一文档顶部元信息与修订记录（阶段 / 最后更新 / 状态） |
+| 2026-10-11 | **v0.8 收官**：磁盘文件系统 FAT12/16/32（`fs/fat.rs`，只读）挂到 VFS，`fs::mount_disks` 接入启动链（`/disk` + `/mnt/fat`）；H-03 `tools/mkfs/mkfs.py` 落地（mtools 独立复核）；新增 `make test-fat`（21 项，双盘）与编排场景 `fat`（10 场景）；状态行改为「v0.8 已完成」，限制项从「FAT32 未做」改为「FAT 只读、无扇区缓存」 |
 | 2026-10-11 | **v0.8 前半落地**：新增 `driver/pci.rs`（机制 #1 + BAR 探测 + 窗口大小）、`driver/driver.rs`（注册框架 + `probe_all`）、`driver/block.rs`（按扇区读写 + 验收自测）、`driver/virtio_blk.rs`（legacy virtio 0.9.5，同步轮询 + bounce buffer）、`arch/x86_64/port.rs`（端口 I/O）、`frame::allocate_contiguous`；启动盘改为 virtio-blk（Makefile / `tests/test_boot.py` / `tests/test_keyboard.py`，`disable-modern=on`）；新增 `make test-driver`（22 项）与编排场景 `driver`（9 场景）；修 B-16（BAR 大小 32→64 位宽错误）、B-17（LBA 溢出未拦）；状态行由「v0.8 尚未编写」改为「v0.8 前半完成，FAT32 待做」 |

@@ -6,7 +6,7 @@
 
 ## 当前进度
 
-**v0.8 前半已落地（2026-10-11）**：驱动注册框架 + PCI 枚举 + 块设备（legacy virtio-blk），磁盘后端与 `mkfs` 仍待做。
+**v0.8 已完成（2026-10-11）**：驱动注册框架 + PCI 枚举 + 块设备（legacy virtio-blk）+ **磁盘文件系统（FAT12/16/32 只读，挂到 VFS）** + H-03 `mkfs`。
 **v0.7 已落地（2026-10-11）**：VFS + RAMFS + ELF Loader、文件 syscall（`open`/`read`/`close`），详情见文末。
 
 **v0.4 已完成（2026-10-08）**：中断控制器 + Timer + 键盘 + 上下文切换原语 + 主机侧 Go 工具（H-04/H-05）。
@@ -85,7 +85,7 @@ IRQ 的 EOI 时序错误导致 PIC 停摆（B-11）。
 v0.7 仍**未做**（属 v0.8+）：用户堆（`brk`/`mmap`）、`argc/argv`、`fork/execve/wait4` 与进程对象、
 动态链接、内核高半区迁移；磁盘 FS（FAT32）与 `mkfs`（H-03）属 v0.8，Shell 与 `ls`/`cat` 属 v0.9。
 
-**v0.8 前半已落地（2026-10-11）**：驱动注册框架 + PCI 枚举 + 块设备（virtio-blk legacy）。
+**v0.8 已落地（2026-10-11）**：驱动注册框架 + PCI 枚举 + 块设备（virtio-blk legacy）+ 磁盘文件系统（FAT12/16/32）。
 
 - **PCI 枚举**（`kernel/src/driver/pci.rs`）：配置机制 #1（`0xCF8`/`0xCFC`），全总线扫描（用头部类型的
   多功能位把 256 个 function 的探测砍到 1 个），**BAR 探测**（写全 1 读掩码）并算出窗口大小；
@@ -103,18 +103,31 @@ v0.7 仍**未做**（属 v0.8+）：用户堆（`brk`/`mmap`）、`argc/argv`、
 - **启动盘换成 virtio-blk**：`make run` 与全部 QEMU 测试都改为
   `-device virtio-blk-pci,drive=blk0,disable-modern=on` —— 「镜像能启动」与「内核驱动能读写这块盘」
   因此是**同一台设备上的同一条路径**。
+- **磁盘文件系统（FAT12/16/32，只读）挂到 VFS**（`kernel/src/fs/fat.rs`）：类型按 BPB 的**簇数**判定
+  （不靠扩展名或配置），支持 FAT12/16 的**固定根目录区**与 FAT32/子目录的**簇链**、
+  8.3 短名（应用 NT 大小写标志）与 **LFN 长文件名**（带校验和验证）、任意偏移读、空文件（首簇 0）
+  正确返回 0 字节；写操作一律 `EROFS`，簇链断/越界 → `EUCLEAN`（不静默返回半截数据）；
+  `fs::mount_disks()` 把启动盘挂到 `/disk`、`mkfs` 生成的测试盘挂到 `/mnt/fat`（顺带验证最长前缀路由），
+  **syscall 层一行未改** —— 这正是 VFS 收口的目的；`FileSystem` trait 随之收窄为 `&mut self` 且
+  `read_all` 返回 `Vec<u8>`（磁盘文件内容不在内存里，原来那种「借用后端缓冲」的形状不再成立）；
+- **H-03 `mkfs`**（`tools/mkfs/mkfs.py`）：自己生成 FAT12/16/32 镜像（引导扇区/FSInfo/FAT 副本/
+  LFN + 8.3 目录项/簇链），写完回读校验；正确性由 **mtools 独立复核**（`mdir`/`mtype` 读同一张盘）——
+  两套独立的 FAT 实现都认同一张盘，才能说明「镜像本身是对的」。
 
 自动化验证：`make test-driver` **22 项**断言 PASS（`vendor=0x1af4 device_id=0x1001`、`bar0=io:`、
 `queue0 size=256 region=... (3 pages contiguous)`、`capacity=131072 sectors (64 MiB)`、
 `boot sector sig=0x55aa fstype=FAT16`、512/4096/4608 字节分块读一致性、最后扇区写回读+还原、三类负例）；
-`tests/orchestrate.json` 增至 **9 场景**（新增 `driver`）全 PASS。
+`make test-fat` **21 项**断言 PASS（**双盘启动**：从启动盘读回**内核自己的映像**
+`fs: read /disk/KERNEL.ELF magic=0x7f454c46 size=3005280` 与 `BOOTX64.EFI magic=0x4d5a`；
+测试盘上跨簇文件 3000 字节**逐字节对公式**、偏移 1024 读、空文件、LFN 长文件名、二级子目录，
+以及 `fs: disk negative cases PASS (ENOENT/ENOTDIR/EISDIR/EROFS)`）；
+`tests/orchestrate.json` 增至 **10 场景**（新增 `driver` 与 `fat`）全 PASS。
 另用非 `snapshot=on` 方式启动后比对镜像 md5，确认写测试真的把最后一个扇区恢复了原样。
 
-v0.8 仍**未做**：FAT32 磁盘文件系统挂到 VFS（与 H-03 `mkfs`）—— 这是 v0.8 的剩余部分；
-modern（virtio 1.0）、MSI-X/INTx 中断、多块盘、BAR 重分配、ECAM/ACPI 也留到后续。
+v0.8 仍**未做**（明确不算完成）：FAT 后端**只读**（写盘/簇分配器、扇区缓存属后续）、不解析分区表、
+modern（virtio 1.0）、MSI-X/INTx 中断、超过两块盘、BAR 重分配、ECAM/ACPI。
 
-下一步：按 DEVELOPMENT.md 第 5 节顺序继续——v0.8 剩余部分（FAT32 磁盘后端 + `mkfs`）
-然后 v0.9（Shell + 用户程序 + 网络）。
+下一步：按 DEVELOPMENT.md 第 5 节顺序继续 —— v0.9（Shell + 用户程序 + 网络）。
 
 ## 文档入口
 
@@ -127,7 +140,7 @@ modern（virtio 1.0）、MSI-X/INTx 中断、多块盘、BAR 重分配、ECAM/AC
 ## 项目结构（概览）
 
 ```text
-boot/      UEFI 引导（v0.1 ✅）   kernel/    Rust 内核主体（v0.8 🟡，含内存/中断/调度/syscall/fs/驱动）
+boot/      UEFI 引导（v0.1 ✅）   kernel/    Rust 内核主体（v0.8 ✅，含内存/中断/调度/syscall/fs/驱动）
 libc/      最小用户态运行时（v0.7 ✅，含 open/read/close）
 shared/    boot/kernel 共享结构    user/      用户态程序（v0.7：hello ✅，其 ELF 即 RAMFS 上的 /init）
 tools/     Python 主机工具        tools-go/  Go 主机服务
@@ -141,6 +154,9 @@ pci.rs ──枚举──▶ driver.rs ──匹配/挂接──▶ virtio_blk.r
 （总线上有什么）   （谁来管它）              （实现 Driver + BlockDevice）
                         │
                         └──▶ block.rs（按扇区读写的统一接口 + 设备注册表）
+                                  │
+磁盘上的文件：                     ▼
+fs/fat.rs（FAT12/16/32 只读后端）──▶ fs/vfs.rs + 挂载表 ──▶ open/read/close（syscall 层零改动）
 ```
 
 ## 常用命令
@@ -158,8 +174,10 @@ make test-ipc        # v0.5：断言 pipe 创建/写入/读取摘要日志 + 自
 make test-fs         # v0.7：断言 VFS 挂载路由 + RAMFS 读/写/ls + 负例 errno
 make test-user       # v0.7：断言 ELF 从 RAMFS 装载 + 文件 syscall 全链路 + 用户写入读回 + 隔离
 make test-driver     # v0.8：断言 PCI 枚举 + 驱动挂接 + virtio-blk 扇区读/写/负例
+make fat-image       # v0.8：用 tools/mkfs/mkfs.py 生成 FAT32 测试盘（内容见 tests/fatroot/）
+make test-fat        # v0.8：双盘启动，断言 FAT16/32 挂到 VFS 后的读/ls/LFN/跨簇/偏移读/EROFS
 make user            # v0.7：单独构建并校验用户态脚手架（libc + user/hello → 段页对齐的 ELF）
 make test-all        # 全部集成测试
 make go-test         # v0.4 H-04/H-05：Go 单元测试（串口分析 + 并行编排器）
-make test-orch       # v0.4 H-04：Go 编排器并行跑 9 个集成测试场景（tests/orchestrate.json）
+make test-orch       # v0.4 H-04：Go 编排器并行跑 10 个集成测试场景（tests/orchestrate.json）
 ```

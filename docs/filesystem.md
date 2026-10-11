@@ -1,20 +1,22 @@
 # 文件系统（阶段文档）
 
-- 阶段：第六阶段（v0.7）
+- 阶段：第六阶段（v0.7）+ 第八阶段（v0.8 磁盘后端）
 - 最后更新：2026-10-11
-- 状态：🟡 v0.7 核心已实现并验收（VFS + RAMFS + 挂载点路由 + fd 表 → `open`/`read`/`write`/`close`，
-  `make test-fs` 19 项串口断言 PASS）；磁盘后端（FAT32 / virtio-blk）与 `mkfs`（H-03）属 v0.8
+- 状态：✅ v0.7 核心已实现并验收（VFS + RAMFS + 挂载点路由 + fd 表 → `open`/`read`/`write`/`close`，
+  `make test-fs` 19 项串口断言 PASS）；**v0.8 磁盘后端（FAT12/16/32，只读）已挂到同一套 VFS** 并验收
+  （`make test-fat` 21 项），H-03 `mkfs`（`tools/mkfs/mkfs.py`）同步落地
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
 - 依赖：syscall.md（open/read/write/close）、memory.md（内核堆：RAMFS 的数据就在堆上）
 
 ## 1. 概述
 
-v0.7 文件系统阶段分两步，本版只做第一步：
+文件系统阶段分两步，两步均已完成：
 
-1. **VFS 抽象 + RAMFS 后端**（本版完成）：把「文件」这件事的语义先立起来，
+1. **VFS 抽象 + RAMFS 后端**（v0.7）：把「文件」这件事的语义先立起来，
    并让 syscall 层的文件语义有真实落点；
-2. **磁盘后端**（v0.8）：FAT32 + 块设备挂到同一套 VFS 上，并补 `mkfs`（H-03）。
+2. **磁盘后端**（v0.8）：FAT12/16/32 只读后端 + 块设备挂到同一套 VFS 上，并补 `mkfs`（H-03）——
+   验证方式是「**syscall 层一行都不改**，`open`/`read`/`close` 直接能读磁盘上的文件」。
 
 非目标重申：不把具体文件系统写死进内核（ADR-004），`FileSystem` trait 是唯一入口；
 `syscall` 层只认路径与 fd，不认「RAMFS 还是 FAT32」。
@@ -31,21 +33,26 @@ v0.7 文件系统阶段分两步，本版只做第一步：
 | `ramfs.rs` | 第一个后端（内存 FS） | `RamFs { root: Node }`、`Node { name, kind, data: Vec<u8>, children: Vec<Node> }` |
 | `file.rs` | fd 表（`open` 的落点） | `FdTable`、`open/read/write/close/reset`、`O_RDONLY/O_WRONLY/O_RDWR/O_CREAT` |
 
-`FileSystem` trait（v0.7 的全部语义）：
+`FileSystem` trait（v0.8 的形状；v0.7 曾用 `&self` + 借用返回，见下方说明）：
 
 ```rust
 pub trait FileSystem {
     fn name(&self) -> &'static str;
-    fn stat(&self, path: &str) -> Result<Metadata, i64>;
-    fn read<'a>(&'a self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64>;
-    fn read_all<'a>(&'a self, path: &str) -> Result<&'a [u8], i64>;
+    fn stat(&mut self, path: &str) -> Result<Metadata, i64>;
+    fn read(&mut self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, i64>;
+    fn read_all(&mut self, path: &str) -> Result<Vec<u8>, i64>;
     fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<usize, i64>;
     fn create(&mut self, path: &str) -> Result<(), i64>;
     fn mkdir(&mut self, path: &str) -> Result<(), i64>;
-    fn list(&self, path: &str) -> Result<Vec<DirEntry>, i64>;
+    fn list(&mut self, path: &str) -> Result<Vec<DirEntry>, i64>;
     fn usage(&self) -> (usize, usize) { (0, 0) } // 默认实现：磁盘后端不适用
 }
 ```
+
+v0.8 把方法都收 `&mut self`、并把 `read_all` 从「借用后端内部缓冲」改成**返回 `Vec<u8>`**：
+挂载表本就用 `&'static mut` **独占**持有后端，而磁盘后端的文件内容根本不在内存里 ——
+要「借用」就得先把整个文件读进一个缓存，那还不如直接把这次读的结果交出去。
+代价是比 RAMFS 多一次拷贝（小文件可忽略），收益是磁盘后端不需要任何内部可变性。
 
 约定两条：
 
@@ -142,21 +149,102 @@ fd 编号（与 Linux 一致的形状，见 syscall.md 2.7）：
       → 内核读回 `fs: readback /tmp/hello.txt len=24` + `fs: user data: written by user program`
 - [ ] Shell 里 `cd`/`ls`/`cat` RAMFS 内文件 → 属 v0.9（需要 `init`/`sh` 与 `argc/argv`；v0.7 在**内核侧**
       与**一个用户程序**里验证了同样的语义，见 `user/hello`）
-- [ ] 磁盘后端（FAT32）+ `mkfs`（H-03）→ v0.8 **剩余部分**（块设备那一半已完成：`make test-driver`）
+- [x] 磁盘后端（FAT）+ `mkfs`（H-03）→ v0.8 已落地，见第 3 节（`make test-fat` 21 项 PASS）
 
-## 3. 后续文件系统后端（v0.8 起）
+## 3. v0.8 实际实现：FAT 磁盘后端（`kernel/src/fs/fat.rs`）
 
-### 3.1 FAT32 on virtio-blk
+### 3.1 为什么是 FAT，而不是 EXT2 / 自创格式
 
-- v0.8 的块设备驱动（`driver/block.rs` + `driver/virtio_blk.rs`，2026-10-11 已就位）为 FAT32 提供了
-  「按 512 字节扇区读写」的底座：FAT32 将作为第二个 `FileSystem` 实现挂到 VFS 上；
-  syscall 层不需要改动 —— 这正是 2.1 把语义收进 trait 的目的；
-- 届时 `read_all` 的零拷贝借用需要重新考虑（磁盘后端可能要在读时填充缓冲）。
+启动盘本身就是 FAT（UEFI 固件的 ESP 要求）。所以「同一个 FAT 实现」既能读我们自己生成的测试盘，
+也能读**固件写的真实盘** —— 内核因此能打开自己的 `/disk/…KERNEL.ELF`。
+格式选择由**已有的事实**决定，而不是由喜好决定（也避免「自己造格式自己写解析器」这种自证）。
 
-### 3.2 mkfs（H-03）
+覆盖范围：
 
-- `tools/mkfs/mkfs.py` 仍是占位。v0.7 的 RAMFS 是**内核内建**的文件系统，不需要镜像生成；
-  磁盘 FS 才需要 `mkfs`，因此它随 v0.8 落地。
+| 项 | 支持情况 |
+| ---- | ---- |
+| 类型 | **FAT12 / FAT16 / FAT32** 全部按 BPB 自动判定（由**簇数**与布局决定，不靠扩展名或配置） |
+| 目录 | 12/16 的**固定根目录区**、32 与所有子目录的**簇链**；跳过 `.`/`..`/卷标/已删除项 |
+| 名字 | 8.3 短名（应用 NT 大小写标志）+ **LFN 长文件名**（按序号定位拼装 + 校验和验证） |
+| 文件 | 任意偏移读（沿簇链走）、整文件读；空文件（首簇 0）**正确返回 0 字节**而不是去解引用簇 0 |
+| 写 | **不支持**：`write`/`create`/`mkdir` 一律 `EROFS`（分配器 + 目录项改写属后续版本） |
+| 缓存 | 没有：每次访问都真读设备（扇区缓冲在栈上），加扇区缓存是后续优化 |
+| 一致性 | 簇链断/越界/出现空闲标记 → `EUCLEAN`，**不静默返回半截数据** |
+
+已知限制（写清楚，避免「看起来支持」）：
+
+- 只接受 **512 字节扇区**的卷（`BPB_BytsPerSec == 512`）—— 块设备本身就是 512 字节粒度，
+  而 QEMU/固件都用 512；
+- 不解析分区表（MBR/GPT）：v0.8 把**整盘当一个卷**（超级软盘布局），与启动盘一致；
+- 时间戳/属性只读不写；没有 `..` 路径语义（VFS 层统一拒绝 `.`/`..`）。
+
+### 3.2 挂载：两个卷，同一套路由
+
+`fs::mount_disks()`（在 `Kernel started!` 之后、调度器之前）把块设备注册表里的卷挂到 VFS：
+
+| 块设备 | 挂载点 | 内容 |
+| ---- | ---- | ---- |
+| 0（启动盘） | `/disk` | 固件要用的 ESP：`EFI/BOOT/BOOTX64.EFI` + `KERNEL.ELF` |
+| 1（测试盘） | `/mnt/fat` | `tools/mkfs/mkfs.py` 生成，内容见 `tests/fatroot/README.md` |
+
+`/mnt/fat` 恰好挂在 `/mnt`（自测用的第二个 RAMFS）**下面**，所以顺带验证了挂载表的**最长前缀路由**：
+
+```text
+fs: mount point=/disk fs=fat16 sectors=131072 cluster_bytes=1024 clusters=65264
+fs: mount point=/mnt/fat fs=fat32 sectors=131072 cluster_bytes=512 clusters=128992
+fs: route /mnt/note.txt fs=ramfs-scratch /mnt/fat/hello.txt fs=fat32
+```
+
+这里有个容易写错的地方（实际踩过）：判断「测试盘是否已挂」不能用 `backend_name("/mnt/fat").is_some()`——
+没有第二块盘时它依然返回 `ramfs-scratch`（最长前缀落到挂在 `/mnt` 的后端），于是单盘启动会在
+「检查测试卷」上失败并 halt。正确判断是 `vfs::is_mount_point`（路径是否**就是**挂载点本身，而不是「落在别人挂载点下面」的普通路径）。
+
+### 3.3 验收（`make test-fat`，21 项串口断言 PASS，双盘启动）
+
+```text
+fs: ls /disk entries=2
+fs: ls /disk name=EFI kind=dir size=0 perms=drwxr-xr-x
+fs: ls /disk name=KERNEL.ELF kind=file size=3005280 perms=-rw-r--r--
+fs: read /disk/KERNEL.ELF magic=0x7f454c46 size=3005280 (our own kernel image, read from the boot volume)
+fs: read /disk/EFI/BOOT/BOOTX64.EFI magic=0x4d5a route=fat16
+fs: ls /mnt/fat name=dir kind=dir size=0
+fs: ls /mnt/fat name=a long file name.txt kind=file size=13
+fs: ls /mnt/fat name=empty.txt kind=file size=0
+fs: ls /mnt/fat name=hello.txt kind=file size=17
+fs: content check PASS /mnt/fat/dir/nested.bin len=3000 (formula verified byte by byte across 6 clusters)
+fs: offset read PASS /mnt/fat/dir/nested.bin offset=1024 len=8 data=0x3 (matches the formula)
+fs: empty file PASS /mnt/fat/empty.txt len=0
+fs: long file name PASS /mnt/fat/a long file name.txt (LFN entry)
+fs: nested directory PASS /mnt/fat/dir/deep/marker.txt
+fs: disk negative cases PASS (ENOENT/ENOTDIR/EISDIR/EROFS)
+fs: disk selftest PASS
+```
+
+这些断言的意义（都是「磁盘上的事实」而不是日志措辞）：
+
+- `magic=0x7f454c46` + `size=3005280`：从**启动盘**读回了**内核自己的映像**（前 4 字节是 ELF 魔数，
+  大小是 FAT 目录项里记录的真实字节数）—— VFS → FAT → 块设备 → virtio 的完整往返；
+- `BOOTX64.EFI magic=0x4d5a`（`MZ`）：固件要用的 PE 引导文件在同一张盘上也能读到；
+- `content check PASS … len=3000`：跨簇文件（512 字节簇 → **6 个簇**）**逐字节对公式**
+  （`bytes((i*7+3)&0xFF)`，内核自己算期望值，不依赖宿主预先算好的校验和）；
+- `offset read PASS … offset=1024`：任意偏移读 —— `read`/`open` 走的正是这条路径；
+- `empty file PASS len=0`：空文件首簇为 0，必须返回 0 字节；
+- `long file name PASS`：带空格的**长文件名**（LFN 目录项）路径可解析；
+- `nested directory PASS`：二级子目录（簇链 + `.`/`..`）；
+- `negative cases PASS (ENOENT/ENOTDIR/EISDIR/EROFS)`：错误各自具体，只读后端不能用「写失败」笼统表示。
+
+单盘启动（如 `make test-driver`）时内核打印 `fs: no second volume (single-disk boot; ...)`（提示语里点名 `make test-fat`），
+启动链继续走到调度器/用户态 —— 即「不挂测试盘也能正常启动」同样被覆盖。
+
+### 3.4 mkfs（H-03，`tools/mkfs/mkfs.py`）
+
+- 自己实现 FAT12/16/32 镜像生成（引导扇区/FSInfo/FAT 副本/LFN + 8.3 目录项/簇链），
+  **不调 `mformat`** —— H-03 要的就是「我们能生成 FAT 镜像」这件事；
+- 写完做一次**回读校验**（几何 → FAT 副本 → 簇链 → 目录项 → 长度），失败就非零退出，
+  免得把坏镜像交给 QEMU 再回头怀疑内核；
+- 正确性由 **mtools 独立复核**：`mdir -i build/fat.img ::`、`mtype -i build/fat.img ::hello.txt`
+  —— 两套**互相独立**的 FAT 实现都认同一张盘，才能说明「镜像本身是对的」（见 `tests/fatroot/README.md`）；
+- 目录树取自 `tests/fatroot/data/`（`make fat-image`），每个文件对应一类断言：跨簇、空文件、LFN、二级子目录。
 
 ## 4. 非目标 / 后续
 
@@ -171,5 +259,6 @@ fd 编号（与 Linux 一致的形状，见 syscall.md 2.7）：
 | 2026-10-06 | 第一阶段创建占位 |
 | 2026-10-07 | 补记路线细化：明确 VFS 先行/RAMFS 后端/文件描述符表与 syscall 对接顺序、补充 ELF Loader 对接关系、补充 FAT32/mkfs 后续位置 |
 | 2026-10-08 | 本次 docs 迭代统一文档顶部元信息（阶段 / 最后更新 / 状态）与修订记录，保持与 DEVELOPMENT.md 与索引文档描述一致 |
-| 2026-10-11 | 备注：v0.8 的块设备层已落地（`block.rs` + `virtio_blk.rs`，`make test-driver`），FAT32 后端与 `mkfs` 仍未开始，因此本节仍按计划书写 |
+| 2026-10-11 | 备注：v0.8 的块设备层已落地（`block.rs` + `virtio_blk.rs`，`make test-driver`）；当时 FAT 后端与 `mkfs` 仍未开始 |
+| 2026-10-11 | **v0.8 磁盘后端落地（收官）**：新增 `fs/fat.rs`（FAT12/16/32 只读：BPB 解析与类型判定、固定根目录区/簇链目录、8.3 + NT 标志 + LFN、偏移读、`EROFS`/`EUCLEAN`）与 `fs::mount_disks`（`/disk` + `/mnt/fat`，验证最长前缀路由）；`FileSystem` trait 收 `&mut self` 且 `read_all` 返回 `Vec<u8>`（磁盘内容不在内存里）；修「单盘启动误判 `/mnt/fat` 已挂」（改用 `vfs::is_mount_point`）；新增 `vfs::is_mount_point`；`make test-fat`（21 项，双盘启动，编排第 10 个场景）；`tools/mkfs/mkfs.py` + `tests/fatroot/`；第 3 节由「后续计划」改写为实现记录 |
 | 2026-10-11 | **v0.7 核心落地**：从占位改为实现记录 —— 模块划分与 `FileSystem` trait、挂载表最长前缀路由（含路由证据日志）、路径语义收窄项、RAMFS 数据模型与单文件上限、初始文件树与启动日志、fd 表与 syscall 对接（fd 0/1/2 与 ≥3 的语义、最小空闲槽位、偏移量推进）、`make test-fs` 19 项验收；明确 Shell `cd/ls/cat` 属 v0.9、磁盘后端与 `mkfs` 属 v0.8 |

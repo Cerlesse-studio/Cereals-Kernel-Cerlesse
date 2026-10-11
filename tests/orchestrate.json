@@ -202,6 +202,45 @@
       "timeoutSec": 60
     },
     {
+      "name": "fat",
+      "cmd": [
+        "python3", "tests/test_boot.py",
+        "--disk", "build/disk.img",
+        "--disk2", "build/fat.img",
+        "--serial-log", "build/orch/fat/serial.log",
+        "--ovmf-vars", "build/orch/fat/OVMF_VARS.fd",
+        "--timeout", "30",
+        "--expect", "Kernel started!",
+        "--expect", "fs: mount point=/disk fs=fat16",
+        "--expect", "fs: read /disk/KERNEL.ELF magic=0x7f454c46 size=",
+        "--expect", "fs: mount point=/mnt/fat fs=fat32",
+        "--expect", "fs: ls /mnt/fat entries=4",
+        "--expect", "fs: content check PASS /mnt/fat/dir/nested.bin len=3000",
+        "--expect", "fs: offset read PASS /mnt/fat/dir/nested.bin offset=1024 len=8",
+        "--expect", "fs: empty file PASS /mnt/fat/empty.txt len=0",
+        "--expect", "fs: long file name PASS /mnt/fat/a long file name.txt (LFN entry)",
+        "--expect", "fs: nested directory PASS /mnt/fat/dir/deep/marker.txt",
+        "--expect", "fs: disk negative cases PASS (ENOENT/ENOTDIR/EISDIR/EROFS)",
+        "--expect", "fs: disk selftest PASS"
+      ],
+      "serialLog": "build/orch/fat/serial.log",
+      "expect": [
+        "Kernel started!",
+        "fs: mount point=/disk fs=fat16",
+        "fs: read /disk/KERNEL.ELF magic=0x7f454c46 size=",
+        "fs: mount point=/mnt/fat fs=fat32",
+        "fs: ls /mnt/fat entries=4",
+        "fs: content check PASS /mnt/fat/dir/nested.bin len=3000",
+        "fs: offset read PASS /mnt/fat/dir/nested.bin offset=1024 len=8",
+        "fs: empty file PASS /mnt/fat/empty.txt len=0",
+        "fs: long file name PASS /mnt/fat/a long file name.txt (LFN entry)",
+        "fs: nested directory PASS /mnt/fat/dir/deep/marker.txt",
+        "fs: disk negative cases PASS (ENOENT/ENOTDIR/EISDIR/EROFS)",
+        "fs: disk selftest PASS"
+      ],
+      "timeoutSec": 60
+    },
+    {
       "name": "keyboard",
       "cmd": [
         "python3", "tests/test_keyboard.py",

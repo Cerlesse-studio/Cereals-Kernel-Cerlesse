@@ -28,7 +28,7 @@ USER_RUSTFLAGS := -C relocation-model=static -C code-model=large
 USER_PROFILE   := user-release
 USER_ELF       := $(BUILD)/user/x86_64-unknown-none/$(USER_PROFILE)/user-hello
 
-.PHONY: help build boot kernel image image-exception image-pagefault run test test-exception test-memory test-pagefault test-keyboard test-scheduler test-ipc test-fs test-user test-driver test-all user go-test test-orch clean
+.PHONY: help build boot kernel image image-exception image-pagefault fat-image run test test-exception test-memory test-pagefault test-keyboard test-scheduler test-ipc test-fs test-user test-driver test-fat test-all user go-test test-orch clean
 
 help:
 	@echo "targets:"
@@ -44,10 +44,12 @@ help:
 	@echo "  test-fs - v0.7: assert VFS mount routing + RAMFS read/write/ls + negative errno cases"
 	@echo "  test-user - v0.7: assert ELF loaded from RAMFS + ring3 file syscalls + user write readback + isolation"
 	@echo "  test-driver - v0.8: assert PCI enumeration + driver probe + virtio-blk sector read/write"
+	@echo "  fat-image - v0.8: build the FAT test volume (tools/mkfs/mkfs.py from tests/fatroot/data)"
+	@echo "  test-fat - v0.8: assert FAT16/32 on disk mounted in VFS: read/ls/LFN/multi-cluster/EROFS"
 	@echo "  user   - v0.7: build+validate the user-space scaffold alone (libc + user/hello -> static ELF)"
 	@echo "  test-all - run every integration test"
 	@echo "  go-test  - v0.4 H-04/H-05: Go unit tests for tools-go (host side)"
-	@echo "  test-orch - v0.4 H-04: run all 9 scenarios in parallel via Go orchestrator"
+	@echo "  test-orch - v0.4 H-04: run all 10 scenarios in parallel via Go orchestrator"
 	@echo "  clean  - remove build artifacts"
 
 build: image
@@ -117,7 +119,7 @@ test-pagefault: image-pagefault
 		--expect "CR2=0x500000000000" \
 		--expect "KERNEL PANIC: unhandled exception"
 
-test-all: test test-exception test-memory test-pagefault test-keyboard test-scheduler test-ipc test-fs test-user test-driver
+test-all: test test-exception test-memory test-pagefault test-keyboard test-scheduler test-ipc test-fs test-user test-driver test-fat
 
 # v0.5 验收：≥3 个内核任务在 PIT 时间片驱动下轮转（Round Robin）
 test-scheduler: image
@@ -250,6 +252,55 @@ test-driver: image
 		--expect "block: negative cases PASS" \
 		--expect "block: selftest PASS"
 
+# v0.8 H-03 验收：用 tools/mkfs/mkfs.py 生成「带已知文件集」的 FAT32 测试盘（64 MiB）。
+#
+# 内容取自 tests/fatroot/data（见该目录的 README：每个文件对应一类断言）。
+# 正确性由 **mtools 独立复核**：`mdir -i build/fat.img ::` / `mtype ... ::hello.txt`。
+fat-image:
+	$(PYTHON) tools/mkfs/mkfs.py --out $(BUILD)/fat.img --from tests/fatroot/data
+
+# v0.8 验收：磁盘上的文件系统（FAT 后端挂进 VFS 后，syscall 层一行未改就能 open/read）。
+#
+# 断言的都是「磁盘上的事实」而不是日志措辞：
+#   - `fs: mount point=/disk fs=fat16 sectors=131072 cluster_bytes=1024 clusters=65264`：
+#     启动盘（mtools 写的 ESP）被 **FAT16 解析器** 认出来（类型由簇数判定，不靠扩展名）；
+#   - `fs: read /disk/KERNEL.ELF magic=0x7f454c46`：从磁盘读回**内核自己的映像**，
+#     前 4 字节是 ELF 魔数 —— VFS → FAT → 块设备 → virtio 的完整往返；
+#   - `BOOTX64.EFI magic=0x4d5a`（`MZ`）：固件要用的 PE 引导文件在同一张盘上读到；
+#   - `fs: mount point=/mnt/fat fs=fat32 sectors=131072 ... clusters=128992`：
+#     `mkfs.py` 生成的测试盘，且挂在 `/mnt`（RAMFS）**下面** → 顺带验证最长前缀路由；
+#   - `fs: content check PASS ... len=3000`：跨簇文件逐字节对公式（6 个 512 字节簇）；
+#   - `fs: offset read PASS ... offset=1024`：任意偏移读（fd 的 read 路径形态）；
+#   - `empty file PASS len=0`：首簇为 0 的空文件不会去解引用簇 0；
+#   - `long file name PASS`：带空格的长文件名（LFN 目录项 + 校验和）；
+#   - `fs: disk negative cases PASS (ENOENT/ENOTDIR/EISDIR/EROFS)`：错误各自具体。
+test-fat: image fat-image
+	$(PYTHON) tests/test_boot.py \
+		--disk $(BUILD)/disk.img \
+		--disk2 $(BUILD)/fat.img \
+		--serial-log $(BUILD)/serial-fat.log \
+		--expect "Kernel started!" \
+		--expect "fs: mount point=/disk fs=fat16 sectors=131072 cluster_bytes=1024 clusters=65264" \
+		--expect "fs: disk selftest begin" \
+		--expect "fs: ls /disk entries=2" \
+		--expect "fs: ls /disk name=EFI kind=dir size=0 perms=drwxr-xr-x" \
+		--expect "fs: ls /disk name=KERNEL.ELF kind=file size=" \
+		--expect "fs: read /disk/KERNEL.ELF magic=0x7f454c46 size=" \
+		--expect "fs: read /disk/EFI/BOOT/BOOTX64.EFI magic=0x4d5a route=fat16" \
+		--expect "fs: mount point=/mnt/fat fs=fat32 sectors=131072 cluster_bytes=512 clusters=128992" \
+		--expect "fs: second volume at /mnt/fat fs=fat32" \
+		--expect "fs: ls /mnt/fat entries=4" \
+		--expect "fs: read /mnt/fat/hello.txt len=17 data=hello from FAT32" \
+		--expect "fs: content check PASS /mnt/fat/dir/nested.bin len=3000 (formula verified byte by byte across 6 clusters)" \
+		--expect "fs: offset read PASS /mnt/fat/dir/nested.bin offset=1024 len=8 data=0x" \
+		--expect "(matches the formula)" \
+		--expect "fs: empty file PASS /mnt/fat/empty.txt len=0" \
+		--expect "fs: long file name PASS /mnt/fat/a long file name.txt (LFN entry)" \
+		--expect "fs: nested directory PASS /mnt/fat/dir/deep/marker.txt" \
+		--expect "fs: route /mnt/note.txt fs=ramfs-scratch /mnt/fat/hello.txt fs=fat32" \
+		--expect "fs: disk negative cases PASS (ENOENT/ENOTDIR/EISDIR/EROFS)" \
+		--expect "fs: disk selftest PASS"
+
 # v0.5 验收：IPC（pipe 骨架）创建/写入/读取串口摘要日志 + 自测，随 Round Robin 巡回后执行
 test-ipc: image
 	$(PYTHON) tests/test_boot.py \
@@ -285,10 +336,10 @@ user:
 go-test:
 	cd tools-go && $(GO) vet ./... && $(GO) test ./...
 
-# v0.4 H-04 验收：Go 编排器并行跑全部 9 个集成测试场景 + 串口日志二次复核。
-# 磁盘镜像先构建（默认/异常注入/页错误三个镜像），随后场景并行执行；
+# v0.4 H-04 验收：Go 编排器并行跑全部 10 个集成测试场景 + 串口日志二次复核。
+# 磁盘镜像先构建（默认/异常注入/页错误 + FAT 测试盘），随后场景并行执行；
 # 每个场景独占 OVMF_VARS 副本、串口日志与 monitor socket（见 tests/orchestrate.json）。
-test-orch: image image-exception image-pagefault
+test-orch: image image-exception image-pagefault fat-image
 	cd tools-go && $(GO) run ./cmd/testorch -config ../tests/orchestrate.json -root ..
 
 clean:

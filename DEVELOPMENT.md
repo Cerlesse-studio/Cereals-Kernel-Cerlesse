@@ -9,10 +9,11 @@
   VFS（trait + 挂载表最长前缀路由）、RAMFS、fd 表、`read`/`write`/`open`/`close`，
   以及 **ELF Loader**（用户程序不再是摊平映像，而是 RAMFS 上的 `/init` 经 `elf.rs` 按段权限装载，
   `RW` 段对 ring3 可写）；`make user` 追加 `tools/check_user_elf.py` 独立校验段布局；
-  **v0.8 前半已落地并通过 `make test-driver`（22 项）验收**：驱动注册框架（`Driver` trait + 注册表 + `probe_all`）、
+  **v0.8 已完成并通过 `make test-driver`（22 项）+ `make test-fat`（21 项）验收**：驱动注册框架（`Driver` trait + 注册表 + `probe_all`）、
   PCI 枚举（配置机制 #1 + BAR 探测 + 窗口大小）、块设备抽象（按 512 字节扇区读写）、
-  **legacy virtio-blk 0.9.5**（virtqueue + 同步轮询 + bounce buffer）、`frame::allocate_contiguous`（DMA 前置条件）；
-  启动盘已改为 virtio-blk（`disable-modern=on`）；v0.8 剩余的 **FAT32 挂到 VFS** 与 H-03 `mkfs` 仍待做，
+  **legacy virtio-blk 0.9.5**（virtqueue + 同步轮询 + bounce buffer）、`frame::allocate_contiguous`（DMA 前置条件）、
+  **FAT12/16/32 只读后端挂到 VFS**（`/disk` = 启动盘、`/mnt/fat` = 测试盘，syscall 层零改动）与 H-03 `mkfs`
+  （`tools/mkfs/mkfs.py`，mtools 独立复核）；启动盘已改为 virtio-blk（`disable-modern=on`）；
   v0.9（Shell/用户程序/网络）仍为占位
 - 关联文档：[docs/architecture.md](docs/architecture.md) · [docs/roadmap.md](docs/roadmap.md) · [docs/project-structure.md](docs/project-structure.md) · [docs/drivers.md](docs/drivers.md) · [docs/syscall.md](docs/syscall.md) · [docs/filesystem.md](docs/filesystem.md) · [docs/process.md](docs/process.md)
 
@@ -41,7 +42,7 @@
 | ---- | ---- | ---- | ---- |
 | H-01 | 镜像构建脚本（组装 boot + kernel + FS 镜像） | Python | v0.1 |
 | H-02 | QEMU 自动化：启动、超时、串口日志断言 | Python | v0.1 |
-| H-03 | mkfs 工具（RAMFS/FAT 镜像生成） | Python | v0.7 |
+| H-03 | mkfs 工具（FAT12/16/32 镜像生成，`tools/mkfs/mkfs.py`，mtools 复核） | Python | v0.8 ✅ |
 | H-04 | 测试编排服务（并行多场景跑 QEMU 测试） | Go | v0.4 |
 | H-05 | 串口日志实时收集与分析 | Go | v0.4 |
 | H-06 | 包管理器设计与主机侧原型（高效/安全/轻量、Windows 式灵活性参考） | 待定（先主机侧） | 设计阶段 |
@@ -302,10 +303,10 @@ v0.6 踩坑记录（已修复，建议保留）：
 - [x] `make user` 追加 `tools/check_user_elf.py`：不启 QEMU 即可校验基址/段页对齐/`W^X`/映像窗口/无重定位
 - [ ] Shell 里 `ls`/`cat`/`cd` 操作 RAMFS → **v0.9**（需要 shell 与 `argc/argv`；v0.7 已在内核侧与
       `/init` 里验证了同样的路径/文件语义）
-- [ ] 磁盘文件系统后端（FAT32）+ Python mkfs（H-03）→ **v0.8**（RAMFS 是内核内建，不需要镜像生成）
+- [x] 磁盘文件系统后端（FAT）+ Python mkfs（H-03）→ **v0.8 已落地**（见 v0.8 小节的最后两条）
 - [ ] 用户堆 / `brk` / `mmap`、`argc/argv`、`fork`/`execve`/`wait4`、动态链接 → v0.8+（见 docs/syscall.md 3.4）
 
-### v0.8 — Driver + PCI + Disk（前半已实现并通过验收，2026-10-11）
+### v0.8 — Driver + PCI + Disk（已实现并通过验收，2026-10-11）
 - [x] Driver Manager 与驱动注册框架（`kernel/src/driver/driver.rs`）：`Driver` trait（`name`/`matches`/`attach`）、
       固定容量注册表、`probe_all()` 按注册顺序匹配 + 挂接、`ProbeStats { devices, matched, attached, failed }`
 - [x] PCI 枚举 + Vendor/Device 匹配（`kernel/src/driver/pci.rs`）：配置机制 #1（`0xCF8`/`0xCFC`）、
@@ -324,8 +325,21 @@ v0.6 踩坑记录（已修复，建议保留）：
       `queue0 size=256 ... 3 pages contiguous`、`capacity=131072 sectors (64 MiB)`、
       `boot sector sig=0x55aa fstype=FAT16`、分块读一致性 512/4096/4608、写回读 + 还原、三类负例）；
       编排场景由 8 个增至 **9 个**（`driver`），`make test-orch` 9 passed / 0 failed（127.2s）
-- [ ] 磁盘 FS 后端（FAT32）挂载到 VFS → v0.8 剩余部分（见 docs/filesystem.md）
-- [ ] Python `mkfs` 工具（H-03）→ 与 FAT32 后端一起做
+- [x] 磁盘 FS 后端（**FAT12/16/32，只读**）挂载到 VFS（`kernel/src/fs/fat.rs` + `fs::mount_disks`）：
+      类型由 BPB 的**簇数**判定（不靠扩展名）、12/16 的固定根目录区与 32 的子目录簇链、
+      8.3 短名 + NT 大小写标志 + **LFN 长文件名**（含校验和）、任意偏移读、空文件（首簇 0）正确返回 0；
+      写操作一律 `EROFS`；簇链断/越界 → `EUCLEAN`（不静默返回半截数据）。
+      `FileSystem` trait 随之收窄为 `&mut self` + `read_all -> Vec<u8>`（磁盘文件内容不在内存里，
+      原来那种「借用后端缓冲」的形状不再成立）；**syscall 层一行未改** —— 这正是 VFS 收口的目的
+- [x] Python `mkfs` 工具（H-03，`tools/mkfs/mkfs.py`）：自己实现 FAT12/16/32 镜像生成（引导扇区/FSInfo/
+      FAT 副本/LFN + 8.3 目录项/簇链），写完回读校验；正确性由 **mtools 独立复核**（`mdir`/`mtype`
+      读同一张盘，见 `tests/fatroot/README.md`）—— 两套独立实现互相印证，而不是自己验证自己
+- [x] 验收：`make test-fat` **21 项** PASS（双盘启动）：`/disk` 是固件写的 FAT16 启动盘，
+      从它读回**内核自己的映像**（`/disk/KERNEL.ELF` 前 4 字节 = ELF 魔数 `0x7f454c46`）与
+      引导程序（`BOOTX64.EFI` = `MZ`）；`/mnt/fat` 是 `mkfs` 生成的 FAT32 测试盘，
+      跨簇文件（3000 字节 = 6 个簇）**逐字节对公式**、偏移 1024 的 8 字节读、空文件、LFN 长文件名、
+      二级子目录、最长前缀路由（`/mnt/note.txt` → RAMFS、`/mnt/fat/*` → FAT）、负例 `ENOENT/ENOTDIR/EISDIR/EROFS`；
+      编排场景由 9 个增至 **10 个**（`fat`）
 
 #### v0.8 缺陷与设计记录
 
@@ -366,6 +380,7 @@ v0.6 踩坑记录（已修复，建议保留）：
 | 回归测试 | 每个里程碑的验收标准固化为测试用例 | Go 编排服务 | v0.4 |
 | 异常测试 | 故意触发 #DE/#PF，校验诊断输出（`make test-exception` / `make test-pagefault`） | Python | v0.2（#PF 于 v0.3 加入） |
 | 驱动/块设备测试 | PCI 枚举 → 驱动挂接 → 扇区读写/分块一致性/负例（`make test-driver`） | Python | v0.8 |
+| 磁盘文件系统测试 | 双盘启动 → FAT16 启动盘读内核映像 / FAT32 测试盘读·LFN·跨簇公式·偏移读·负例（`make test-fat`） | Python | v0.8 |
 
 约定：
 
@@ -432,5 +447,6 @@ qemu-system-x86_64 -machine q35 -m 512M -serial stdio -display none \
 | 2026-10-11 | **v0.6 用户态脚手架可用**：`libc/` 从占位变为实现（syscall 封装 + `_start` + `print!/println!` + `panic_handler`）；新增真实用户程序 `user/hello` 并入 workspace（含 `default-members` 与 `user-release` profile，large 代码模型 + `lto = false`）；`kernel/build.rs` 构建期构建用户程序并摊平成连续映像内嵌（断言装载基址 / 入口在映像第 0 字节 / 无可装载重定位）；`UserSpace::load_program` 支持多代码页（1..=8）；新增 `make user`，`make test-user` 增至 **19 项断言**（含 `user: program=hello source=libc`）；全量回归（test / test-memory / test-scheduler / test-ipc / test-exception / test-pagefault / test-keyboard / go-test / test-orch 7 场景）PASS |
 | 2026-10-11 | **v0.7 落地（VFS + RAMFS + ELF Loader）**：`fs/` 从占位变为实现（`vfs` trait + 路径工具 + 系统级入口、`mount` 最长前缀路由、`inode` 元数据、`ramfs` 内存后端、`file` fd 表）；`read`/`write`/`open`/`close` 接入 `syscall_table`（fd 0/1/2 保留、动态 fd ≥ 3、用户缓冲按页校验）；新增 `syscall/elf.rs`：用户程序改为「RAMFS `/init` → ELF Loader 按段权限逐页映射」（`build.rs` 不再摊平，`user.ld` 四个段 `ALIGN(0x1000)`，`.lbss.*` 必须归入 `.bss`），`RW` 段对 ring3 可写；新增 `make test-fs`（19 项）与 `tools/check_user_elf.py`（`make user` 验段布局），`make test-user` 增至 **32 项断言**；修 B-15（syscall 入口未恢复 caller-saved 寄存器 → 用户态 `r9` 被破坏，#PF）；全量回归（9 个串口测试目标 + `go-test` + `test-orch` **8 场景**）PASS |
 | 2026-10-11 | **v0.8 前半落地（驱动框架 + PCI + 块设备）**：新增 `driver/driver.rs`（`Driver` trait + 注册表 + `probe_all` + `ProbeStats`）、`driver/pci.rs`（配置机制 #1 + BAR 探测/窗口大小）、`driver/block.rs`（`BlockDevice` + 注册表 + 验收自测）、`driver/virtio_blk.rs`（legacy virtio 0.9.5：virtqueue/描述符链/轮询/bounce buffer）、`arch/x86_64/port.rs`（端口 I/O 32 位入口）、`frame::allocate_contiguous`（DMA/virtqueue 前置）；启动盘改为 **virtio-blk（`disable-modern=on`）**，`main.rs` 在 `Kernel started!` 后接入「枚举 → 注册 → 探测/挂接 → 块设备自测」；新增 `make test-driver`（22 项）与编排场景 `driver`（**9 场景**，127.2s 全 PASS），全量回归 PASS（含非 snapshot 启动后镜像 md5 不变，验证写测试真的还原了扇区）；修 B-16（BAR 大小 32→64 位宽错误 → I/O BAR 尺寸报错）、B-17（`lba + sectors` 环绕 → 越界请求漏拦）；同步 docs/drivers.md（v0.8 实现记录 + 设计取舍 + 限制） |
+| 2026-10-11 | **v0.8 收官（磁盘文件系统 + `mkfs`）**：`fs/fat.rs`（FAT12/16/32 只读：BPB 按簇数定类型、固定根目录区/簇链目录、8.3 + NT 标志 + LFN 校验和、偏移读、`EROFS`/`EUCLEAN`）挂到 VFS（`fs::mount_disks` → `/disk` 启动盘、`/mnt/fat` 测试盘，验证最长前缀路由）；`FileSystem` trait 改为 `&mut self` + `read_all -> Vec<u8>`；新增 `vfs::is_mount_point` 并修「单盘启动误判 `/mnt/fat` 已挂 → 启动被 halt」；`tools/mkfs/mkfs.py`（H-03）自己生成 FAT12/16/32 镜像并由 mtools 独立复核，`tests/fatroot/` 提供测试盘内容与复核说明；`tests/test_boot.py` 新增 `--disk2`；新增 `make fat-image` / `make test-fat`（**21 项**，双盘启动）与编排场景 `fat`（**10 场景**，150.7s 全 PASS）；全量回归 PASS（`test-driver` 22 项 / `test-fs` 19 项 / `test-user` 32 项 / `make go-test`）；同步 filesystem.md（第 3 节由计划改写为实现记录）、drivers.md、roadmap/README/project-structure/tools README |
 
 
