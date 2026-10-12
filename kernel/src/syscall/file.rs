@@ -25,9 +25,13 @@
 
 use core::slice;
 
+use crate::ckm::api as ckm;
+use crate::ckm::policy::Op;
 use crate::driver::{keyboard, serial};
 use crate::fs::file as fdtable;
 use crate::fs::vfs;
+use crate::security::credential::Cred;
+use crate::security::permission::{self, Want};
 use crate::syscall::address_space::UserSpace;
 use crate::time::clock;
 
@@ -127,6 +131,82 @@ fn log_errno(op: &str, fd: i32, err: i64) {
     serial::print(" errno=");
     serial::print_dec(err.unsigned_abs());
     serial::println("");
+}
+
+/// v1.0 mode 判定失败的留痕（与 `ckm: policy` 行的 `EPERM` 刻意分开）。
+fn report_mode_deny(path: &str, cred: &Cred, want: Want) {
+    serial::print("fs: EACCES path=");
+    serial::print(path);
+    serial::print(" uid=");
+    serial::print_dec(cred.uid as u64);
+    serial::print(" want=");
+    serial::print(want.name());
+    serial::println("");
+}
+
+/// `open` 路径上的两项判定（`docs/ckm.md` 3.3/3.4 #1）：
+///
+/// 1. **受保护前缀**（`/etc`、`/bin`、`/lib`、`/init`）的**写**需要
+///    [`crate::security::capability::CAP_FS_SYSTEM_WRITE`]，失败 `EPERM(-1)`；
+/// 2. **文件 mode**（v1.0，`security/permission.rs`）：已存在的文件按 open 模式判
+///    读/写位；`O_CREAT` 且文件不存在时判**父目录**的写位，失败 `EACCES(-13)`。
+///
+/// 两类失败的 errno 刻意不同：「不属于你」与「你没有这个能力」在审计与测试里
+/// 必须可区分（`docs/ckm.md` 10 的补充条款）。返回 `0` 或负 errno。
+fn enforce_open(path: &str, flags: i32) -> i64 {
+    let cred = ckm::current_cred();
+    let accmode = flags & fdtable::O_ACCMODE;
+    let write_intent = accmode == fdtable::O_WRONLY || accmode == fdtable::O_RDWR;
+
+    // 1) 能力判定（只对受保护前缀的写；非受保护路径不产生判定行）
+    if write_intent {
+        if let Some(index) = ckm::protected_index(path) {
+            let errno = ckm::enforce(Op::FsWrite, index as u64);
+            if errno != 0 {
+                return errno;
+            }
+        }
+    }
+
+    // 2) mode 判定
+    let want = if write_intent { Want::Write } else { Want::Read };
+    match vfs::stat(path) {
+        Ok(meta) if !meta.kind.is_dir() => {
+            if let Err(errno) = permission::check(meta.mode, meta.uid, meta.gid, &cred, want) {
+                report_mode_deny(path, &cred, want);
+                return errno;
+            }
+        }
+        Ok(_) => {} // 目录：让 fd 表报 EISDIR（判定不该抢它的语义）
+        Err(_) if flags & fdtable::O_CREAT != 0 => {
+            let parent = match path.rfind('/') {
+                Some(0) | None => "/",
+                Some(i) => &path[..i],
+            };
+            if let Ok(pmeta) = vfs::stat(parent) {
+                if let Err(errno) = permission::check(pmeta.mode, pmeta.uid, pmeta.gid, &cred, Want::Write) {
+                    report_mode_deny(parent, &cred, Want::Write);
+                    return errno;
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    0
+}
+
+/// `write` 到**已打开**文件的受保护前缀判定（`docs/ckm.md` 3.4 #1 的后半句）。
+///
+/// 路径从 fd 表取（那里的路径是 `open` 时规范化过的，不可被用户态改写）：
+/// 若用户先以合法身份打开再写，判定点 1 不能被绕过。返回 `0` 或负 errno。
+fn enforce_fd_write(fd: i32) -> i64 {
+    let Some(path) = fdtable::path_of(fd) else {
+        return 0; // 未知 fd：让 fd 表报 EBADF
+    };
+    match ckm::protected_index(&path) {
+        Some(index) => ckm::enforce(Op::FsWrite, index as u64),
+        None => 0,
+    }
 }
 
 /// stdin（fd=0）等待一个整行的最大 tick 数（PIT 100Hz → 3 秒）。
@@ -238,6 +318,12 @@ pub unsafe fn sys_write(args: &[u64; 5], space: *const UserSpace) -> i64 {
         log_errno("write", fd, vfs::EBADF);
         return vfs::EBADF;
     }
+    // 判定点 1（写受保护前缀）：fd 表里的路径才是权威路径
+    let errno = enforce_fd_write(fd);
+    if errno != 0 {
+        log_errno("write", fd, errno);
+        return errno;
+    }
     match fdtable::write(fd, bytes) {
         Ok(n) => {
             log_write(fd, n);
@@ -273,6 +359,19 @@ pub unsafe fn sys_open(args: &[u64; 5], space: *const UserSpace) -> i64 {
             return vfs::EINVAL;
         }
     };
+
+    // 判定点 1（能力，EPERM）+ v1.0 mode 判定（EACCES）：都在分配 fd 之前
+    let errno = enforce_open(path, flags);
+    if errno != 0 {
+        serial::print("user: open path=");
+        serial::print(path);
+        serial::print(" flags=");
+        serial::print_hex(flags as u64);
+        serial::print(" errno=");
+        serial::print_dec(errno.unsigned_abs());
+        serial::println("");
+        return errno;
+    }
 
     match fdtable::open(path, flags) {
         Ok(fd) => {

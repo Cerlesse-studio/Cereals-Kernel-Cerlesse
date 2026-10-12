@@ -175,6 +175,9 @@ pub unsafe fn sys_fork(_args: &[u64; 5], _space: *const UserSpace) -> i64 {
     };
     let parent_slot = parent.slot;
     let parent_pid = parent.pid;
+    // 凭证沿袭：`fork` 不增加能力（`docs/ckm.md` 3.2 的「能力不可继承性提升」）。
+    // 这里先拷一份到局部量，避免在 `process::create` 读写进程表时继续持有父进程引用。
+    let parent_cred = parent.cred;
     let child_space = {
         let Some(space) = parent.space.as_ref() else {
             return -38;
@@ -203,6 +206,7 @@ pub unsafe fn sys_fork(_args: &[u64; 5], _space: *const UserSpace) -> i64 {
         .expect("free_slot 返回的槽位必然空闲");
     child.frame = frame;
     child.space = Some(child_space);
+    child.cred = parent_cred;
 
     serial::print("user: fork parent=");
     serial::print_dec(parent_pid);
@@ -271,6 +275,28 @@ pub unsafe fn sys_exec(args: &[u64; 5], space: *const UserSpace) -> i64 {
         }
     }
 
+    // 2.5 判定点 7（`docs/ckm.md` 3.4）：程序文件必须**可读**（mode → `EACCES`）。
+    //     读程序文件不需要任何能力位，因此这里**不**调能力判定；
+    //     "`execve` 到受保护前缀的程序是否有额外限制" 的答案是“没有”（受保护前缀约束的是**写**）。
+    //     先拿一份当前凭证：凭证切换要在“旧身份发起”的语义下记录（见下）。
+    let parent_cred = crate::ckm::api::current_cred();
+    if let Ok(meta) = vfs::stat(&path) {
+        if let Err(errno) = crate::security::permission::check(
+            meta.mode,
+            meta.uid,
+            meta.gid,
+            &parent_cred,
+            crate::security::permission::Want::Read,
+        ) {
+            serial::print("fs: EACCES path=");
+            serial::print(&path);
+            serial::print(" uid=");
+            serial::print_dec(parent_cred.uid as u64);
+            serial::println(" want=read (execve)");
+            return errno;
+        }
+    }
+
     // 3. 读 ELF 字节（还没动当前映像）
     let Ok(elf) = vfs::read_all(&path) else {
         serial::print("user: exec ");
@@ -296,6 +322,21 @@ pub unsafe fn sys_exec(args: &[u64; 5], space: *const UserSpace) -> i64 {
     // 5. 替换映像。**先切 CR3 再丢弃旧地址空间** —— 顺序反了就是释放掉自己
     //    正在使用的页表。
     let new_root = new_space.root();
+    // 凭证：命中 CKM 组件表（`/init`、`/bin/sh`、`/bin/hello`）则换成该组件声明的
+    // uid/gid/能力，其余完全沿袭父进程（`docs/ckm.md` 3.1）。
+    // 在 `process_mut` 之前算：`exec_cred` 内部要读进程表（pid）与写审计/证据。
+    let new_cred = crate::ckm::api::exec_cred(&path, parent_cred);
+    if new_cred != parent_cred {
+        serial::print("ckm: credential switch pid=");
+        serial::print_dec(process::process_mut(slot).map(|p| p.pid).unwrap_or(0));
+        serial::print(" uid=");
+        serial::print_dec(parent_cred.uid as u64);
+        serial::print(" -> ");
+        serial::print_dec(new_cred.uid as u64);
+        serial::print(" caps=");
+        serial::print_hex(new_cred.caps as u64);
+        serial::println("");
+    }
     let old_space;
     {
         let p = process::process_mut(slot).expect("当前进程存在");
@@ -304,6 +345,7 @@ pub unsafe fn sys_exec(args: &[u64; 5], space: *const UserSpace) -> i64 {
         // `ps` 看到的是程序名（`ls`），不是 `"exec"` —— `comm` 是定长字段，
         // 因此这里能安全地指向用户给的路径（不需要把 String 泄漏成 `&'static str`）。
         p.set_comm(path.rsplit('/').next().unwrap_or(&path));
+        p.cred = new_cred;
         old_space = p.space.replace(new_space);
     }
     unsafe { cpu::write_cr3(new_root) };

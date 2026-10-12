@@ -161,6 +161,19 @@ pub fn open(path: &str, flags: i32) -> Result<i32, i64> {
     })
 }
 
+/// 取某个已打开 fd 的路径（**克隆**一份，不把 fd 表借给调用方）。
+///
+/// 用途：`syscall/file.rs` 在 `write` 时要按**这个 fd 的路径**做受保护前缀判定
+/// （判定点 1 里「write 到已打开文件」的那一半），而路径状态在 fd 表里。
+/// 克隆是刻意的：判定会打串口/写审计，不应在持有 fd 表的情况下做。
+pub fn path_of(fd: i32) -> Option<String> {
+    with_table(|t| {
+        t.slots
+            .get(fd as usize)
+            .and_then(|slot| slot.as_ref().map(|h| h.path.clone()))
+    })
+}
+
 /// `read(fd, buf)`：从当前偏移读入 `buf`，推进偏移。
 pub fn read(fd: i32, buf: &mut [u8]) -> Result<usize, i64> {
     with_table(|t| {

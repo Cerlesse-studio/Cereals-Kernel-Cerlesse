@@ -181,6 +181,7 @@ unsafe fn run_process(
     name: &'static str,
     pid: u64,
     source: &'static str,
+    cred: crate::security::Cred,
     space: UserSpace,
     frame: UserFrame,
 ) -> Result<(), &'static str> {
@@ -191,6 +192,17 @@ unsafe fn run_process(
     let p = process::create(slot, pid, name, 0, NO_PROCESS).ok_or("user: process slot busy")?;
     p.frame = frame;
     p.space = Some(space);
+    // 顶层程序的初始凭证（CKM-1）：组件表登记过的（`/init`、`/bin/sh`）用组件声明的
+    // uid/gid/能力，其余用最小权限。这一行证据说明「内核直接运行的程序是什么身份」，
+    // 它与 `execve` 路径上的 `exec_component` 判定行是两条互补的证据。
+    p.cred = cred;
+    serial::print("ckm: program path=");
+    serial::print(name);
+    serial::print(" uid=");
+    serial::print_dec(cred.uid as u64);
+    serial::print(" caps=");
+    serial::print_hex(cred.caps as u64);
+    serial::println("");
     // 顶层程序一旦被运行就是 RUNNING（`create` 给的是 READY）——
     // `user/ps` 读的就是这个字段，不撒谎。
     p.state = crate::process::process::ProcState::Running;
@@ -261,7 +273,9 @@ fn run_from_vfs(name: &'static str, path: &'static str, pid: u64) -> Result<(), 
     // 顶层程序的 argv 就是它自己（`argv[0] = path`）—— 与外部程序走的是同一条路
     let frame = crate::syscall::process::user_frame_for(&space, stats.entry, &[path.as_bytes()])
         .map_err(|_| "user: argv stack build failed")?;
-    unsafe { run_process(name, pid, "elf", space, frame) }
+    // 初始凭证来自 CKM 组件表（`docs/ckm.md` 3.1 的固定主体划分）。
+    let cred = crate::ckm::api::program_cred(path);
+    unsafe { run_process(name, pid, "elf", cred, space, frame) }
 }
 
 /// 运行内嵌的手写机器码（隔离探针）。
@@ -280,7 +294,8 @@ fn run_raw(name: &'static str, code: &'static [u8], pid: u64) -> Result<(), &'st
     serial::println("");
 
     let frame = UserFrame::new_user(entry, USER_STACK_TOP, 0, 0);
-    unsafe { run_process(name, pid, "asm", space, frame) }
+    // 手写机器码（隔离探针）没有组件表项：按最小权限（普通用户）启动。
+    unsafe { run_process(name, pid, "asm", crate::security::Cred::plain(), space, frame) }
 }
 
 /// 读回用户程序写的文件（`/tmp/hello.txt`），证明用户态 `write` 真的落到了 RAMFS。
