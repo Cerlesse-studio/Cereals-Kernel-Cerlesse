@@ -1,11 +1,13 @@
 # Cerlesse OS 包管理器设计提案（H-06）
 
 - 阶段：跨阶段 / 主机侧能力（H-06；不阻塞 v0.1–v0.8 内核主线）
-- 最后更新：2026-10-11
-- 状态：🟡 **提案 v1 + P0a 已落地** —— 设计规格（格式/安全模型/事务语义/CLI/验收）已定；
-  **包容器 `.ckc`（CKC = Cerlesse Kernel Container）与打包/校验规则已实现**：
-  `tools/pkgmgr/ckc.py` + `make test-pkg`（37 项，含 `tar` 独立复核）；
-  事务/receipt/catalog（P0b）与内核侧接入（P1）仍待做，见第 11 节
+- 最后更新：2026-10-12
+- 状态：🟡 **提案 v1 + P0a/P0b 已落地** —— 设计规格（格式/安全模型/事务语义/CLI/验收）已定；
+  **包容器 `.ckc`（P0a）与事务引擎（P0b = CKM-3）都已实现**：
+  `tools/pkgmgr/ckc.py`（`pack`/`verify`/`info`）+ `tools/pkgmgr/cpm.py`
+  （`init`/`add`/`remove`/`rollback`/`status`/`ls`/`verify`/`plan`/`apply`/`recover`/`gc`）；
+  `make test-pkg` = `test-ckc`（37 项）+ `test-cpm`（**63 项**），两份都含独立复核；
+  catalog 签名/`trust`（开放问题 13.1 未定夺）与内核侧接入（P1）仍待做，见第 11 节（P0b 落地清单见 11.1）
 - 关联：**[ckm.md](./ckm.md)（CKM 设计提案：本文的 P0b 事务/回执/签名 = CKM 阶段 3，用户态 `cpm` 合并进 `ckm pkg`；内核侧消费点由 CKM 的 `ckm_component_state` + 状态树提供）** ·
   [DEVELOPMENT.md](../DEVELOPMENT.md)（H-06 需求行）· [docs/README.md](./README.md)（索引）·
   [docs/filesystem.md](./filesystem.md)（VFS/RAMFS/FAT 现状）· [docs/syscall.md](./syscall.md)（用户程序约束）·
@@ -191,7 +193,8 @@ payload 是**确定性未压缩 ustar**。规则必须全部满足，否则同�
 `pack` / `verify` / `info`，退出码与 9.2 一致；`make test-pkg`（`tests/test_ckc.py`）**37 项断言**通过，
 包括确定性、头部逐字段、payload 篡改、ustar 结构规则、打包期规则（超长路径/越界 target/setuid/重复 target/hooks），
 以及**独立复核**：用系统 `tar` 读同一段 payload，条目与内容必须与 `ckc.py` 一致（不是自己验自己）。
-仍未做（P0b）：catalog 签名、事务/receipt/store —— 见 11.1。
+**仍未做（P0b 的剩余面）**：catalog 签名与 `trust` 公钥管理（开放问题 13.1 未定夺，见 11.1）；
+事务/回执/store/`recover` 已随 P0b 落地（`tools/pkgmgr/cpm.py`）。
 
 ### 3.3 `catalog.toml` + `catalog.toml.sig` —— 渠道清单
 
@@ -563,14 +566,36 @@ user           : ~ /home/<user>
 - 校验：头部逐字段 + payload SHA-256 + ustar 结构（排序 / 首条目 / mtime / 补零 / 仅常规文件）；
 - 验收：`make test-pkg`（`tests/test_ckc.py`，**37 项**，含用系统 `tar` 的独立复核）。
 
-**P0b（待做）—— 事务、状态与目录**
+**P0b（已落地 2026-10-12）—— 事务、状态与目录**
 
-- `tools/pkgmgr/cpm.py`（事务/receipt/store/`gc`/`recover`，见 7、8 节）；
-- `catalog sign/verify`（Ed25519；纯 Python 实现或 `cryptography` 可选依赖，见 13.1 的开放问题）；
-- `add`/`remove`/`rollback`/`status`/`verify`/`plan`/`gc`/`recover`；
-- 事务日志 + 回滚 + 失败注入（用 `--fail-after <phase>` 这个测试专用开关注入失败，而不是靠真断电）；
-- 退出码按 9.2；`--json` 输出；
-- 验收目标：`make test-pkg` 扩到覆盖 12.1 里剩下的条目（catalog 签名/未知公钥/激活与回退/幂等/去重/原子失败/可恢复/并发/预算）。
+`tools/pkgmgr/cpm.py`（纯标准库）实现 7、8 节的事务与 6.4 的回收；权威落点：
+
+| 交付物 | 落点 |
+| ---- | ---- |
+| 目录骨架（`scopes/` · `store/sha256/` · `receipts/` · `txn/` · `cache/` · `catalog/` · `trust/`） | `cpm init` |
+| 回执（3.5，当前 + **上一修订** `.prev.toml`） | `cpm/{add,remove,rollback}` 原子写（临时文件 + `os.replace`） |
+| 事务日志（3.6，append-only、`seq` 单调、逐条 `fsync`） | `txn/<utc>-<pid>.jsonl`；前像在 `txn/<id>/<n>` |
+| 事务阶段 7.1（plan → stage → verify → activate → commit，可回滚） | `add`/`rollback`/`remove` 共用一套；**备份与 `activate` 记录都在写目标之前落日志**（WAL 顺序） |
+| 内容寻址 store + 文件级去重（4.4） | `store/sha256/<hex>`（同内容只存一份） |
+| 安装期重新校验（5.2 的路径白名单必须**在主机侧再跑一遍**） | `cpm` 调 `ckc.manifest_from_data` —— 「打包期检查过了」不是安装期的前提 |
+| 失败注入（测试开关） | `--fail-after <阶段>`（自动回滚、退出码 3）与 `--crash-after <阶段>`（硬退出、留未提交事务给 `recover`） |
+| `recover`（7.2 的「中断后可恢复」） | 扫描未提交事务并回滚；含**陈旧锁接管**（7.3） |
+| 单写者锁（7.3） | `<root>/cpm.lock`（pid + 起始时间；活着 ⇒ `ELOCK`，已死 ⇒ warn + 接管）；读者不加锁 |
+| `gc`（6.4） | `--dry-run` 先列出；回收无引用 blob、已提交/已回滚的日志与 `cache/` |
+| 退出码 9.2 / `--json` 输出 / `cpm: <verb> ...` 行前缀 | 全命令统一 |
+| 命令 | `init`/`add`/`remove`/`rollback`/`status`/`ls`/`verify`/`plan`/`apply`/`recover`/`gc`（`pack` 仍由 `ckc.py` 提供） |
+
+**仍未做（P0b 的剩余面）**：
+
+- `catalog sign/verify` 与 `trust add`（Ed25519；阻塞于开放问题 13.1「纯标准库没有 Ed25519」的定夺）；
+- `[requires]` 的依赖求解（4.5：目前只记录、不隐式安装）与镜像基线对接（P1）；
+- `--offline` 目前是「恒成立」的语义（本实现只读 store），将来接网络后它才成为真正的开关。
+
+**验收**：`make test-pkg`（= `test-ckc` 37 项 + `test-cpm` **63 项**，主机侧、不启 QEMU）。
+`test-cpm` 覆盖 12.1 里与签名/catalog 无关的条目：激活与状态、回退、离线回退、幂等、去重、
+原子失败、可恢复（含掉电）、路径越界（零写入）、特权位、hook 拒绝、并发、预算；
+其中「安装期重新校验」一条用了手工拼的**容器合法但 target 越出 scope** 的 `.ckc`，
+证明拒绝发生在写任何文件之前。
 
 > **与 CKM 的关系（2026-10-11）**：P0b 的交付物（事务、回执、catalog/签名、`recover`）就是
 > [CKM](ckm.md) 的 **CKM-3 阶段**，实现位置从 `tools/pkgmgr/` 延伸到 CKM Service（`userland/ckmd`）；
@@ -597,25 +622,26 @@ user           : ~ /home/<user>
 
 ### 12.1 P0 验收条目（全部可脚本断言，`make test-pkg`）
 
-`[x]` 的是 P0a 已落地并由 `make test-pkg`（37 项）断言的条目；`[ ]` 的属 P0b（见 11.1）。
+`[x]` 的是已落地并由 `make test-pkg`（`test-ckc` 37 + `test-cpm` 63 项）断言的条目；
+`[ ]` 的属 catalog/签名部分（P0b 剩余面，阻塞于开放问题 13.1）。
 
 - [x] **确定性**（已落地，`make test-pkg`）：同一目录树 `ckc.py pack` 两次，两个 `.ckc` 逐字节相同，`--print-rev` 输出相同；
 - [ ] **签名**：catalog 任一字节被改 ⇒ `verify` 失败（退出码 2），且错误信息指出是签名不符；
 - [ ] **未知公钥**：用未 `trust add` 的公钥签的 catalog ⇒ 拒绝（退出码 2），提示 `cpm trust add`；
 - [ ] **内容绑定**：把 catalog 里的 `rev` 改成另一个 `.ckc` 的 rev ⇒ 校验失败（退出码 2），不写任何文件；
 - [x] **blob 篡改**（已落地，`make test-pkg`）：`.ckc` 内一个字节被改 ⇒ 退出码 2，错误信息指出是 payload 摘要不符；
-- [ ] **激活与状态**：`add` 后 `status --json` 显示 `activated` + 正确 rev；`verify` 逐文件通过；
-- [ ] **回退**：`add` 新 rev → `rollback` → 文件内容逐字节等于上一 rev，`status` 的 rev 回到旧值；
-- [ ] **离线回退**：`rollback --offline` 成功（不触网）；
-- [ ] **幂等**：连续两次 `apply`，第二次对 scope **零写入**（日志含 `skip (already active)`）；
-- [ ] **去重**：两个包含相同文件的包安装后，store 中该内容只有一份（`gc --dry-run` 列出 0 项可回收）；
-- [ ] **原子失败**：`add --fail-after activate` ⇒ 退出码 3，scope 内文件恢复到事务前状态，无半成品 receipt；
-- [ ] **可恢复**：手工留下未 `commit` 的 `txn/` ⇒ `cpm recover` 回滚并报告；
-- [ ] **路径越界**：`userland` 包声明 `system` scope 的 target ⇒ `EINVAL`（退出码 1），**零文件写入**；
-- [ ] **特权位**：`mode = 0o4755` ⇒ 打包/安装都拒绝；
-- [ ] **hook 拒绝**：`hooks = true` ⇒ 拒绝；
-- [ ] **并发**：持有锁时并发写命令 ⇒ 退出码 5；`status` 在锁被持有时仍可用；
-- [ ] **预算**：`status` 不读 catalog（用 `strace`/README 里的检查或「删掉 catalog 后 status 仍成功」断言）；
+- [x] **激活与状态**（已落地，`make test-cpm`）：`add` 后 `status --json` 显示 `activated` + 正确 rev；`verify` 逐文件通过；
+- [x] **回退**（已落地，`make test-cpm`）：`add` 新 rev → `rollback` → 文件内容逐字节等于上一 rev，`status` 的 rev 回到旧值；
+- [x] **离线回退**（已落地，`make test-cpm`）：`rollback --offline` 成功（不触网）；
+- [x] **幂等**（已落地，`make test-cpm`）：连续两次 `apply`，第二次对 scope **零写入**（`st_mtime_ns` 未变，日志含 `already active`）；
+- [x] **去重**（已落地，`make test-cpm`）：两个包含相同文件的包安装后，store 中该内容只有一份（`gc --dry-run` 列出 0 项可回收）；
+- [x] **原子失败**（已落地，`make test-cpm`）：`add --fail-after activate` ⇒ 退出码 3，scope 内文件恢复到事务前状态，无半成品 receipt；
+- [x] **可恢复**（已落地，`make test-cpm`）：留下未 `commit` 的 `txn/`（`--crash-after` 模拟掉电）⇒ `cpm recover` 回滚并报告；
+- [x] **路径越界**（已落地，`make test-cpm`）：手工拼一个「容器合法但 target 越出 scope」的 `.ckc` ⇒ `EINVAL`（退出码 1），**零文件写入**；
+- [x] **特权位**（已落地，`make test-pkg`）：`mode = 0o4755` ⇒ 打包与安装期都拒绝；
+- [x] **hook 拒绝**（已落地，`make test-pkg`）：`hooks = true` ⇒ 拒绝；
+- [x] **并发**（已落地，`make test-cpm`）：持有锁时并发写命令 ⇒ 退出码 5；`status` 在锁被持有时仍可用；
+- [x] **预算**（已落地，`make test-cpm`）：删掉 `catalog/` 后 `status` 仍成功（不读 catalog、不扫 store）；
 - [ ] **catalog 上限**：> 1 MiB 的 catalog ⇒ `EFBIG`（退出码 4）。
 
 ### 12.2 与既有验收的关系
@@ -656,5 +682,6 @@ user           : ~ /home/<user>
 | 日期 | 变更 |
 | ---- | ---- |
 | 2026-10-07 | 新增本文档：提出一种高效、安全、轻量且具备类似 Windows 包管理器灵活性的包管理器设计方案，含意图驱动模型、安装区与事务回退、按需元数据、安全域边界等要点 |
+| 2026-10-12 | **P0b 落地（= CKM-3 事务引擎）**：新增 `tools/pkgmgr/cpm.py`（纯标准库）—— 目录骨架（`scopes`/`store/sha256`/`receipts`/`txn`/`cache`/`catalog`/`trust`）、回执（当前 + `.prev.toml`）、事务日志（`txn/<utc>-<pid>.jsonl`，append-only + `fsync`）、7.1 的 stage/verify/activate/commit + 逆序回滚、内容寻址 store 与文件级去重、`recover`（未提交事务回滚 + 陈旧锁接管）、`gc`、单写者锁、9.2 退出码与 `--json`；**安装期用 `ckc.manifest_from_data` 重跑域边界/路径白名单**（`tools/pkgmgr/ckc.py` 为此把 `load_manifest` 的校验体拆成可复用的 `manifest_from_data`，`make test-pkg` 的 37 项不变）；失败注入开关 `--fail-after <阶段>`（自动回滚、退出码 3）与 `--crash-after <阶段>`（硬退出 9、留未提交事务给 `recover`）；新增验收 `tests/test_cpm.py`（`make test-cpm`，**63 项**，含系统 `tar` 独立复核、逐字节回滚比对、越界包零写入）与 Makefile 目标 `test-pkg = test-ckc + test-cpm`、`test-cpm`；11.1 的 P0b 由「待做」改为落地清单，12.1 标记已落地条目；**仍未做**：catalog 签名/`trust`（开放问题 13.1）与 P1 内核侧接入 |
 | 2026-10-11 | **P0a 落地：`.ckc` 包容器（后缀定名 CKC）** —— 3.2 从「`.cpk` 裸 tar 设想」改写为容器规格：64 字节头（magic `CKC\x01` / 版本 / 头长 / flags / payload_len / payload_off / 32 字节 payload_sha256 / 保留位，小端）+ 确定性 ustar payload（归档名 = 目标路径去 `/`、`PKG.toml` 第一、其余按字节序、mtime/uid/gid 全 0、仅常规文件、补零为 0、不压缩）；身份 = **payload** 哈希；新增实现 `tools/pkgmgr/ckc.py`（纯标准库：`pack`/`verify`/`info` + 退出码 0/1/2/4 + `PKG.toml` 子集解析与 scope 白名单/setuid/超长路径等打包期规则）与验收 `tests/test_ckc.py`（`make test-pkg`，**37 项**：确定性、头部逐字段、payload 篡改、ustar 结构规则、打包期规则、系统 `tar` 独立复核）；11.1 拆成 P0a（已落地）/P0b（事务、catalog、receipt）；同步 docs/README.md 索引、DEVELOPMENT.md 的 H-06 行、README.md、tools/README.md、project-structure.md |
 | 2026-10-11 | **提案 v1（本版）**：把设想补成可实施的规格 —— 术语字段级定义（2）、七个制品格式（`PKG.toml`/`.cpk`/`catalog(+sig)`/`cpkg.toml`/receipt/journal/store，3）、内容标识与三级校验（4）、安全模型（信任根/域边界/**纯文件安装**/威胁对策表，5）、效率预算（6.3）、事务阶段与原子性边界（7）、scope 白名单与到内核现状的映射（8）、CLI 与退出码（9）、MVP 三期（11）、可脚本断言的验收条目（12.1）；同步更新索引状态（docs/README.md）与 DEVELOPMENT.md 的 H-06 行 |

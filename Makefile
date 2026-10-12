@@ -27,7 +27,7 @@ KERNEL_ELF := target/x86_64-unknown-none/debug/kernel
 USERLAND        := userland
 USERLAND_IMAGES := $(BUILD)/userland/images
 
-.PHONY: help build boot kernel kernel-nouserland image image-kernel image-exception image-pagefault fat-image storage-images run test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn dyn-hostcheck test-scheduler test-ipc test-fs test-user test-ckm test-ckm-store test-driver test-fat test-storage-fixtures test-storage test-storage-mbr test-network test-all user userland-images test-pkg go-test test-orch check-boundary check clean
+.PHONY: help build boot kernel kernel-nouserland image image-kernel image-exception image-pagefault fat-image storage-images run test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn dyn-hostcheck test-scheduler test-ipc test-fs test-user test-ckm test-ckm-store test-driver test-fat test-storage-fixtures test-storage test-storage-mbr test-network test-all user userland-images test-pkg test-ckc test-cpm go-test test-orch check-boundary check clean
 
 help:
 	@echo "targets:"
@@ -63,7 +63,9 @@ help:
 	@echo "  test-kernel-only - pure-kernel acceptance: boot + self-tests + diagnostic idle loop without userland"
 	@echo "  check-boundary - assert the kernel does not depend on userland (tools/check-boundary.py)"
 	@echo "  check   - host-side gate: check-boundary + go-test"
-	@echo "  test-pkg - H-06: assert the .ckc package container (CKC) format + packaging rules (host-side)"
+	@echo "  test-pkg - H-06: assert the .ckc container (P0a) + the cpm transaction engine (P0b / CKM-3), host-side"
+	@echo "  test-ckc - H-06 P0a: .ckc container format + packaging rules (host-side)"
+	@echo "  test-cpm - H-06 P0b = CKM-3: add/rollback/recover/gc transaction engine (host-side)"
 	@echo "  test-all - run every integration test"
 
 	@echo "  go-test  - v0.4 H-04/H-05: Go unit tests for tools-go (host side)"
@@ -963,17 +965,31 @@ userland-images:
 # 兼容 v0.9 的旧名字（当时 `make user` 在内核 workspace 里构建用户程序）。
 user: userland-images
 
-# H-06 P0a 验收：CKC 包容器（后缀 `.ckc`）。**主机侧、不启 QEMU、纯标准库**：
+# H-06 包管理器验收（**主机侧、不启 QEMU、纯标准库**）：两份套件，对应 P0a 与 P0b。
 #
-# 断言的是容器与打包规则本身（详见 tools/pkgmgr/ckc.py 的模块文档）：
-#   - 确定性：同一目录树两次打包逐字节相同、rev 相同；
-#   - 头部逐字段：magic/版本/头长/flags/payload_off/payload_len/保留位，改任一处 → 退出码 2；
-#   - 内容哈希：翻 payload 一个字节 → 退出码 2；
-#   - ustar 结构：条目未排序 / PKG.toml 不在第一 / 非零 mtime / 非零补零 / 符号链接 → 2；
-#   - 打包期规则：超长路径（ENAMETOOLONG）/目标越出 scope/setuid/重复 target/hooks/… → 1；
-#   - 独立复核：系统 `tar` 读同一段 payload，条目与内容必须与 ckc.py 一致（不是自己验自己）。
-test-pkg:
+#   1. `test-ckc`（P0a，`tools/pkgmgr/ckc.py`）—— 容器与打包规则本身：
+#      - 确定性：同一目录树两次打包逐字节相同、rev 相同；
+#      - 头部逐字段：magic/版本/头长/flags/payload_off/payload_len/保留位，改任一处 → 退出码 2；
+#      - 内容哈希：翻 payload 一个字节 → 退出码 2；
+#      - ustar 结构：条目未排序 / PKG.toml 不在第一 / 非零 mtime / 非零补零 / 符号链接 → 2；
+#      - 打包期规则：超长路径（ENAMETOOLONG）/目标越出 scope/setuid/重复 target/hooks/… → 1；
+#      - 独立复核：系统 `tar` 读同一段 payload，条目与内容必须与 ckc.py 一致（不是自己验自己）。
+#   2. `test-cpm`（**P0b = CKM-3 事务引擎**，`tools/pkgmgr/cpm.py`）—— 事务/回执/回滚/恢复：
+#      - 成功路径：落地文件逐字节等于包内内容、回执 rev = `.ckc` payload 哈希、`verify` 通过；
+#      - 幂等：重复 `add`/`apply` 命中 `already active` ⇒ 零写入（`st_mtime_ns` 断言）；
+#      - 原子失败：`add --fail-after activate` ⇒ 退出码 3，文件逐字节回到事务前且无半成品回执；
+#      - 掉电与恢复：`--crash-after activate` 硬退出 9 留下未提交事务 ⇒ `cpm recover` 回滚（含陈旧锁接管）；
+#      - 回退：`rollback --offline` 回到上一修订（纯本地）；
+#      - 篡改检出与自愈：`verify` 退出码 2，同修订重装通过且修订历史不被挤掉；
+#      - 安装期重新校验：手工拼的「容器合法但 target 越出 scope」的包被拒且**零文件写入**；
+#      - 去重 / 并发锁（写命令 5、读者不受影响）/ 卸载保留配置 / 退出码档位。
+test-pkg: test-ckc test-cpm
+
+test-ckc:
 	$(PYTHON) tests/test_ckc.py
+
+test-cpm:
+	$(PYTHON) tests/test_cpm.py
 
 # 边界门禁（docs/pure-kernel.md 阶段二）：内核不得依赖用户态 ——
 # 不得嵌套调用 cargo/as/ld、不得内嵌用户态字节、不得依赖用户态包。

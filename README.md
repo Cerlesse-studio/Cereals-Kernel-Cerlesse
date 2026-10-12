@@ -118,7 +118,7 @@ root@cerlesse C:>
 | `make test-dyn` / `make dyn-hostcheck` | 内核侧最小动态链接 / 同一批夹具交给宿主机 glibc `ld.so` 复核 |
 | `make test-storage` / `make test-storage-mbr` | GPT / MBR 分区镜像的卷枚举（`storage_volumes`）+ VFS 收口（卷身份上挂载点、多挂载点、卸载）+ 主机侧夹具复核 |
 | `make check` / `make check-boundary` | 主机侧门禁（边界 + Go 单测）/ 内核不得依赖用户态 |
-| `make test-orch` / `make test-pkg` | 19 个场景并行编排 / CKC 包容器 `.ckc`（主机侧，不启 QEMU） |
+| `make test-orch` / `make test-pkg` | 19 个场景并行编排 / 包管理器（主机侧，不启 QEMU）：`.ckc` 容器（`test-ckc` 37 项）+ **事务引擎 `cpm`（`test-cpm` 63 项）** |
 
 其余目标（`image-kernel`、`userland-images`、`fat-image`、`go-test` 等）及其输出含义见 [DEVELOPMENT.md](DEVELOPMENT.md) 与 [docs/api.md](docs/api.md)。
 
@@ -143,7 +143,7 @@ tests/     QEMU 集成测试与编排    docs/      开发文档（每个子系�
 | [docs/syscall.md](docs/syscall.md) · [docs/process.md](docs/process.md) | 系统调用与用户态 / 进程、调度、IPC |
 | [docs/filesystem.md](docs/filesystem.md) · [docs/drivers.md](docs/drivers.md) | VFS、RAMFS、FAT / 驱动框架、PCI、virtio、网络栈 |
 | [docs/roadmap.md](docs/roadmap.md) · [docs/desktop.md](docs/desktop.md) | 路线图 / v1.0 之后的桌面环境兼容路线 |
-| [docs/ckm.md](docs/ckm.md) · [docs/package-manager.md](docs/package-manager.md) | CKM（内核级权限控制与扩展管理）规划：权限模型、内核接口、扩展生命周期 / `.ckc` 包格式与事务 |
+| [docs/ckm.md](docs/ckm.md) · [docs/package-manager.md](docs/package-manager.md) | CKM（内核级权限控制与扩展管理）：权限模型、内核接口、扩展生命周期（CKM-1/2/3 已落地） / `.ckc` 包格式（P0a）与事务引擎 `cpm`（P0b = CKM-3） |
 | [docs/storage.md](docs/storage.md) | CSS（存储管理）规划：卷模型与稳定标识、Windows 式盘符 + Linux 式挂载双视图、VFS 收口（**CSS-1/CSS-2 已落地**）、与 CKM 的权限/持久化对接 |
 
 ## 当前状态
@@ -161,6 +161,11 @@ Cerlesse Kernel + CKM 内核控制核心 + CKM 用户态管理服务 + 可插拔
 内核只提供强制权限与组件状态机制（CKM Core），扩展安装/事务/修复由持权的用户态服务完成，
 系统文件通过可撤销的覆盖层修改 —— 分层思路参考 KernelSU，但不照搬 Android 的 root 机制；
 第一版**不做**动态内核模块装载与图形界面。
+
+**已落地 CKM-1（内核接口 + 判定点 + syscall 257–259）、CKM-2（双槽 A/B 可写状态区 + 覆盖层机制）
+与 CKM-3（事务引擎，主机侧 `tools/pkgmgr/cpm.py`）**：回执、事务日志、`stage → activate → commit`
+可回滚、掉电后 `recover`、`gc` 与单写者锁都已可脚本断言（`make test-ckm` / `make test-cpm`）；
+CKM-4（`ckmd`/`ckm`）起把事务接进内核侧用户态服务。
 
 存储侧有一条并列的路线（[CSS 存储管理提案](docs/storage.md)）：**像 Windows 一样管理磁盘与卷**
 （盘符、卷标、稳定卷标识、多挂载点），**像 Linux 一样通过统一 VFS 兼容多种文件系统**
