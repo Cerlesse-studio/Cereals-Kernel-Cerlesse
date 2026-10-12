@@ -6,15 +6,28 @@
 //! - [`sys_storage_volumes`] 是**只读**查询，不需要任何能力位（CKM 的只读面
 //!   同样如此，见 `docs/storage.md` 6.2）；写入的条数受 `buf_len` 限制，装不下
 //!   就截断（每条记录仍然完整）——`out_count_ptr` 用来问「总共有多少条」；
-//! - [`sys_storage_rescan`] 是**受控动作**：CKM-1 起要求
+//! - [`sys_storage_rescan`] / [`sys_storage_mount`] / [`sys_storage_unmount`] /
+//!   [`sys_storage_assign_letter`] 都是**受控动作**：CKM-1 起要求
 //!   `CAP_STORAGE_ADMIN`（`docs/ckm.md` 3.4 判定点 8），拒绝时返回 `-EPERM`
-//!   并留下审计 + 串口证据。挂载/卸载/盘符（262/263/264）的行为归 CSS-3，
-//!   它们现在仍落在 ENOSYS 桩上，因此那三个动作的判定点 8 也在 CSS-3 才接上
-//!   （本文件的 [`sys_storage_rescan`] 是这条判定点已经生效的那一半）。
+//!   并留下审计 + 串口证据。
+//!
+//! CSS-3 把 262/263/264 从 ENOSYS 桩上拿下来（`docs/storage.md` 6.3）：
+//!
+//! | 号 | 调用 | 行为 | 失败语义 |
+//! | ---- | ---- | ---- | ---- |
+//! | 262 | `storage_mount` | 把卷挂到路径（已挂载的卷 → 只加别名，**不重开设备**） | `ENOENT` 卷不存在 / `ENOTSUP` 没后端 / `EEXIST` 挂载点重复 |
+//! | 263 | `storage_unmount` | 卸掉别名，卷仍在卷表里 | `ENOENT` 不是挂载点 / `EINVAL` 卸根 |
+//! | 264 | `storage_assign_letter` | 分配/取消盘符（`0` = 回到缺省规则） | `EEXIST` 字母被占 / `EINVAL` 非法字母 |
+//!
+//! 参数校验（长度、保留位、指针）**先于**能力判定：拒绝必须发生在副作用之前，
+//! 但「参数不合法」与「没有权限」是两回事，顺序反了会让 `EINVAL` 变成 `EPERM`。
+
+use alloc::string::String;
 
 use crate::ckm::api as ckm;
 use crate::ckm::policy::Op;
 use crate::driver::serial;
+use crate::fs::vfs::MountOptions;
 use crate::storage::registry;
 use crate::storage::volume::VOLUME_RECORD_SIZE;
 use crate::syscall::address_space::UserSpace;
@@ -126,5 +139,173 @@ pub unsafe fn sys_storage_rescan(args: &[u64; 5], _space: *const UserSpace) -> i
             count as i64
         }
         Err(_) => EIO,
+    }
+}
+
+// ---- CSS-3：挂载/卸载/盘符（262/263/264，`docs/storage.md` 6.3）----
+
+/// 用户态字符串的长度上限（路径/卷标识都在 15–128 字节量级；超长一律 `EINVAL`）。
+const STR_MAX: usize = 128;
+
+/// 从用户态拷一个字符串（校验指针与 UTF-8；零长度也算 `EINVAL`）。
+unsafe fn user_str(
+    space: *const UserSpace,
+    ptr: u64,
+    len: u64,
+    tag: &'static str,
+) -> Result<String, i64> {
+    if len == 0 || len as usize > STR_MAX {
+        return Err(EINVAL);
+    }
+    let bytes = match unsafe { crate::syscall::file::user_bytes(space, ptr, len, tag) } {
+        Ok(bytes) => bytes,
+        Err(errno) => return Err(errno),
+    };
+    match core::str::from_utf8(bytes) {
+        Ok(text) if !text.is_empty() => Ok(String::from(text)),
+        _ => Err(EINVAL),
+    }
+}
+
+/// 系统调用 `storage_mount(vol_id_ptr, vol_id_len, point_ptr, point_len, flags)`（262）。
+///
+/// `flags` bit0 = 只读挂载（→ 只读原因 `ro-mount`，`docs/storage.md` 3.5），
+/// 其余位一律 `EINVAL`（未知标志不静默忽略：那是「明明要只读却写了」的来源）。
+/// 已挂载的卷再加挂载点只加**别名**（同一份数据，CSS-2 的 `alias_volume`），
+/// 因此「两个入口不是两份数据」在这条路径上也成立。
+pub unsafe fn sys_storage_mount(args: &[u64; 5], space: *const UserSpace) -> i64 {
+    let (vol_ptr, vol_len, point_ptr, point_len, flags) =
+        (args[0], args[1], args[2], args[3], args[4]);
+    if flags & !1 != 0 {
+        return EINVAL;
+    }
+    let vol_id = match unsafe { user_str(space, vol_ptr, vol_len, "storage_mount") } {
+        Ok(text) => text,
+        Err(errno) => return errno,
+    };
+    let point = match unsafe { user_str(space, point_ptr, point_len, "storage_mount") } {
+        Ok(text) => text,
+        Err(errno) => return errno,
+    };
+
+    // 判定点 8：挂载是受控动作（`CAP_STORAGE_ADMIN`）。参数合法之后、动任何状态之前。
+    let errno = ckm::enforce(Op::StorageMount, flags);
+    if errno != 0 {
+        serial::print("user: storage_mount vol=");
+        serial::print(&vol_id);
+        serial::print(" point=");
+        serial::print(&point);
+        serial::println(" -> EPERM (need CAP_STORAGE_ADMIN)");
+        return errno;
+    }
+
+    let options = if flags & 1 != 0 { MountOptions::RO } else { MountOptions::RW };
+    match crate::fs::mount_volume_by_id(&vol_id, &point, options) {
+        Ok(()) => {
+            serial::print("user: storage_mount vol=");
+            serial::print(&vol_id);
+            serial::print(" point=");
+            serial::print(&point);
+            serial::print(" ro=");
+            serial::println(if options.read_only { "ro-mount" } else { "rw" });
+            0
+        }
+        Err(errno) => {
+            serial::print("user: storage_mount vol=");
+            serial::print(&vol_id);
+            serial::print(" point=");
+            serial::print(&point);
+            serial::print(" -> errno=");
+            serial::print_dec(errno.unsigned_abs());
+            serial::println("");
+            errno
+        }
+    }
+}
+
+/// 系统调用 `storage_unmount(point_ptr, point_len, 0, 0, 0)`（263）。
+///
+/// 卸载的是**别名**：卷仍在卷表里（`mount_count` 减一），再次挂载不需要重新探测
+/// 设备。卸下加载点 `/` 返回 `EINVAL`（那是系统唯一的根文件系统）。
+pub unsafe fn sys_storage_unmount(args: &[u64; 5], space: *const UserSpace) -> i64 {
+    let (point_ptr, point_len, a, b, c) = (args[0], args[1], args[2], args[3], args[4]);
+    if a != 0 || b != 0 || c != 0 {
+        return EINVAL;
+    }
+    let point = match unsafe { user_str(space, point_ptr, point_len, "storage_unmount") } {
+        Ok(text) => text,
+        Err(errno) => return errno,
+    };
+
+    // 判定点 8：卸载同为受控动作
+    let errno = ckm::enforce(Op::StorageUnmount, 0);
+    if errno != 0 {
+        serial::print("user: storage_unmount point=");
+        serial::print(&point);
+        serial::println(" -> EPERM (need CAP_STORAGE_ADMIN)");
+        return errno;
+    }
+
+    match crate::fs::unmount_point(&point) {
+        Ok(()) => {
+            serial::print("user: storage_unmount point=");
+            serial::print(&point);
+            serial::println("");
+            0
+        }
+        Err(errno) => {
+            serial::print("user: storage_unmount point=");
+            serial::print(&point);
+            serial::print(" -> errno=");
+            serial::print_dec(errno.unsigned_abs());
+            serial::println("");
+            errno
+        }
+    }
+}
+
+/// 系统调用 `storage_assign_letter(vol_id_ptr, vol_id_len, letter, 0, 0)`（264）。
+///
+/// `letter` 是 ASCII（`'A'..='Z'`）；`0` 表示**取消自定义映射、回到缺省规则**
+/// （不是「没有盘符」—— 缺省规则会立刻补一个）。字母被别的卷占着 -> `EEXIST`。
+/// 映射写进 CKM 状态区（`storage/letters`），因此重启后字母不变。
+pub unsafe fn sys_storage_assign_letter(args: &[u64; 5], space: *const UserSpace) -> i64 {
+    let (vol_ptr, vol_len, letter, a, b) = (args[0], args[1], args[2], args[3], args[4]);
+    if a != 0 || b != 0 || letter > u8::MAX as u64 {
+        return EINVAL;
+    }
+    let vol_id = match unsafe { user_str(space, vol_ptr, vol_len, "storage_assign_letter") } {
+        Ok(text) => text,
+        Err(errno) => return errno,
+    };
+
+    // 判定点 8：改字母表是受控动作（与挂载同一能力位，但它是**持久化**动作）
+    let errno = ckm::enforce(Op::StorageLetter, letter);
+    if errno != 0 {
+        serial::print("user: storage_assign_letter vol=");
+        serial::print(&vol_id);
+        serial::println(" -> EPERM (need CAP_STORAGE_ADMIN)");
+        return errno;
+    }
+
+    match registry::assign_letter(&vol_id, letter as u8) {
+        Ok(()) => {
+            serial::print("user: storage_assign_letter vol=");
+            serial::print(&vol_id);
+            serial::print(" letter=");
+            serial::print(crate::storage::letters::ascii(&(letter as u8)));
+            serial::print(" -> letter=");
+            serial::print(crate::storage::letters::ascii(&registry::letter_of(&vol_id)));
+            serial::println("");
+            0
+        }
+        Err(errno) => {
+            serial::print("user: storage_assign_letter vol=");
+            serial::print(&vol_id);
+            serial::print(" -> errno=");
+            serial::print_dec(errno.unsigned_abs());
+            serial::println("");
+            errno
+        }
     }
 }

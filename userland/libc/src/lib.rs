@@ -52,6 +52,7 @@
 pub mod args;
 pub mod console;
 pub mod heap;
+pub mod path;
 pub mod syscall;
 
 pub use crate::args::{arg, arg_str, argc, Args};
@@ -63,8 +64,9 @@ pub use crate::syscall::{
     component_kind, component_kind_name, component_priority, component_state, component_state_name,
     component_version_code, dirent_is_dir, dirent_name, dirent_size, execve, exit, fork, getdents,
     getpid, getprocs, mmap, mprotect, munmap, nanosleep, open, procinfo_name, procinfo_pid,
-    procinfo_ppid, procinfo_state, read, storage_rescan, storage_volumes, volume_disk,
-    volume_free_bytes, volume_fs, volume_health, volume_id, volume_label, volume_label_truncated,
+    procinfo_ppid, procinfo_state, read, storage_assign_letter, storage_mount, storage_rescan,
+    storage_unmount, storage_volumes, volume_disk, volume_free_bytes, volume_fs, volume_health,
+    volume_id, volume_label, volume_label_truncated, volume_letter, volume_letter_str,
     volume_mounts, volume_part, volume_read_only, volume_total_bytes, wait4, write, ARG_MAX,
     AUDIT_RECORD_SIZE, CAP_AUDIT_READ, CAP_CKM_ADMIN, CAP_CKM_SERVICE, CAP_FS_SYSTEM_WRITE,
     CAP_STORAGE_ADMIN, CAP_STORAGE_FORMAT, CKM_ABI_VERSION, CKM_OP_AUDIT_READ, CKM_OP_EXEC_COMPONENT,
@@ -76,8 +78,12 @@ pub use crate::syscall::{
     EAGAIN, EBADF, ECHILD, EFAULT, EISDIR, EINVAL, ENOENT, ENOMEM, ENOSPC, ENOSYS, EPERM,
     MAP_ANONYMOUS, MAP_PRIVATE, MAX_COMPONENTS, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY,
     PROCINFO_NAME_MAX, PROCINFO_SIZE, PROT_EXEC, PROT_NONE, PROT_READ, PROT_WRITE, STDERR, STDIN,
-    STDOUT, STORAGE_RESCAN_ALL, VOLUME_FREE_UNKNOWN, VOLUME_LABEL_MAX, VOLUME_RECORD_SIZE,
+    STDOUT, STORAGE_LETTER_NONE, STORAGE_MOUNT_RDONLY, STORAGE_RESCAN_ALL, VOLUME_FREE_UNKNOWN,
+    VOLUME_LABEL_MAX, VOLUME_RECORD_SIZE,
 };
+
+// CSS-3：Windows 式路径（`C:\x`）→ POSIX 路径的重写。用户程序用 `libc::path::resolve`。
+pub use crate::path::{is_windows, resolve as resolve_windows_path, resolve_str};
 
 /// 卷表缓冲的默认容量（内核 `storage::MAX_VOLUMES` = 16 条）。
 pub const MAX_VOLUMES: usize = 16;

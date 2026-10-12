@@ -18,8 +18,10 @@
   + 独立恢复环境（分层借鉴 KernelSU，但不照搬 Android root 机制），见 [ckm.md](ckm.md)；
   同日再加 **「CSS 存储管理系统」（v1.0 之后，与 CKM 同期）**：磁盘→分区→卷→盘符/挂载点，
   Windows 式盘符 + Linux 式统一 VFS，见 [storage.md](storage.md)；
-  **同日 CSS-1（底层识别）与 CSS-2（VFS 收口）均已落地**（GPT/MBR 只读扫描 + `storage_volumes`/`storage_rescan`
-  + 挂载表带卷身份/多挂载点/卸载 + 挂载错误改 errno + `make test-storage`），余下 CSS-3…CSS-6 规划中）
+  **CSS-1（底层识别）与 CSS-2（VFS 收口）已落地，CSS-3（盘符）也于 2026-10-12 大部分落地**
+  （GPT/MBR 只读扫描 + `storage_volumes`/`storage_rescan` + 挂载表带卷身份/多挂载点/卸载 + 挂载错误改 errno
+  + 盘符表/`storage_mount`/`unmount`/`assign_letter` + `libc` 的 `C:\` 重写 + `make test-storage`），
+  CSS-4…CSS-6 与 CSS-3 剩余（状态树/卷标写）规划中）
 
 > 本文档顶部保留阶段/最后更新/状态字段，与项目文档维护约定对齐。
 
@@ -118,9 +120,14 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 10. **第十阶段（v0.9 之后，进行中；执行上排在第九阶段之前）**：纯内核化边界收敛 —— 内核只提供机制，
     用户态已拆到独立 workspace `userland/`（阶段二/四 ✅、阶段五 🟡；阶段一/三/六 未做），
     见 [pure-kernel.md](pure-kernel.md)（含第 8 节执行记录）。
-11. **第十一阶段（v1.0 之后，规划）**：CKM 内核级权限控制与扩展管理 —— CKM Core（内核）/
+11. **第十一阶段（v1.0 之后，进行中）**：CKM 内核级权限控制与扩展管理 —— CKM Core（内核）/
     CKM Service（`ckmd`）/ CKM Manager（`ckm`）/ 覆盖层 / 恢复环境，分 CKM-1…CKM-7；
     第一版不做动态内核模块装载与 GUI，见 [ckm.md](ckm.md)。
+    **CKM-1（内核接口）已于 2026-10-12 落地**：`kernel/src/ckm/`（`cred`/`policy`/`state`/`audit`/`api`）+
+    v1.0 `security/`（uid/gid + mode）+ syscall `257`/`258`/`259` + 判定点 1/3/5/6 的落点与证据。
+    **CKM-2（可写持久化 + 覆盖层机制）同日落地**：系统盘尾部 1 MiB 的**双槽 A/B + CRC32 状态区**
+    （`ckm/store.rs`，开放问题 1 取 (b)）与覆盖层注册表 + 路径改写钩子（`ckm/overlay.rs` + `fs::mount::resolve`），
+    验收为 `make test-ckm`（40 断言）与 `make test-ckm-store`（跨重启：写 → 重启 → 读回）。
 12. **第十二阶段（v1.0 之后，进行中；与第十一阶段同期）**：CSS 存储管理 —— 分区扫描 / 卷与稳定标识 /
     盘符与多挂载点 / 可写文件系统 / `ckm storage` 界面，分 CSS-1…CSS-6；第一版不写分区表、
     **文件系统后端编译内置**（不经 CKM 运行时装卸），见 [storage.md](storage.md)。
@@ -131,11 +138,17 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
     挂载表拆「后端 / 挂载点」并带 `vol_id`/`options`（`alias_volume`/`umount`，挂载计数写回卷记录）、
     挂载错误改 errno、`stat` 行尾 `vol=`、`fs::storage_mount_selftest` 开机自测；
     `tests/test_boot.py` 增 `--expect-re`（反向引用绑同一 `vol_id`，因为启动盘序列号随镜像构建变化）。
+    **CSS-3（盘符）于 2026-10-12 大部分落地**：盘符表 `storage/letters.rs`（确定规则 + 自定义映射落
+    CKM 状态区键 `storage/letters`）+ `storage_mount`(262)/`storage_unmount`(263)/`storage_assign_letter`(264)
+    （判定点 8 `CAP_STORAGE_ADMIN`）+ `libc` 的 `C:\` 重写 + `/bin/volumes` 子命令；仍缺 `/storage/**`
+    只读状态树与卷标写/改名。
 
 ## 5. 修订记录
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-12 | **CKM-2（可写持久化 + 覆盖层机制）落地** —— 开放问题 1 定夺为 **(b) 双槽 A/B + CRC32 的极小日志式区**（系统盘尾部 1 MiB，在 FAT 之外；`tools/image-builder/build_image.py` 改为「先在 63 MiB 上 `mformat`、再追加保留区」）、`kernel/src/ckm/store.rs`（`get`/`put`/自测）、`kernel/src/ckm/overlay.rs`（注册/撤销/最长前缀/优先级/冲突拒绝，钩子在 `fs::mount::resolve`）、`policy::reject`（语义拒绝，`need=0x0`）、`fs::overlay_selftest`；新增 `make test-ckm-store` + `tests/test_ckm_store.py`（两阶段启动）与编排场景 `ckm-store`，`test-ckm` 扩到 40 断言，`test-fat`/`test-programs`/`test-storage` 的 FAT 几何与根目录条目断言同步；第十一阶段改为「进行中」 |
+| 2026-10-12 | **CKM-1（内核接口）落地**：`kernel/src/ckm/`（`cred`/`policy`/`state`/`audit`/`api`）+ v1.0 `security/` + syscall `257`/`258`/`259` + 判定点 1/3/5/6；新增 `make test-ckm` 与编排场景 `ckm`，`test-user`/`test-proc` 同步扩展；同批修掉一处内核栈对齐 UB（`process::kstack_top` 16 字节对齐） |
 | 2026-10-11 | **CSS-2（VFS 收口）落地** —— `fs::mount` 拆 `backends`/`mounts`（一个后端可被多挂载点引用）+ `vol_id`/`options`/`alias_volume`/`umount`/`route`/`sync_counts`；`FileSystem` 增 `caps`/`volume_info`（保守缺省；RAMFS 可写、FAT 只读+大小写不敏感+卷标）；FAT 探测唯一入口 `fs::fat::probe`/`probe_sector`（删掉 `storage/volume.rs` 里重复的 BPB 判定）、`FatFs::open` → `OpenError{errno,reason}`；`fs::mount_disks` 按卷表挂载并保留 `/disk`/`/mnt/fat` 兼容点；`fs: stat` 行尾 `vol=`；新增 `fs::storage_mount_selftest` 开机自测与 `storage: mount`/`volcheck`/`unmount`/`fs: route` 证据行；`tests/test_boot.py` 增 `--expect-re`；`make test-storage`（31 项 + 2 正则）/`test-storage-mbr`（14 项 + 1 正则）与编排场景 `fs`/`fat`/`storage`/`storage-mbr`/`programs` 全 PASS；第十二阶段与 storage.md 第 2/5/9/10 节同步 |
 | 2026-10-11 | **新增「CSS 存储管理系统规划」（v1.0 之后）** —— 新建 [storage.md](storage.md)：卷模型（设备→分区→卷→盘符/挂载点 + 稳定 `vol_id`）、Windows 式盘符与 Linux 式挂载双视图、VFS 收口与挂载表带卷身份、与 CKM 的接口（能力位 / 判定点 / 号段 261–266）、文件系统支持路线、CSS-1…CSS-6 分期与 11 条验收；本文件标第十二阶段并补 v1.0 之后规划段 |
 | 2026-10-06 | 第一阶段初稿：10 个里程碑 + 25 步依赖顺序 |
@@ -164,3 +177,4 @@ Kernel 基础层（GDT / IDT / Exception / Panic）
 | 2026-10-11 | **新增「桌面环境兼容路线」（v1.0 之后，规划）**：新建 docs/desktop.md —— 现状审计（显示/输入/ioctl/设备模型/`/proc`/futex/音频/ACPI 等逐项有据）、用户态与内核侧归属纠正（logind/D-Bus/PipeWire 是用户态，KVM 与桌面前置无关）、被遗漏的地基清单、D0–D5 分层与 QEMU 可断言验收（monitor `sendkey`/`screendump` 实测可用）、里程碑 v1.1–v1.6；同步 roadmap（第九阶段 + 「禁止提前做」项修正）、DEVELOPMENT（5.10）、architecture 第 5 节、project-structure（规划新增目录）与 README |
 | 2026-10-11 | **CSS 提案评审补边界**：[storage.md](storage.md) 增 6.8「文件系统后端装载政策」（第一版全部编译内置、不经 CKM 运行时装卸）、6.1「覆盖层/回滚/恢复归 CKM」、6.7「兼容性完整展示」、第 11 节「不做写回修复」（`fsck` 只读检查）；第十二阶段段落同步 |
 | 2026-10-11 | **CSS-1 落地**：`kernel/src/storage/`（GPT 主/备表头 + CRC32、MBR + EBR 链只读扫描，无分区表退化为整盘一卷，FAT 探测）、块设备注册表 2 → 8、`storage_volumes`(261)/`storage_rescan`(265)（64 字节定长卷记录、确定性枚举）、`mkfs.py` 的 GPT/MBR/主表受损/无表四类夹具、`libc` 解析器 + 用户程序 `/bin/volumes`、`make storage-images`/`test-storage-fixtures`/`test-storage`/`test-storage-mbr` 与编排场景 `storage`/`storage-mbr`（15 → **17 场景**）、内核解析自测 11 例 / 45 断言；第十二阶段由「规划」改「进行中」；同步 [storage.md](storage.md) 第 2/9/10 节、docs/README.md、DEVELOPMENT.md 5.13 |
+| 2026-10-12 | **CSS-3（盘符）大部分落地**：盘符表 `kernel/src/storage/letters.rs`（固定容量：缺省 `C` 给系统卷、其余按枚举顺序给 `D`/`E`/…；自定义映射持久化到 CKM 状态区键 `storage/letters`，`letter = 0` 取消回到规则）、`storage/registry.rs` 的 `letter_of`/`slot_of`/`assign_letter`（盘符写入卷记录偏移 24）、`syscall/storage.rs` 把 262 `storage_mount`/263 `storage_unmount`/264 `storage_assign_letter` 从 ENOSYS 桩上拿下（判定点 8 `CAP_STORAGE_ADMIN`）、`fs::mount_volume_by_id`/`fs::unmount_point`、`userland/libc/src/path.rs`（`C:\` → POSIX，查卷表不硬编码字母）+ 三个 syscall 包装、`/bin/volumes` 的 `list`/`mount`/`unmount`/`letter`/`demo` 子命令；`make test-storage`（`letter=` + `letters selftest checks=36`）/`test-storage-mbr`（`checks=22`）/`test-programs`（`volumes demo` 双入口）/`test-ckm`（零能力拒绝）/`test-ckm-store`（`storage/letters` 跨重启）全 PASS；第十二阶段与 [storage.md](storage.md) 第 2/4/6/9/10/13 节同步 |

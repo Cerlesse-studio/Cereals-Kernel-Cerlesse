@@ -171,7 +171,21 @@ pub fn read(fd: i32, buf: &mut [u8]) -> isize {
 ///
 /// 路径用「指针 + 长度」传递；`flags` 只允许 [`O_RDONLY`]/[`O_WRONLY`]/[`O_RDWR`]
 /// 与 [`O_CREAT`] 的组合，其余位内核返回 [`EINVAL`]。
+///
+/// **CSS-3**：Windows 式路径（`C:\x`）在这一层被重写成 POSIX 路径（`crate::path`，
+/// `docs/storage.md` 4.2）—— 内核仍然只看到绝对路径，因此 syscall ABI 不变；
+/// 盘符未分配/卷不在表里时直接返回 [`crate::path::ENOENT`]（不把 `C:\x` 丢给内核
+/// 去当普通文件名——那会把「没有这个盘符」变成「这个怪名字的文件不存在」）。
 pub fn open(path: &str, flags: i32) -> isize {
+    let mut rewritten = [0u8; 128];
+    let path = if crate::path::is_windows(path) {
+        match crate::path::resolve_str(path, &mut rewritten) {
+            Ok(resolved) => resolved,
+            Err(errno) => return errno,
+        }
+    } else {
+        path
+    };
     unsafe {
         raw(
             SYS_OPEN,
@@ -442,6 +456,16 @@ pub fn procinfo_name(buf: &[u8], index: usize) -> &str {
 pub const SYS_STORAGE_VOLUMES: u64 = 261;
 /// `storage_rescan` 的系统调用号（CSS-1）。
 pub const SYS_STORAGE_RESCAN: u64 = 265;
+/// `storage_mount` 的系统调用号（**CSS-3**）：把卷挂到路径。
+pub const SYS_STORAGE_MOUNT: u64 = 262;
+/// `storage_unmount` 的系统调用号（CSS-3）：卸掉一个挂载点。
+pub const SYS_STORAGE_UNMOUNT: u64 = 263;
+/// `storage_assign_letter` 的系统调用号（CSS-3）：分配/取消盘符。
+pub const SYS_STORAGE_ASSIGN_LETTER: u64 = 264;
+/// `storage_mount` 的 `flags` bit0：只读挂载（→ 只读原因 `ro-mount`）。
+pub const STORAGE_MOUNT_RDONLY: u64 = 1;
+/// `storage_assign_letter` 的「取消」取值（回到缺省规则，而不是「没有盘符」）。
+pub const STORAGE_LETTER_NONE: u8 = 0;
 /// 单条卷记录的字节数（必须与内核 `storage::volume::VOLUME_RECORD_SIZE` 一致）。
 pub const VOLUME_RECORD_SIZE: usize = 64;
 /// `vol_id` 字段里可读字符的上限（记录占 16 字节：15 字符 + NUL）。
@@ -492,6 +516,83 @@ pub fn storage_volumes(buf: &mut [u8], out_count: Option<&mut u64>) -> isize {
 /// CSS-1 里这是受控动作（CKM 落地后需要 `CAP_STORAGE_ADMIN`，见 `docs/storage.md`）。
 pub fn storage_rescan(disk: u32) -> isize {
     unsafe { raw(SYS_STORAGE_RESCAN, disk as u64, 0, 0, 0, 0) }
+}
+
+/// `storage_mount(vol_id, point, flags)`（**CSS-3**）：把卷挂到路径。
+///
+/// 需要 `CAP_STORAGE_ADMIN`（判定点 8）：未授权进程拿到 `-EPERM`，
+/// 且内核会同时留一条审计事件与一行串口证据（“拒绝三件套”）。
+/// 已挂载的卷再加挂载点只加**别名**：两个路径下是同一份数据（不是两份）。
+pub fn storage_mount(vol_id: &str, point: &str, flags: u64) -> isize {
+    unsafe {
+        raw(
+            SYS_STORAGE_MOUNT,
+            vol_id.as_ptr() as u64,
+            vol_id.len() as u64,
+            point.as_ptr() as u64,
+            point.len() as u64,
+            flags,
+        )
+    }
+}
+
+/// `storage_unmount(point)`（CSS-3）：卸掉一个挂载点（卷仍在卷表里）。
+///
+/// 需要 `CAP_STORAGE_ADMIN`；`point` 不是挂载点时是 `-ENOENT`，卸根是 `-EINVAL`。
+pub fn storage_unmount(point: &str) -> isize {
+    unsafe {
+        raw(
+            SYS_STORAGE_UNMOUNT,
+            point.as_ptr() as u64,
+            point.len() as u64,
+            0,
+            0,
+            0,
+        )
+    }
+}
+
+/// `storage_assign_letter(vol_id, letter)`（CSS-3）：分配/取消盘符。
+///
+/// `letter` 是 ASCII `'A'..='Z'`；[`STORAGE_LETTER_NONE`] 表示取消自定义映射、
+/// 回到缺省规则。字母被别的卷占着是 `-EEXIST`，非法字母是 `-EINVAL`，
+/// 卷不存在是 `-ENOENT`。映射会写进 CKM 状态区（重启后字母不变）。
+pub fn storage_assign_letter(vol_id: &str, letter: u8) -> isize {
+    unsafe {
+        raw(
+            SYS_STORAGE_ASSIGN_LETTER,
+            vol_id.as_ptr() as u64,
+            vol_id.len() as u64,
+            letter as u64,
+            0,
+            0,
+        )
+    }
+}
+
+/// 第 `index` 条卷记录的盘符（**CSS-3**，记录偏移 24）。
+///
+/// `0` = 未分配。盘符是**别名**：真正的身份是 [`volume_id`]（同一 `vol_id` 的两个卷
+/// 只有第一个带盘符 —— 一个字母不能同时是两个卷的入口）。
+pub fn volume_letter(buf: &[u8], index: usize) -> u8 {
+    record(buf, index, VOLUME_RECORD_SIZE).map_or(0, |rec| rec[24])
+}
+
+/// 盘符的文本形式（未分配返回 `"-"`）。
+pub fn volume_letter_str(buf: &[u8], index: usize) -> &'static str {
+    letter_name(volume_letter(buf, index))
+}
+
+/// 盘符取值 → 单字符文本（非法或未分配 → `"-"`）。
+pub fn letter_name(letter: u8) -> &'static str {
+    const NAMES: [&str; 26] = [
+        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q",
+        "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+    ];
+    match letter {
+        b'A'..=b'Z' => NAMES[(letter - b'A') as usize],
+        _ => "-",
+    }
 }
 
 /// 第 `index` 条卷记录的稳定标识（`fs:…` / `pt:…` / `raw:…`）。

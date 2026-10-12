@@ -219,6 +219,103 @@ fn read_only_reason(caps: vfs::FsCaps, options: MountOptions) -> &'static str {
     }
 }
 
+// ---- CSS-3：按卷身份挂载/卸载（`storage_mount`/`storage_unmount` 的落点）----
+
+/// 把一个卷挂到 `point`（`docs/storage.md` 4.3 / 6.3 的 262）。
+///
+/// 两条路径，区别是**要不要重新打开设备**：
+///
+/// 1. 卷已在挂载表里（例如启动盘已经在 `/disk`）→ 只加一个**别名挂载点**
+///    （CSS-2 的 `alias_volume`）：两个路径下是同一个后端实例、同一份数据；
+/// 2. 卷还没挂过 → 打开后端再挂。现状（CSS-3）只有「整盘 FAT」有后端：分区里的
+///    文件系统需要 FAT 后端接受分区偏移，那是 CSS-4 的事，因此这里返回
+///    [`vfs::ENOTSUP`]（**不是** `ENOENT`：卷在、后端没实现，两者必须可区分）。
+///
+/// 证据行与 CSS-2 的挂载行同格式（`storage: mount point=… vol=… ro=…`），
+/// 因此「谁在什么时候把哪个卷挂到了哪里」在串口上可断言（6.7）。
+pub fn mount_volume_by_id(vol_id: &str, point: &str, options: MountOptions) -> Result<(), i64> {
+    let volume = crate::storage::registry::find(vol_id).ok_or(vfs::ENOENT)?;
+    let disk_id = volume.disk_id as usize;
+    let part_index = volume.part_index;
+    let fs_kind = volume.fs;
+    let id = String::from(volume.id.as_str());
+
+    if mount::table().count_mounts(&id) == 0 {
+        if part_index != 0 {
+            serial::print("fs: mount vol=");
+            serial::print(&id);
+            serial::println(" has no backend (partition offset unsupported until CSS-4)");
+            return Err(vfs::ENOTSUP);
+        }
+        if !matches!(
+            fs_kind,
+            crate::storage::volume::FsKind::Fat12
+                | crate::storage::volume::FsKind::Fat16
+                | crate::storage::volume::FsKind::Fat32
+        ) {
+            return Err(vfs::ENOTSUP);
+        }
+        let dev = crate::driver::block::get(disk_id).ok_or(vfs::ENODEV)?;
+        let fs = match fat::FatFs::open(dev) {
+            Ok(fs) => fs,
+            Err(err) => return Err(err.errno),
+        };
+        mount::table().mount_volume(point, Box::new(fs), &id, options)?;
+    } else {
+        mount::table().alias_volume(point, &id, options)?;
+    }
+
+    // 挂载点的父目录（`/volumes`）如果还不存在就补一个：
+    // 路由是**字符串匹配**，不依赖这个目录 —— 但用户 `ls /` 时期望看到它。
+    // 已存在（`EEXIST`）是正常情形，不当作错误。
+    if let Some(parent) = parent_of(point) {
+        let _ = vfs::mkdir(&parent);
+    }
+
+    let caps = vfs::backend_caps(point).ok_or(vfs::ENOENT)?;
+    serial::print("storage: mount point=");
+    serial::print(point);
+    serial::print(" vol=");
+    serial::print(&id);
+    serial::print(" ro=");
+    serial::println(read_only_reason(caps, options));
+    Ok(())
+}
+
+/// 卸载一个挂载点（`docs/storage.md` 6.3 的 263）。
+///
+/// 只摘挂载点条目：卷仍在卷表里（`mount_count` 减一，由挂载表的 `umount` 同步写回），
+/// 再次挂载不需要重新探测设备。证据行给的是**卸载之后**的挂载点数。
+pub fn unmount_point(point: &str) -> Result<(), i64> {
+    let removed = mount::table().umount(point)?;
+    let id = match &removed {
+        Some(id) => String::from(id.as_str()),
+        None => String::from("-"),
+    };
+    let count = match &removed {
+        Some(id) => mount::table().count_mounts(id),
+        None => 0,
+    };
+    serial::print("storage: unmount point=");
+    serial::print(point);
+    serial::print(" vol=");
+    serial::print(&id);
+    serial::print(" mounts=");
+    serial::print_dec(count as u64);
+    serial::println(" (volume still listed)");
+    Ok(())
+}
+
+/// 挂载点的父目录（`/volumes/data` → `/volumes`；单段路径 → `None`）。
+fn parent_of(point: &str) -> Option<String> {
+    let point = vfs::normalize(point).ok()?;
+    let index = point.rfind('/')?;
+    if index == 0 {
+        return None;
+    }
+    Some(String::from(&point[..index]))
+}
+
 /// `fs: write <path> bytes=<n>`。
 fn log_write(path: &str, bytes: usize) {
     serial::print("fs: write ");
@@ -346,6 +443,137 @@ pub fn selftest() -> Result<(), &'static str> {
     serial::println("fs: negative cases PASS (ENOENT/ENOTDIR/EISDIR/EEXIST/EINVAL)");
 
     serial::println("fs: selftest PASS");
+    Ok(())
+}
+
+// ---- CKM-2：覆盖层机制验收（`docs/ckm.md` 6.1/6.3/6.4） ----
+
+/// 覆盖层机制自测：**注册/撤销真的改变 `open` 的结果**（`make test-ckm` 的断言来源）。
+///
+/// 为什么这段自测在 `fs/` 而不在 `ckm/`：覆盖表的实现（`ckm/overlay.rs`）刻意不碰
+/// 文件系统，「建覆盖区」「读写文件」「验证视图变化」都需要 `fs` —— 而
+/// `fs/ ──▶ ckm/` 才是允许的依赖方向（[`docs/ckm.md`](../../docs/ckm.md) 4.1）。
+///
+/// 覆盖区（`/ckm/overlay/<id>/**`）由内核在这里建立，因此它随内核存在，
+/// 与「扩展装了什么」无关（`docs/ckm.md` 6.1 的模型）。
+///
+/// 断言链（每一条都是机制，不是展示）：
+///
+/// 1. 注册（`priority=10`，前缀 `/etc`）后，**新 `open`** 得到覆盖内容而不是基线；
+/// 2. 同优先级 + 前缀重叠 → **拒绝后注册者**（`op=overlay_conflict result=deny`）；
+/// 3. 更高优先级（`20`）→ 允许且真的遮蔽（6.3 第 1 条）；
+/// 4. 撤销 high → 回到 demo 的视图；撤销 demo → **回到基线**（6.4 第 2 条）；
+/// 5. `kind ≠ 3`、前缀覆盖 `/ckm`（自指）→ 一律拒绝。
+///
+/// 收尾时表必须是空的：用户进程启动时看到的是**基线**（「停用即撤销」的全局版本）。
+pub fn overlay_selftest() -> Result<(), &'static str> {
+    serial::println("fs: overlay selftest begin");
+    // 内核上下文：持有全部能力（判定点 7「注册覆盖层」的允许面）。
+    let cred = crate::ckm::cred::current();
+    use crate::ckm::overlay;
+
+    const DEMO: &[u8] = b"overlay: demo replacement\n";
+    const HIGH: &[u8] = b"overlay: high priority wins\n";
+
+    // 0. 干净起点（幂等：重复自测不该累积条目）
+    overlay::reset();
+
+    // 1. 覆盖区：/ckm/overlay/<id>（模型见 docs/ckm.md 6.1）
+    vfs::mkdir("/ckm").map_err(|_| "fs: overlay mkdir /ckm failed")?;
+    vfs::mkdir("/ckm/overlay").map_err(|_| "fs: overlay mkdir /ckm/overlay failed")?;
+    vfs::mkdir("/ckm/overlay/demo").map_err(|_| "fs: overlay mkdir demo failed")?;
+    vfs::create("/ckm/overlay/demo/motd").map_err(|_| "fs: overlay create demo failed")?;
+    vfs::write("/ckm/overlay/demo/motd", 0, DEMO)
+        .map_err(|_| "fs: overlay write demo failed")?;
+    // `high` 的前缀是**一个文件**（`/etc/motd`）：镜像就是覆盖区里的同名文件
+    // （`/ckm/overlay/high`），而不是一个目录 —— 这是「覆盖区镜像前缀树」的直接结果：
+    // 前缀是目录 → 镜像目录内容；前缀是文件 → 镜像文件本身。
+    vfs::create("/ckm/overlay/high").map_err(|_| "fs: overlay create high failed")?;
+    vfs::write("/ckm/overlay/high", 0, HIGH).map_err(|_| "fs: overlay write high failed")?;
+    serial::println("fs: overlay area /ckm/overlay ready id=demo,high");
+
+    // 2. 基线视图
+    let baseline = vfs::read_all("/etc/motd").map_err(|_| "fs: overlay read baseline failed")?;
+    if baseline != MOTD {
+        return Err("fs: overlay baseline is not the ramfs MOTD");
+    }
+
+    // 3. 注册 demo（前缀 /etc）→ 新 open 换了视图
+    overlay::register("demo", overlay::OVERLAY_KIND, 10, "/etc", &cred)
+        .map_err(|_| "fs: overlay register(demo) failed")?;
+    let demo_view =
+        vfs::read_all("/etc/motd").map_err(|_| "fs: overlay read after register failed")?;
+    if demo_view != DEMO {
+        return Err("fs: overlay register did not change the open result");
+    }
+    serial::print("fs: overlay open /etc/motd changed=1 bytes=");
+    serial::print_dec(demo_view.len() as u64);
+    serial::println("");
+    // 表的可读形态（只读面，与 `ckm_component_state` 同风格）：谁在里面、优先级多少
+    let (id, kind, priority, prefix) =
+        overlay::entry_at(0).ok_or("fs: overlay table is empty after register")?;
+    serial::print("fs: overlay table[0] id=");
+    serial::print(id);
+    serial::print(" kind=");
+    serial::print_dec(kind as u64);
+    serial::print(" priority=");
+    serial::print_dec(priority as u64);
+    serial::print(" prefix=");
+    serial::println(prefix);
+
+    // 4. 同优先级 + 重叠前缀 → 拒绝后注册者（6.3 第 2 条）
+    if overlay::register("dupe", overlay::OVERLAY_KIND, 10, "/etc/motd", &cred)
+        != Err(overlay::EEXIST)
+    {
+        return Err("fs: same-priority overlay conflict was accepted");
+    }
+    serial::println("fs: overlay conflict rejected (dupe vs demo, same priority)");
+
+    // 5. 更高优先级 → 允许，且真的遮蔽 demo（6.3 第 1 条）
+    overlay::register("high", overlay::OVERLAY_KIND, 20, "/etc/motd", &cred)
+        .map_err(|_| "fs: overlay register(high) failed")?;
+    let high_view =
+        vfs::read_all("/etc/motd").map_err(|_| "fs: overlay read after register(high) failed")?;
+    if high_view != HIGH {
+        return Err("fs: overlay higher priority did not win");
+    }
+    serial::print("fs: overlay priority wins (high=20 > demo=10) bytes=");
+    serial::print_dec(high_view.len() as u64);
+    serial::println("");
+
+    // 6. 撤销是**逐条**的：先回 demo 的视图，再回基线（6.4 第 2 条）
+    overlay::unregister("high", &cred).map_err(|_| "fs: overlay unregister(high) failed")?;
+    let back_to_demo = vfs::read_all("/etc/motd")
+        .map_err(|_| "fs: overlay read after unregister(high) failed")?;
+    if back_to_demo != DEMO {
+        return Err("fs: overlay unregister(high) did not restore the demo view");
+    }
+    overlay::unregister("demo", &cred).map_err(|_| "fs: overlay unregister(demo) failed")?;
+    let restored =
+        vfs::read_all("/etc/motd").map_err(|_| "fs: overlay read after unregister failed")?;
+    if restored != baseline {
+        return Err("fs: overlay unregister did not restore the baseline view");
+    }
+    if !overlay::is_empty() {
+        return Err("fs: overlay table is not empty after unregister");
+    }
+    serial::print("fs: overlay unregister restored baseline bytes=");
+    serial::print_dec(restored.len() as u64);
+    serial::println("");
+
+    // 7. kind ≠ 3：覆盖层只对系统修改模块开放（6.1）
+    if overlay::register("bad", 2, 30, "/etc", &cred) != Err(overlay::EINVAL) {
+        return Err("fs: overlay accepted kind=2");
+    }
+    // 8. 前缀覆盖 /ckm 会自指（重写后的路径又被重写）——必须拒绝
+    if overlay::register("loop", overlay::OVERLAY_KIND, 40, "/ckm/overlay", &cred)
+        != Err(overlay::EINVAL)
+    {
+        return Err("fs: overlay accepted a prefix covering /ckm");
+    }
+    serial::println("fs: overlay negative cases PASS (kind/prefix/duplicate)");
+
+    serial::println("fs: overlay selftest PASS");
     Ok(())
 }
 

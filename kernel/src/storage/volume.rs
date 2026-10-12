@@ -220,6 +220,12 @@ pub struct Volume {
     /// 当前挂载点数（CSS-2 起由挂载表维护：挂载/卸载后 `registry::set_mount_count`
     /// 写入，重扫后由 `MountTable::sync_counts` 重放；新建的卷从 0 开始）。
     pub mount_count: u32,
+    /// 盘符（**CSS-3**：`0` = 未分配，否则 `'A'..='Z'` 的 ASCII）。
+    ///
+    /// 盘符是别名而不是身份（3.1）：映射住在 `letters`（字母 → `vol_id`），
+    /// 这个字段是**给消费者的视图**（记录偏移 24），扫描之后由
+    /// `registry::apply_letters` 从字母表灌进来。
+    pub letter: u8,
     /// 是否可移动介质（CSS-1 未知，恒 false）。
     pub removable: bool,
 }
@@ -254,7 +260,8 @@ impl Volume {
             flags |= 1 << 3;
         }
         rec[22..24].copy_from_slice(&flags.to_le_bytes());
-        rec[24] = 0; // letter：CSS-3 才分配
+        // 盘符（CSS-3）：`0` = 未分配。字母是别名，`vol_id` 才是身份（3.1）
+        rec[24] = self.letter;
         rec[25..25 + LABEL_MAX].copy_from_slice(&self.label);
         if let Some(uuid) = self.uuid {
             // 记录里只放前 4 字节（完整前缀在 id 里已经可读）
@@ -289,7 +296,13 @@ impl Volume {
             Some(label) => serial::print(label),
             None => serial::print("-"),
         }
-        serial::print(" letter=- mounts=");
+        serial::print(" letter=");
+        if self.letter == 0 {
+            serial::print("-");
+        } else {
+            serial::print(crate::storage::letters::ascii(&self.letter));
+        }
+        serial::print(" mounts=");
         serial::print_dec(self.mount_count as u64);
         serial::print(" ro=");
         serial::print(self.read_only.name());
@@ -393,6 +406,8 @@ pub fn make_volume(
         // 探测阶段还不知道挂载表的状态；已挂载的卷由 `registry::scan_all` 末尾的
         // `MountTable::sync_counts()` 重放回真实计数（CSS-2）。
         mount_count: 0,
+        // 盘符同理：扫描完成后由 `registry::apply_letters` 从字母表灌进来（CSS-3）。
+        letter: 0,
         removable: false,
     }
 }

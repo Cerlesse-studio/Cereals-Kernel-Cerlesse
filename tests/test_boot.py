@@ -71,6 +71,13 @@ def parse_args() -> argparse.Namespace:
         help="v0.9 test-network：加一块 legacy virtio-net-pci 网卡（QEMU user/slirp 网络）",
     )
     parser.add_argument(
+        "--persist",
+        action="store_true",
+        help="blk0 **不加** `snapshot=on`：写真的落盘（CKM-2 的持久化自测需要它，"
+        "见 tests/test_ckm_store.py）。只能配一块**独占的镜像副本**用 —— 并行编排的"
+        "场景共享 build/disk.img，在那里开写会互相踩。",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=TIMEOUT_SECONDS,
@@ -121,7 +128,8 @@ def main() -> int:
         #（kernel/src/driver/virtio_blk.rs）——「镜像能启动」与「驱动能读写这块盘」
         # 因此是同一台设备上的同一条路径。disable-modern=on 强制设备暴露 legacy
         # 接口（vendor 1af4 / device 0x1001 / BAR0 是 I/O 窗口）。
-        "-drive", f"if=none,id=blk0,format=raw,file={disk},snapshot=on",
+        "-drive",
+        f"if=none,id=blk0,format=raw,file={disk}{'' if args.persist else ',snapshot=on'}",
         "-device", "virtio-blk-pci,drive=blk0,disable-modern=on",
         "-serial", "stdio",
         "-display", "none",

@@ -19,6 +19,13 @@
 //! 3. **错误是 errno**（`EEXIST` / `ENOSPC` / `ENOENT` / `EINVAL`），不再是
 //!    `&'static str` —— 否则「拒绝理由」不可断言（`docs/storage.md` 4.5）。
 //!
+//! ## CKM-2 追加的一处收口（`docs/ckm.md` 6.1）
+//!
+//! `resolve()` 在查表**之前**把路径交给 `ckm::overlay` 改写：覆盖层是**注册表项**，
+//! 不是「真的挂了一个文件系统」。放在这里而不是塞进各个 `fs::vfs::*` 入口，是因为
+//! 「路径 → 后端」只在这一个地方发生 —— 覆盖层的影响面因此等于路由的影响面，
+//! 不会出现「`stat` 看到了覆盖、`read` 没有」这种缝隙。
+//!
 //! ## `resolve()` 返回 `&'static mut` 的安全论据
 //!
 //! 后端由 `backends: Vec<Box<dyn FileSystem>>` **独占持有**，`resolve()` 是唯一
@@ -26,6 +33,7 @@
 //! `resolve()` 之间必然隔着一次完整的 read/stat（借用已结束），内核又是单线程的
 //! （没有并发访问挂载表）。这与 v0.7 起一直使用的 `static mut TABLE` 是同一套契约。
 
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -161,7 +169,10 @@ impl MountTable {
         &'static mut self,
         path: &str,
     ) -> Result<(&'static mut dyn FileSystem, String), i64> {
-        let (index, rel) = self.best(path)?;
+        // CKM-2：覆盖层改写先于查表（`docs/ckm.md` 6.1）。因此**每一个**系统级入口
+        //（stat/read/write/create/mkdir/list）看到的都是覆盖后的视图，没有第二条路径。
+        let path = self.overlay_path(path);
+        let (index, rel) = self.best(&path)?;
         let backend = self.mounts[index].backend;
         // SAFETY 论据见模块头「resolve() 返回 &'static mut 的安全论据」：
         // `self` 本身是 `&'static mut`，后端由 `backends` 独占持有。
@@ -170,7 +181,8 @@ impl MountTable {
 
     /// 路径解析到的挂载点信息（`fs: route …` 证据行与「路径 → 卷」断言用）。
     pub fn route(&self, path: &str) -> Option<Route> {
-        let normalized = vfs::normalize(path).ok()?;
+        let path = self.overlay_path(path);
+        let normalized = vfs::normalize(&path).ok()?;
         let mut best: Option<usize> = None;
         for (i, m) in self.mounts.iter().enumerate() {
             if !vfs::within(&normalized, &m.point) {
@@ -239,6 +251,29 @@ impl MountTable {
         self.mounts.push(MountEntry { point, backend, vol_id, options });
         self.sync_counts();
         Ok(())
+    }
+
+    /// CKM-2：把「用户看到的路径」交给覆盖层，得到实际要解析的路径（`docs/ckm.md` 6.1）。
+    ///
+    /// 三条约束：
+    ///
+    /// 1. **规范化之后**比对：注册时的前缀是规范化路径，比较必须同口径；
+    /// 2. **空表是快路径**：不查表、不分配（绝大多数启动与进程走这条）；
+    /// 3. **失败不回退**：被覆盖的路径如果覆盖区里没有对应文件，得到的就是 `ENOENT`
+    ///    —— 「隐藏」在机制期就是「前缀命中即改写」，不做隐式回退到基线
+    ///    （那是 `.mask`/全量策略的语义，CKM-5）。
+    fn overlay_path<'a>(&self, path: &'a str) -> Cow<'a, str> {
+        if crate::ckm::overlay::is_empty() {
+            return Cow::Borrowed(path);
+        }
+        let Ok(normalized) = vfs::normalize(path) else {
+            // 非法路径（空/`.`/`..`）：交给 `best()` 去报 EINVAL，不在这里造第二个理由。
+            return Cow::Borrowed(path);
+        };
+        match crate::ckm::overlay::rewrite(&normalized) {
+            Some(rewritten) => Cow::Owned(rewritten),
+            None => Cow::Owned(normalized),
+        }
     }
 
     /// 最长前缀匹配的内部实现：返回（条目下标, 挂载点内相对路径）。

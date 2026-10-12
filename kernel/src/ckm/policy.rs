@@ -219,6 +219,27 @@ pub fn allowed(op: Op, cred: &Cred) -> bool {
     cred.caps_ok(op.need())
 }
 
+/// **语义拒绝**：凭证够、但请求本身不合法（覆盖层前缀冲突、非法参数、槽位满）。
+///
+/// 与 [`check`] 的区别是**失败的理由**：那里是「缺哪一位能力」，这里是「这个请求不能成立」。
+/// 两者都必须留审计与串口证据（`docs/ckm.md` 3.4 的三件套只对能力拒绝要求 errno，
+/// 但「谁在什么时候被拒了」对两类失败同样重要）。
+///
+/// 证据行的 `need=0x0`：**没有**能力位能改变这个结果 —— 补权限不解决冲突。
+/// 具体 errno 由调用方决定（冲突是 `EEXIST`、非法参数是 `EINVAL`）。
+pub fn reject(op: Op, cred: &Cred, detail: u64) {
+    crate::ckm::audit::record(
+        crate::ckm::cred::current_pid(),
+        cred.uid,
+        cred.gid,
+        op,
+        RESULT_DENY,
+        0,
+        detail,
+    );
+    print_policy_line(op, cred, false, 0, detail);
+}
+
 /// 串口证据行（`docs/ckm.md` 4.5）。
 fn print_policy_line(op: Op, cred: &Cred, allowed: bool, need: u32, arg: u64) {
     serial::print("ckm: policy op=");

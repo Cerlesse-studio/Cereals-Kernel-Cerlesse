@@ -123,14 +123,16 @@ Cerlesse/
 | `kernel/src/acpi/` | FADT/MADT 解析、S5、热区/电池桩 | D4 |
 | `kernel/src/ipc/{unix,eventfd,memfd}.rs` | AF_UNIX/`SO_PEERCRED`、eventfd/timerfd、memfd | D0/D4 |
 
-### 3.1 CKM 规划新增（第十一阶段，尚未创建）
+### 3.1 CKM 新增（第十一阶段；**CKM-1/CKM-2 已落地**）
 
-CKM（内核级权限控制与扩展管理，见 [ckm.md](ckm.md)）预计新开以下目录；**当前都还不存在**，
-按 CKM-1…CKM-7 分期创建并回填：
+CKM（内核级权限控制与扩展管理，见 [ckm.md](ckm.md)）的目录；已落地的部分是
+`kernel/src/ckm/*`（CKM-1 五模块 + CKM-2 的 `overlay.rs`/`store.rs`），其余按 CKM-3…CKM-7 分期创建并回填：
 
-| 规划目录 | 职责 | 分期 |
+| 目录 | 职责 | 分期 |
 | ---- | ---- | ---- |
-| `kernel/src/ckm/{mod,cred,policy,state,audit,api}.rs` | CKM Core：能力位与凭证、判定点、组件状态表、审计环、给 `syscall/` 的唯一入口 | CKM-1 |
+| `kernel/src/ckm/{mod,cred,policy,state,audit,api}.rs` | CKM Core：能力位与凭证、判定点、组件状态表、审计环、给 `syscall/` 的唯一入口 ✅ | CKM-1 |
+| `kernel/src/ckm/overlay.rs` | 覆盖层注册表（注册/撤销/最长前缀/优先级/冲突拒绝）+ 判定点 7/8 ✅ | CKM-2 |
+| `kernel/src/ckm/store.rs` | 可写持久化：系统盘尾部 1 MiB 的双槽 A/B + CRC32 状态区 ✅ | CKM-2 |
 | `kernel/src/security/{credential,permission}.rs` | 凭证（uid/gid）与文件 mode 判定（v1.0 先落地，CKM 的**下层**，不重复实现） | v1.0 |
 | `userland/ckmd/` | CKM Service：事务、包操作、签名校验、修复回滚（持 `CAP_CKM_SERVICE`） | CKM-4 |
 | `userland/ckm/` | CKM Manager：CLI（`ckm state`/`ckm audit`/`ckm pkg …`/`ckm enter-safe-mode`） | CKM-4 |
@@ -141,16 +143,17 @@ CKM（内核级权限控制与扩展管理，见 [ckm.md](ckm.md)）预计新开
 
 ### 3.2 CSS 规划新增（第十二阶段，尚未创建）
 
-CSS（存储管理，见 [storage.md](storage.md)）预计新开/扩展以下目录；**当前都还不存在或未扩展**，
-按 CSS-1…CSS-6 分期创建并回填（**CSS-1/CSS-2 已落地**）：
+CSS（存储管理，见 [storage.md](storage.md)）新开/扩展以下目录，按 CSS-1…CSS-6 分期创建并回填
+（**CSS-1/CSS-2 已落地，CSS-3 大部分落地**；仍标「规划」的行尚未开工）：
 
 | 规划目录 | 职责 | 分期 |
 | ---- | ---- | ---- |
 | `kernel/src/storage/{mod,registry,partition,gpt,mbr,volume,selftest}.rs` | CSS：设备/分区/卷登记、GPT/MBR **只读**解析、稳定卷标识 `vol_id`、卷标/健康状态/只读原因（✅ CSS-1 已落地） | CSS-1 |
-| `kernel/src/syscall/storage.rs` | CSS 的 syscall 入口（号 **261–266**：卷枚举/挂载/卸载/分配字母/重扫/格式化；✅ 261/265 已实现，其余桩） | CSS-1 / CSS-3 |
+| `kernel/src/storage/letters.rs` | ✅ **CSS-3 已落地**：盘符表（确定规则 `C`/`D`/… + 自定义映射持久化到 CKM 状态区 `storage/letters`；`assign`/`clear`/`load_from_store`/`default_for`/`selftest`） | CSS-3 ✅ |
+| `kernel/src/syscall/storage.rs` | CSS 的 syscall 入口（号 **261–266**：卷枚举/挂载/卸载/分配字母/重扫/格式化；✅ 261/262/263/264/265 已实现，**只余 266 桩**） | CSS-1 / CSS-3 |
 | `kernel/src/fs/{vfs,mount,inode,file,ramfs,fat}.rs` | ✅ **CSS-2 已落地**：加 `caps`/`volume_info`（及 `FsCaps`/`VolumeInfo`/`MountOptions`）、FAT 探测收归 `fs/fat.rs`、挂载表拆「后端 / 挂载点」并带 `vol_id`/`options`（`alias_volume`/`umount`/`sync_counts`）、挂载错误改 errno、`stat` 输出 `vol=` | CSS-2 ✅ |
 | `kernel/src/fs/{exfat,ext2,ext4,ntfs,iso9660}/` | 新文件系统后端（各自实现 `FileSystem`，VFS 不变） | CSS-4 / CSS-6 |
-| `userland/libc` 的 path 模块 | Windows 式路径（`C:\x`）→ POSIX 路径重写（查 `storage_volumes`，不硬编码字母） | CSS-3 |
+| `userland/libc/src/path.rs` | ✅ **CSS-3 已落地**：Windows 式路径（`C:\x`）→ POSIX 路径重写（查 `storage_volumes`，不硬编码字母；`is_windows`/`resolve`/`resolve_str`） | CSS-3 ✅ |
 | `userland/ckm/`（`ckm storage …`） | CSS Manager：列出磁盘/分区/卷、挂载/卸载、分配盘符、显示健康与只读原因 | CSS-5 |
 | `tools/mkfs/` | ✅ **GPT/MBR 分区表镜像生成**（CSS-1 已落地，`make test-storage` 的夹具），沿用「自己生成 + 宿主独立复核」的做法 | CSS-1 |
 
@@ -188,6 +191,7 @@ time,process,scheduler,fs,driver,network,ipc,security}`、`boot/`、`shared/` �
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-12 | **CKM-2**：`kernel/src/ckm/` 新增 `overlay.rs`（覆盖层注册表）与 `store.rs`（状态区）；3.1 节由「尚未创建」改为「已落地/待建」；`tools/image-builder/build_image.py` 的镜像布局（FAT 63 MiB + 状态区 1 MiB）与新增 `tests/test_ckm_store.py` |
 | 2026-10-11 | v1.0 之后规划：新增第 3.2 节（**CSS 存储管理**预计新开/扩展的目录：`kernel/src/storage/`、`syscall/storage.rs`、`fs/{exfat,ext2,ext4,ntfs,iso9660}/`、libc 路径模块、`ckm storage`、`mkfs` 分区表生成 —— 均未创建，进入 CSS-1…CSS-6 时回填） |
 | 2026-10-11 | 纯内核化**执行阶段二/四/五（部分）**：`libc/`(7) 与 `user/`(33) 移入 `userland/` 独立 workspace（目录树重写为本节的 userland/ 子树，含 `Cargo.toml`/`.cargo/config.toml`/`Makefile`/`tools/check_dyn_fixture.py`）；`kernel/build.rs` 改为「按 `manifest.txt` 内嵌」（不再构建用户程序）；新增 `tools/check-boundary.py`；根 `Cargo.toml` 收敛为 `shared/boot/kernel` + `exclude userland`；第 4 节由「规划」改为「已执行大部分」（实测：无 userland 的 checkout 仍能 `make image` + `make test-kernel-only`） |
 | 2026-10-11 | 纯内核化规划：新增第 4 节（目标结构：内核/用户态双仓库、新增 `abi/`、9 个内核文件改动清单）；修订记录顺延为第 5 节 |

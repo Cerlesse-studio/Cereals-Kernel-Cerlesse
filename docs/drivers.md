@@ -103,7 +103,9 @@ block: selftest PASS
 - `chunked read PASS`：4608 字节的读**跨过**驱动内部 8 扇区（4 KiB）搬运边界，与 4096 / 512
   两次独立读的拼接结果逐字节一致 → 分块重组与 LBA 偏移换算正确；
 - `write/readback PASS (lba=131071 ...)`：最后一个扇区写 → 读回 → **还原** → 再读回；
-  用非 snapshot 方式启动后比对镜像 md5，确认「还原」真的把盘恢复原样（见 1.5）；
+  用非 snapshot 方式启动后比对镜像的 FAT 区域，确认「还原」真的把盘恢复原样（见 1.5）；
+  > 该扇区自 CKM-2 起落在**状态区**（镜像尾部 1 MiB）的末尾：它仍然被还原，
+  > 而状态区的两个槽在区域**开头**（`ckm/store.rs`），两者不重叠；
 - `negative cases PASS`：长度非整扇区、LBA 越过容量、LBA 溢出（`u64::MAX-1`）三种输入都必须
   报错 —— 最后一条曾经真的漏过（`lba + sectors` 环绕后看起来在容量内），见 B-16/B-17。
 
@@ -126,7 +128,7 @@ block: selftest PASS
 ### 1.5 磁盘写入的「无损」验证
 
 `block: selftest` 会写最后一个扇区再做还原。为确认还原有效（而不只是「读回自身缓存」），
-用**不带 `snapshot=on`** 的方式启动一次并比对镜像：
+用**不带 `snapshot=on`** 的方式启动一次并比对镜像的 **FAT 区域（前 63 MiB）**：
 
 ```text
 before=26a5e771b617734a3ac211caff0fa189
@@ -134,7 +136,14 @@ after =26a5e771b617734a3ac211caff0fa189
 IMAGE UNCHANGED (write test restored the scratch sector)
 ```
 
-测试套件里则统一用 `snapshot=on`（临时写时复制），既让并行场景共享同一镜像，也不污染原始文件。
+> **CKM-2（2026-10-12）起只比前 63 MiB**：镜像尾部 1 MiB 是 **CKM 状态区**
+> （`kernel/src/ckm/store.rs` 的双槽 A/B + CRC32），启动时**按设计会被写入**
+> （首次开机建立状态区，之后 `put` 只写非活动槽）。这是两个区域的两条不同性质，不是「无损」被破坏：
+> 扇区 131071（scratch）的内容被还原，状态区按原子写更新 —— 第二次启动读回 `state=loaded` 就是
+> 「读到的是盘上的字节」的直接证据（`make test-ckm-store`）。同理，`make run` 之后整盘 md5 会变。
+
+测试套件里则统一用 `snapshot=on`（临时写时复制），既让并行场景共享同一镜像，也不污染原始文件；
+只有 CKM-2 的持久化自测（`tests/test_ckm_store.py` + `--persist`）会真的落盘，且它用的是**独占副本**。
 
 ### 1.6 v0.4 已落地部分（中断控制器 + PIT 100Hz + PS/2 键盘 + 上下文切换原语）
 

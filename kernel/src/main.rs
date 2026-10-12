@@ -187,6 +187,17 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
         halt();
     }
 
+    // CKM-2（第一步）：覆盖层机制 —— 注册/撤销真的改变 `open` 的结果。
+    //
+    // 位置在 `ckm::api::init` 之后（覆盖表的判定点 7/8 会写审计环，环必须先建好）、
+    // 用户进程之前（用户看到的必须是**空表 + 基线视图**，见 `docs/ckm.md` 6.4）。
+    // 自测的**文件动作**在 `fs/` 侧发起：`ckm/` 不依赖 `fs/`，方向是 `fs/ ──▶ ckm/`。
+    if let Err(err) = fs::overlay_selftest() {
+        driver::serial::print("fs: overlay FAIL: ");
+        driver::serial::println(err);
+        halt();
+    }
+
     driver::serial::println("Kernel started!");
 
     // v0.4：观测 IF 状态，确认中断使能路径已接通。
@@ -267,8 +278,20 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
         }
     }
 
+    // CKM-2（第二步）：可写持久化状态区 —— 系统盘尾部 1 MiB 的双槽 A/B 区。
+    //
+    // 位置必须在块设备注册（驱动探测）之后：状态区是**扇区级**的原始区，不在任何
+    // 文件系统里（定夺与布局见 `docs/ckm.md` 第 12 节与 `ckm/store.rs`）。
+    // 因此它比文件系统挂载更早可用，也不需要先有可写文件系统（那是 CSS-4）。
+    //
+    // **CSS-3 起它比卷扫描更早**：盘符（`storage/letters`）等存储偏好要在
+    // `storage::init` 枚举卷时就已知，否则 `storage: vol … letter=` 证据行会
+    // 先打出一组缺省字母、再被盘上的映射推翻 —— 启动日志就成了两份真相。
+    ckm::store::init();
+
     // CSS-1（H-08）：块设备之上的分区/卷只读识别 —— 先看清「有哪些卷」，再谈挂载。
     // 位置在块设备验收之后、`fs::mount_disks` 之前：扫描是只读的，失败不会残留在盘上。
+    // `storage::init` 内部先装载 `storage/letters`（CSS-3），因此依赖上面的状态区。
     if let Err(err) = storage::init() {
         driver::serial::print("storage: FAIL: ");
         driver::serial::println(err);
@@ -276,6 +299,20 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
     }
     if let Err(err) = storage::selftest() {
         driver::serial::print("storage: FAIL: ");
+        driver::serial::println(err);
+        halt();
+    }
+
+    if let Err(err) = ckm::store::selftest() {
+        driver::serial::print("ckm: store FAIL: ");
+        driver::serial::println(err);
+        halt();
+    }
+    // CSS-3：盘符缺省规则 + 自定义分配 + 持久化往返（证据见 `make test-storage`）。
+    // 必须在状态区自测之后：它会把自定义映射写进同一个区（`storage/letters`）——
+    // 「同一个区被第二个消费者使用」这件事本身因此是可断言的。
+    if let Err(err) = storage::letters::selftest() {
+        driver::serial::print("storage: letters FAIL: ");
         driver::serial::println(err);
         halt();
     }

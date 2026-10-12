@@ -134,8 +134,9 @@ v0.6 与 v0.7 一起构成系统调用 / 用户空间阶段，但两者有清晰
 分发表按 `SYS_MAX`(=267) 排满：未实现的号落在公共 ENOSYS 桩，
 「号合法但未实现」与「号越界」是两种可区分的失败路径。
 号段划分：`0..=255` 沿用 Linux 语义，`>= 256` 是 Cerlesse 扩展 —— `256` = `getprocs`、
-`257..=260` 由 CKM 提案预留、`261..=266` 由 CSS 使用（CSS-1 已实现 **261 `storage_volumes`** 与
-**265 `storage_rescan`**，其余落 ENOSYS 桩，见 3.11）。
+`257..=260` 由 CKM 提案预留、`261..=266` 由 CSS 使用（已实现 **261 `storage_volumes`**、
+**262 `storage_mount`**、**263 `storage_unmount`**、**264 `storage_assign_letter`**、**265 `storage_rescan`**；
+只有 **266 `storage_format`** 仍落 ENOSYS 桩 —— 它要 CSS-4 才定义，见 3.11/3.12）。
 
 文件 syscall 的两条硬规则（v0.7 新增）：
 
@@ -524,7 +525,7 @@ v0.9 第三步把入口改成按进程切换（当前进程下标 + 每进程内
 
 | 程序 | RAMFS 路径 | 用到的内核能力 | 输出（可与串口逐条对齐） |
 | ---- | ---- | ---- | ---- |
-| `user/ls` | `/bin/ls` | `getdents` | `ls: / entries=5` + 每条 `ls: entry name=… kind=file|dir size=…` |
+| `user/ls` | `/bin/ls` | `getdents` | `ls: / entries=6` + 每条 `ls: entry name=… kind=file|dir size=…` |
 | `user/ps` | `/bin/ps` | `getprocs` | 表头 + 每条 `ps: pid=… ppid=… state=RUNNING comm=…` + `ps: N process(es)` |
 | `user/cat` | `/bin/cat` | `open`/`read`/`write`/`close` | 文件内容 + `cat: /etc/motd bytes=23` |
 | `user/echo` | `/bin/echo` | `argc`/`argv` + 一次 `write` | 参数拼成一行（一次系统调用，与内建 `echo` 的每参数一次 `write` 不同） |
@@ -537,9 +538,10 @@ Linux `task_struct.comm` 的形状）—— `create` 用调试名填充，`execv
 验收（`make test-programs`：注入 `ls` / `ls /bin` / `ps` / `/bin/echo …` / `/bin/cat /etc/motd`，
 17 项 + 5 条正则）：
 
-- [x] `user: getdents path=/ entries=5 returned=5` + `ls: / entries=5`：`ls` 读的是 **VFS 的目录项**
+- [x] `user: getdents path=/ entries=6 returned=6` + `ls: / entries=6`：`ls` 读的是 **VFS 的目录项**
       （v0.7 起 `list()` 只有内核自测用过）；`ls: entry name=bin kind=dir size=0` 证明元数据也被读出来了；
-      （`/` 在第五步时是 4 条，3.9 又加了 `/lib` → 5 条）
+      （`/` 在第五步时是 4 条，3.9 又加了 `/lib` → 5 条，CKM-2 又加了内核的 `/ckm`（覆盖区）→ **6** 条；
+      `fs: ls / entries=5` 那条是内核自测的窗口，在 `/ckm` 建立之前，因此不变）
 - [x] `ls: /bin entries=8`：`/bin` 里恰好是这次构建写进去的 8 个程序
       （`sh`/`hello`/`ls`/`cat`/`echo`/`ps`/`dynhello`/`volumes`，后两个见 3.9 与 3.11）—— 同时证明 `fs::init` 的程序清单是完整的；
 - [x] `user: getprocs count=2` + `ps: pid=3 ppid=0 state=RUNNING comm=sh` + `ps: pid=N ppid=3 … comm=ps`：
@@ -616,7 +618,8 @@ v0.9 之前装载器只接受 `ET_EXEC`：ELF 里的地址就是运行地址，�
 v0.9 收官时「号已定义但未实现」的调用只剩 `mprotect`（`syscall_table::UNIMPLEMENTED` 里
 唯一一项，串口上表现为 `syscall: ENOSYS nr=10 name=mprotect`）。它同时是两件事的前提：
 `mmap(PROT_NONE)` 的映射要能再启用，以及 W^X 下的「先写、再换只执行」。本步把它补上后
-**这张表一度空了** —— 随后 CSS-1（3.11）在扩展号段重新放入 262/263/264/266（CSS-3/CSS-4 待实现）。
+**这张表一度空了** —— 随后 CSS-1（3.11）在扩展号段放入 261/265，CSS-3（3.12）再放入 262/263/264，
+如今这张桩表只剩 **266 `storage_format`**（CSS-4 才定义）。
 
 | 项 | 实现位置 | 说明 |
 | ---- | ---- | ---- |
@@ -680,6 +683,31 @@ CSS-1（见 [storage.md](./storage.md)）在内核里立起「设备 → 分区 
 - [x] 主表头损坏 → 回退备用表头；两表 CRC 都不对 → `health=degraded`；未识别文件系统 → `health=unsupported`
       但**仍然列出**（可见但不挂载）。
 
+### 3.12 卷管理（CSS-3，2026-10-12 落地）
+
+CSS-3（见 [storage.md](./storage.md) 第 4/9 节）把 262/263/264 从 ENOSYS 桩上拿下，让"盘符"与
+"把卷挂到路径"真的能用。三个号都是**受控动作**，走 CKM 判定点 8（`CAP_STORAGE_ADMIN`）；
+参数校验（长度/保留位/指针/UTF-8）**先于**能力判定，因此 `EINVAL` 不会退化成 `EPERM`。
+
+| syscall | 号 | 失败语义 | 行为 |
+| ---- | ---- | ---- | ---- |
+| `storage_mount(vol_id_ptr, vol_id_len, point_ptr, point_len, flags)` | **262** | `ENOENT` 卷不存在 / `ENOTSUP` 没后端 / `EEXIST` 挂载点重复 | 把卷挂到路径；`flags` bit0 = 只读挂载（→ `ro-mount`），其余位 `EINVAL`；已挂载的卷再加点只加**别名**（不重开设备） |
+| `storage_unmount(point_ptr, point_len, 0, 0, 0)` | **263** | `ENOENT` 不是挂载点 / `EINVAL` 卸根 | 卸掉别名；卷仍在卷表（`mount_count` 减一） |
+| `storage_assign_letter(vol_id_ptr, vol_id_len, letter, 0, 0)` | **264** | `EEXIST` 字母被占 / `EINVAL` 非法字母 | 分配/取消盘符（`letter = 0` 回到缺省规则）；映射写进 CKM 状态区 `storage/letters`，重启后不变 |
+
+- 实现位置 `syscall/storage.rs`；底层落点 `fs::mount_volume_by_id`/`fs::unmount_point`（262/263）与
+  `storage::registry::assign_letter` → `storage/letters::assign`（264）；
+- **用户态**：`libc` 新增 `storage_mount`/`storage_unmount`/`storage_assign_letter` 包装，
+  以及 `libc::path`（`is_windows`/`resolve`/`resolve_str`）把 `C:\x` 查卷表改写为 POSIX 路径；
+  `/bin/volumes` 扩为 `list`/`mount`/`unmount`/`letter`/`demo` 子命令；
+- 验收（`make test-storage` + `make test-programs` + `make test-ckm`）：
+  - [x] `volumes demo`（Shell，uid 1000）：`storage_mount` → 用 `C:\KERNEL.ELF`（libc 重写）与
+        `/volumes/<label>/KERNEL.ELF` **两个入口**读同一段字节 → `storage_unmount` → 再开返回 `ENOENT`；
+  - [x] 盘符：`storage: letters table n=… first=C`、卷记录的 `letter=` 与表一致；自定义 `Z` 写盘
+        （`ckm: store put key=storage/letters …`）；冲突拒绝 `storage: letters conflict rejected letter=D`；
+  - [x] 权限：`/bin/hello`（uid 2000）三次存储受控动作均 `-1` + `ckm: policy op=storage_mount … need=0x10`
+        （判定点 8 的拒绝三件套）。
+
 ## 4. 调用链示例
 
 实际调用链（v0.7 + v0.9 用户堆 / 动态链接 + v1.0 `mprotect`）：
@@ -735,3 +763,4 @@ fd ≥ 3 一律经 VFS 抽象路由，syscall 层不认识具体后端。
 | 2026-10-11 | **v0.9 第六步：内核侧最小动态链接** —— 新增 3.9；`syscall/elf.rs::load` 按 `e_type` 分流（`ET_DYN` → 新增 `syscall/dynamic.rs`，`ET_EXEC` 路径不变）；`address_space.rs` 新增共享库窗口（`USER_DYN_BASE` = 基址 + 1 MiB、32 页）与 `map_dyn_page`/`dyn_page_count`/`phys_of`（内核 CR3 下写重定位），`fork` 复制窗口、`page_flags` 认可该窗口、`Drop` 整树释放；`dynamic.rs` 解析 `PT_INTERP`/`PT_DYNAMIC`/`DT_NEEDED`（`/lib/<name>` 递归装载，上限 8 个对象）并应用 `R_X86_64_RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`R_X86_64_64`（按名字线性扫描 `.dynsym`；`DT_PLTREL=REL` 明确拒绝）；新增夹具 `user/dynhello/`（`as`+`ld` 现编，`kernel/build.rs` 内嵌）与 RAMFS `/lib`（`fs::init` 新增 `libraries` 参数，程序清单 7 → 8）；新增 `make test-dyn`（10 项）与 `make dyn-hostcheck`（宿主 glibc 独立复核），`make test-fs` 20 → 21 项、`test-programs` 的 `/` 与 `/bin` 条目数同步 5/7；3.8 的条目数断言与 3.1 的地址布局/`ET_EXEC` 说明同步更新 |
 | 2026-10-11 | **v1.0 第一步：`mprotect`（运行时改保护属性）** —— 新增 3.10；`syscall/memory.rs` 新增 `sys_mprotect`（页对齐/`len>0`/未知位/`W^X` 四类 ABI 拒绝，每类留一行 `user: mprotect rejected (<reason>)`）+ `mmap(PROT_NONE)` 由拒绝改为合法；`address_space.rs` 新增 `mprotect`（范围须在同一窗口、每页已映射，否则 `-EINVAL`；`PROT_NONE` = 清 `USER` 留 `PRESENT`）、`UserWindow`、`prot_to_flags`、`accessible`（`PRESENT`+`USER` 齐备才算可访问）与 `set_page_flags`（改权限即 `invlpg`），堆窗口新增逐页 `heap_flags`（`brk` 增长/收缩与 `fork` 同步，`page_flags` 据此判断堆页）；`syscall_table` 注册 10 号、`UNIMPLEMENTED` 因此**空表**（`mod.rs` 的打印注释同步）；`libc` 新增 `mprotect`/`PROT_NONE`（`lib.rs` re-export）；`user/hello` 新增 `mprotect_selftest`（`PROT_NONE` → 内核拒收 `-EFAULT` → 内容原样 → `RX` 后真的执行机器码 → 6 个负例 → `munmap` 照常归还）；`make test-user` 61 → **91 项** PASS（含 brk 堆窗口的 `PROT_NONE` 往返）；头部状态与 2.7 表、1、3.4/3.5 的「未做」清单同步 |
 | 2026-10-11 | **CSS-1：存储枚举（261 `storage_volumes` / 265 `storage_rescan`）** —— 新增 3.11；`syscall/storage.rs` 实现两个号（定长 64 字节卷记录、确定性枚举、`storage_volumes` 无需能力位、`rescan` 设备不存在 `-ENODEV`）；`syscall_table.rs` 的 `SYS_MAX` 257 → **267**，并在 CKM 预留的 257–260 之后开出 CSS 号段 261–266（261/265 已实现，262/263/264/266 落 `UNIMPLEMENTED` 桩，串口可区分「未实现」与「号越界」）；`libc` 新增 `storage_volumes`/`storage_rescan` + `volume_*` 解析器，新增用户程序 `user/volumes` → `/bin/volumes`；头部号段表、1 节分发表说明、3.4 与 3.10 的「空表」表述同步 |
+| 2026-10-12 | **CSS-3：卷管理（262 `storage_mount` / 263 `storage_unmount` / 264 `storage_assign_letter`）** —— 新增 3.12；`syscall/storage.rs` 实现三个号（参数校验先于能力判定；对应 `fs::mount_volume_by_id`/`fs::unmount_point` 与 `storage::registry::assign_letter`）；`libc` 新增三个包装与 `path` 模块（`C:\x` → POSIX）、`/bin/volumes` 扩为 `list`/`mount`/`unmount`/`letter`/`demo`；头部号段表改为「只余 266 `storage_format` 落 ENOSYS 桩」，3.10 的桩表描述同步；验收在 `make test-storage`（盘符断言）/`test-programs`（`volumes demo` 双入口）/`test-ckm`（零能力拒绝） |

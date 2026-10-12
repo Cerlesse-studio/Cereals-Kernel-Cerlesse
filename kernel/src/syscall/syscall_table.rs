@@ -11,7 +11,8 @@
 //! `0..=255` 保持 Linux 语义，`>= 256` 明确是 Cerlesse 自己的 ABI。
 //! CKM-1 在 257..=259 上实现了策略查询 / 审计读取 / 组件状态（260 留桩）；
 //! CSS-1 在 CKM 号段之后开出存储号段 `261..=266`
-//! （`docs/storage.md` 6.3）：261/265 已实现，其余落 [`UNIMPLEMENTED`] 桩。
+//! （`docs/storage.md` 6.3）：261/265 已实现，其余落 [`UNIMPLEMENTED`] 桩；
+//! **CSS-3 把 262/263/264 全部实现**（挂载 / 卸载 / 盘符），只剩 266（格式化）留桩。
 //!
 //! 表按 `SYS_MAX` 排满：未单独实现的号落在公共 ENOSYS 桩上，
 //! 因此「号合法但未实现」与「号越界」是两种可区分的失败
@@ -58,11 +59,11 @@ pub const SYS_CKM_POLICY_SET: u64 = 260;
 pub const SYS_STORAGE_VOLUMES: u64 = 261;
 /// 存储重扫（CSS-1）：`disk_index == u32::MAX` 表示全部设备。
 pub const SYS_STORAGE_RESCAN: u64 = 265;
-/// CSS 的其余预留号：262/263/264 属 CSS-3、266 属 CSS-4（见 [`UNIMPLEMENTED`]）。
+/// 按卷身份挂载（**CSS-3 已实现**）：已挂载的卷只加别名挂载点（`docs/storage.md` 6.3）。
 pub const SYS_STORAGE_MOUNT: u64 = 262;
-/// 卸载卷（CSS-3 实现）。
+/// 卸载挂载点（CSS-3 已实现）：只摘别名，卷仍在卷表里。
 pub const SYS_STORAGE_UNMOUNT: u64 = 263;
-/// 分配/取消盘符（CSS-3 实现）。
+/// 分配/取消盘符（CSS-3 已实现）：映射写进 CKM 状态区（`storage/letters`）。
 pub const SYS_STORAGE_ASSIGN_LETTER: u64 = 264;
 /// 创建/格式化文件系统（CSS-4 实现）。
 pub const SYS_STORAGE_FORMAT: u64 = 266;
@@ -71,7 +72,7 @@ pub const SYS_STORAGE_FORMAT: u64 = 266;
 /// `0..=255` 是 Linux x86_64 号段，`256..` 是 Cerlesse 扩展号段（见模块头）：
 /// `256` = `getprocs`，`257..=260` 是 CKM 号段（CKM-1 已实现 257/258/259，
 /// 260 落 [`UNIMPLEMENTED`] 桩），`261..=266` 由 CSS 使用
-/// （261/265 已在 CSS-1 实现，其余落 [`UNIMPLEMENTED`] 桩）。
+/// （CSS-1 实现 261/265，CSS-3 实现 262/263/264，266 待 CSS-4）。
 pub const SYS_MAX: u64 = 267;
 
 /// 已定义但尚未实现的系统调用号（逐个补齐）：`(号, 名字)`。
@@ -81,16 +82,13 @@ pub const SYS_MAX: u64 = 267;
 /// v0.7 已把 `read/open/close` 从这张表里摘掉；用户堆（`mmap/munmap/brk`）
 /// 见下方 [`SYS_TABLE`]。
 ///
-/// **CSS-1 起这张表重新有内容**：CSS 的 262/263/264（挂载/卸载/字母，CSS-3）
-/// 与 266（格式化，CSS-4）先定义号并落 ENOSYS 桩，实现后从表里摘掉；
+/// **CSS-1 起这张表重新有内容**（266 格式化待 CSS-4）；
 /// **CKM-1 追加 260**（`ckm_policy_set`）：号在阶段 1–3 已定义但行为未定，
-/// 落在同一张桩表上（阶段 4 才给实现）。
+/// 落在同一张桩表上（阶段 4 才给实现）；**CSS-3 把 262/263/264 从表里摘掉**
+/// （挂载/卸载/字母已经实现，见 `syscall/storage.rs`）。
 /// 串口上的 `syscall: ENOSYS nr=… name=…` 依然能区分「未实现」与「号越界」。
-const UNIMPLEMENTED: [(u64, &str); 5] = [
+const UNIMPLEMENTED: [(u64, &str); 2] = [
     (SYS_CKM_POLICY_SET, "ckm_policy_set"),
-    (SYS_STORAGE_MOUNT, "storage_mount"),
-    (SYS_STORAGE_UNMOUNT, "storage_unmount"),
-    (SYS_STORAGE_ASSIGN_LETTER, "storage_assign_letter"),
     (SYS_STORAGE_FORMAT, "storage_format"),
 ];
 
@@ -153,8 +151,12 @@ pub const SYS_TABLE: [SyscallHandler; SYS_MAX as usize] = {
     table[SYS_CKM_POLICY_QUERY as usize] = crate::syscall::ckm::sys_ckm_policy_query;
     table[SYS_CKM_AUDIT_READ as usize] = crate::syscall::ckm::sys_ckm_audit_read;
     table[SYS_CKM_COMPONENT_STATE as usize] = crate::syscall::ckm::sys_ckm_component_state;
-    // CSS-1（H-08）：卷表快照与重扫（其余 CSS 号落 UNIMPLEMENTED 桩）
+    // CSS-1（H-08）：卷表快照与重扫
     table[SYS_STORAGE_VOLUMES as usize] = crate::syscall::storage::sys_storage_volumes;
     table[SYS_STORAGE_RESCAN as usize] = crate::syscall::storage::sys_storage_rescan;
+    // CSS-3：按卷身份挂载 / 卸载 / 盘符（266 格式化仍落 UNIMPLEMENTED 桩）
+    table[SYS_STORAGE_MOUNT as usize] = crate::syscall::storage::sys_storage_mount;
+    table[SYS_STORAGE_UNMOUNT as usize] = crate::syscall::storage::sys_storage_unmount;
+    table[SYS_STORAGE_ASSIGN_LETTER as usize] = crate::syscall::storage::sys_storage_assign_letter;
     table
 };
