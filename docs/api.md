@@ -31,7 +31,8 @@
 
 编号沿用 **Linux x86_64** 语义，便于将来直接运行现成用户态程序。
 `0..=255` 沿用 Linux 语义，`256..` 是 Cerlesse 扩展号段（256 = `getprocs`，257–260 是 CKM 号段
-—— 257/258/259 已在 CKM-1 实现，260 预留给 CKM-4；261–266 由 CSS 使用）；号段上限 `SYS_MAX = 267`；
+—— 257/258/259 已在 CKM-1 实现，260 预留给 CKM-4；261–266 由 CSS 使用，其中 261/262/263/264/265
+已实现、只有 266 `storage_format` 待 CSS-4）；号段上限 `SYS_MAX = 267`；
 **号越界**与**号合法但未实现**是两种可区分的失败（前者 `parse` 返回 `None`，后者落在公共 ENOSYS 桩，均返回 `-ENOSYS`）。
 
 | 号 | 名称 | 状态 | 说明 |
@@ -57,7 +58,9 @@
 | 259 | `ckm_component_state` | ✅ | 组件表快照，定长 64 字节记录，按确定性顺序（CKM-1） |
 | 260 | `ckm_policy_set` | ENOSYS | 改 CKM 策略（CKM-4；阶段 1 的授予面为零） |
 | 261 | `storage_volumes` | ✅ | 卷表快照，定长 64 字节记录（CSS-1，只读、无需能力位） |
-| 262–264 | `storage_mount`/`unmount`/`assign_letter` | ENOSYS | CSS-3 待实现（扩展号段；CSS-2 已先提供**内核内**的 `fs::mount::MountTable::{mount_volume,alias_volume,umount}` 作为它的落点） |
+| 262 | `storage_mount` | ✅ | 把卷挂到路径（扩展号段；需 `CAP_STORAGE_ADMIN`，CSS-3） |
+| 263 | `storage_unmount` | ✅ | 卸载别名，卷仍在卷表（需 `CAP_STORAGE_ADMIN`，CSS-3） |
+| 264 | `storage_assign_letter` | ✅ | 分配/取消盘符（需 `CAP_STORAGE_ADMIN`；映射落 CKM 状态区 `storage/letters`，CSS-3） |
 | 265 | `storage_rescan` | ✅ | 重扫设备的分区与文件系统（CSS-1；设备不存在 `-ENODEV`） |
 | 266 | `storage_format` | ENOSYS | CSS-4 待实现（扩展号段） |
 | 其他 | — | ENOSYS | 号合法但未实现：查表命中 ENOSYS 桩；常见者会打印 `syscall: ENOSYS nr=… name=…` |
@@ -317,6 +320,10 @@ isize ckm_component_state(u8 *buf, usize buf_len, u64 *out_count, 0, 0)
 | `getprocs` | `fn getprocs(buf: &mut [u8]) -> isize` | 定长 40 字节记录（`procinfo_*` 解析器） |
 | `storage_volumes` | `fn storage_volumes(buf: &mut [u8], out_count: Option<&mut u64>) -> isize` | 定长 64 字节记录（CSS-1，`volume_*` 解析器） |
 | `storage_rescan` | `fn storage_rescan(disk_index: u32) -> isize` | `u32::MAX` = 全部（CSS-1） |
+| `storage_mount` | `fn storage_mount(vol_id: &str, point: &str, read_only: bool) -> isize` | 需 `CAP_STORAGE_ADMIN`（CSS-3） |
+| `storage_unmount` | `fn storage_unmount(point: &str) -> isize` | 需 `CAP_STORAGE_ADMIN`（CSS-3） |
+| `storage_assign_letter` | `fn storage_assign_letter(vol_id: &str, letter: u8) -> isize` | `letter = 0` 取消；需 `CAP_STORAGE_ADMIN`（CSS-3） |
+| `path::resolve` / `path::resolve_str` / `path::is_windows` | `(&str, &mut [u8]) -> Result<…, isize>` / `(&str) -> bool` | `C:\x` 查 `storage_volumes` 重写为 POSIX（CSS-3） |
 | `ckm_policy_query` | `fn ckm_policy_query(op: u16, arg: u64, out: &mut [u8]) -> isize` | `0`/`-EPERM`；48 字节记录（CKM-1） |
 | `ckm_audit_read` | `fn ckm_audit_read(buf: &mut [u8], since_seq: u64, out_count: Option<&mut u64>) -> isize` | 返回**条数**；需 `CAP_AUDIT_READ`（CKM-1） |
 | `ckm_component_state` | `fn ckm_component_state(buf: &mut [u8], out_count: Option<&mut u64>) -> isize` | 64 字节记录 × 32 槽，确定性顺序（CKM-1） |
@@ -541,3 +548,4 @@ make clean
 | 2026-10-11 | 补记 v0.9 第六步（最小动态链接）：5.5 构建期接口新增 `as`+`ld` 夹具说明；第 7 节新增 `test-dyn`（10 项）与 `dyn-hostcheck`、补上漏记的 `test-programs`/`test-network` 行，`test-fs` 20 → 21 |
 | 2026-10-11 | **v1.0 第一步：`mprotect`** —— 号表第 10 行由 ⛔ 改为 ✅；新增 2.5/2.6 的 `PROT_NONE` 语义与 `mprotect` 逐条说明（2.6 之后的节号顺移一位）；4.1 新增 `mprotect` 封装、4.2 新增 `PROT_NONE`；errno 表 `-38` 行改写；第 7 节 `test-user` 61 → **91** 项 |
 | 2026-10-11 | **CSS-1：存储枚举** —— `SYS_MAX` 256 → **267**（号段说明补 256/257–260/261–266 划分）；号表新增 `getdents`(78)/`getprocs`(256)/`storage_volumes`(261)/`storage_rescan`(265) 与 262–264/266 的 ENOSYS 行；第 7 节新增 `storage-images`/`test-storage-fixtures`/`test-storage`/`test-storage-mbr` 并把 `test-programs` 更新为 23 + 6 正则 |
+| 2026-10-12 | **CSS-3：卷管理（262/263/264）** —— 号表 262–264 由 ENOSYS 改为 ✅（`storage_mount`/`storage_unmount`/`storage_assign_letter`，均需 `CAP_STORAGE_ADMIN`，判定点 8）；4.1 新增三个 `libc` 封装与 `path::resolve`/`resolve_str`/`is_windows`（`C:\x` 查卷表重写为 POSIX，不硬编码字母）；号段说明改为「只余 266 待 CSS-4」；第 7 节 `test-storage`/`test-programs`/`test-ckm` 的盘符与双入口断言同步 |

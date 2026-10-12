@@ -2,11 +2,16 @@
 
 - 阶段：跨阶段 / 内核级权限与扩展管理（CKM；执行上排在 v1.0 之后，桌面路线之前）
 - 最后更新：2026-10-12
-- 状态：🚧 **CKM-1（内核接口）已落地** —— `kernel/src/ckm/`（`cred`/`policy`/`state`/`audit`/`api`）
-  + v1.0 的 `kernel/src/security/`（凭证 uid/gid + 文件 mode + `EACCES`）+ 判定点 1/3/5/6
-  + syscall `257`/`258`/`259` 已在 `x86_64` 上运行并通过验收（落地清单见 **9.1**，验收见第 10 节）；
-  **仍未实现**：CKM-2 可写持久化（含覆盖层机制）、CKM-3 事务/回执/回滚、CKM-4 `ckmd`/`ckm` CLI、
-  CKM-5 覆盖层全量、CKM-6 恢复环境与安全模式、CKM-7 可加载内核模块 —— 它们仍按第 9 节分期推进
+- 状态：🚧 **CKM-1（内核接口）与 CKM-2（可写持久化 + 覆盖层机制）已落地**
+  —— 落地清单见 **9.1 / 9.2**，验收见第 10 节。
+  - **CKM-1**：`kernel/src/ckm/`（`cred`/`policy`/`state`/`audit`/`api`）+ v1.0 的
+    `kernel/src/security/`（凭证 uid/gid + 文件 mode + `EACCES`）+ 判定点 1/3/5/6
+    + syscall `257`/`258`/`259`；
+  - **CKM-2**：系统盘尾部 1 MiB 的**双槽 A/B + CRC32 状态区**（`ckm/store.rs`，掉电一致的原子写，
+    开放问题 1 因此取 (b)）+ **覆盖层注册表与路径改写钩子**（`ckm/overlay.rs`，钩子在
+    `fs::mount::resolve`）—— 验收是「写 → 重启 → 读回逐字节一致」与「注册/撤销改变 `open` 结果」；
+  - **仍未实现**：CKM-3 事务/回执/回滚、CKM-4 `ckmd`/`ckm` CLI、CKM-5 覆盖层全量（`.mask`、
+    基线保护、开机顺序）、CKM-6 恢复环境与安全模式、CKM-7 可加载内核模块 —— 仍按第 9 节分期推进
 - 关联：[../DEVELOPMENT.md](../DEVELOPMENT.md)（H-07 需求行）· [docs/README.md](./README.md)（索引）·
   [docs/package-manager.md](./package-manager.md)（`.ckc` 包格式与事务，CKM 的包格式层）·
   [docs/architecture.md](./architecture.md)（第 5 节非目标）· [docs/pure-kernel.md](./pure-kernel.md)（内核/用户态边界）·
@@ -191,13 +196,20 @@ struct Cred {
 | `state.rs` | 组件/扩展状态表（5.4）+ 合法转换校验 + 确定性枚举顺序 | 不持久化（阶段 3 由服务写回执；内核重启后由服务重新注入） |
 | `audit.rs` | 固定容量环形缓冲（**必须** ≥ 64 条）+ 串口行输出 + `ckm_audit_read` 的数据源 | 不做持久化审计（阶段 6 之后再谈） |
 | `api.rs` | 给 `syscall/` 用的唯一入口（把上面四个模块包成几个 `pub` 函数） | 不暴露内部类型给别的内核模块 |
+| `overlay.rs`（CKM-2） | 覆盖层注册表（`register`/`unregister`/`lookup`/`rewrite`）+ 最长前缀/优先级/同优先级冲突拒绝；判定点 7/8 | 不碰文件系统（建覆盖区、读写文件都由 `fs/` 发起）、不做 `.mask` 与基线保护（CKM-5） |
+| `store.rs`（CKM-2） | 可写持久化状态区：双槽 A/B + CRC32 的键值存储（`get`/`put`）+ 跨重启自测 | 不做事务/回执（CKM-3）、不认识包、不做审计落盘（CKM-6） |
 
 依赖关系（必须）：`syscall/* → ckm::api → {policy, cred, state, audit}`；
-`fs/` 只依赖 `ckm::policy` 与前缀常量；**`ckm/` 不反向依赖 `syscall/`**（与 `security/` 一样是叶子被依赖者）。
+`fs/` 依赖 `ckm::policy` 与前缀常量，**并**（CKM-2 起）依赖 `ckm::overlay` 做路径改写；
+**`ckm/` 不反向依赖 `syscall/` 与 `fs/`**（与 `security/` 一样是叶子被依赖者）——
+因此覆盖层的**文件动作**（建立 `/ckm/overlay/**`、读写文件、验证视图变化）都在 `fs/` 侧发起
+（`fs::overlay_selftest`），`ckm/overlay.rs` 本身只维护注册表。
+`ckm/store.rs` 额外依赖 `driver/{serial, block}`（状态区是**扇区级**原始区，它不在任何文件系统里）。
 现有 `security/` 继续承担凭证的 UID/GID 与文件 mode 判定（v1.0），两者分工写在 4.1 与 3.3。
 
-> **现状（2026-10-12）**：上表五个文件已全部落地（`kernel/src/ckm/`，含 9.1 的落地清单），
-> 依赖方向（`syscall/* → ckm::api`、`ckm/` 不反向依赖 `syscall/`）由 `make check-boundary` 与模块内 `use` 共同保证。
+> **现状（2026-10-12）**：上表七个文件已全部落地（含 9.1/9.2 的落地清单），
+> 依赖方向（`syscall/* → ckm::api`、`fs/ → ckm/`、`ckm/` 不反向依赖 `syscall/`/`fs/`）
+> 由 `make check-boundary` 与模块内 `use` 共同保证。
 
 ### 4.2 CKM ABI 版本
 
@@ -283,6 +295,17 @@ ckm: selftest PASS (checks=N)
 12 storage_mount   13 storage_unmount 14 storage_letter   15 storage_format
 16 storage_rescan
 ```
+
+**7/8 自 CKM-2 起有落点**（此前只有枚举，没有调用方）：
+
+- `7 overlay_register`：覆盖表的**每一次变动**（注册与撤销都算）走 `policy::check`，
+  因此能力不足时是「三件套」拒绝（`-EPERM` + 审计 + 证据行）；
+- `8 overlay_conflict`：**语义拒绝** —— 凭证够、但同优先级且前缀重叠。它走 `policy::reject`，
+  证据行的 `need=0x0` 是刻意的：**补任何能力都改变不了这个结果**（`docs/ckm.md` 6.3 第 2 条）。
+  同一条规则也用于「非法 id/前缀/kind」与「表已满」。
+
+> 「能力不足」与「请求不成立」分开记的两个理由：断言可区分（`need=0x0` vs 非 0），
+> 以及审计里 `result=deny` 的原因不会退化成一句「权限不够」。
 
 ## 5. 扩展模型（定稿）
 
@@ -467,7 +490,7 @@ KernelSU 把「挂载/覆盖」做成可插拔的**元模块**（官方文档：
 | 期 | 交付物 | 依赖 | 验收出口 |
 | ---- | ---- | ---- | ---- |
 | **CKM-1 内核接口** ✅ **已落地（2026-10-12）** | `kernel/src/ckm/`（`cred`/`policy`/`state`/`audit`/`api`）+ 3.4 判定点 1/3/5/6 + `ckm_policy_query`/`ckm_audit_read`/`ckm_component_state` + 串口证据 | **v1.0 的 `security/`（uid/gid + mode）已先落地** | `make test-ckm`（22 断言）：缺能力写受保护前缀被拒（`-EPERM`）+ 审计可读（含回绕）+ 组件状态枚举确定性；uid 2000 的 `EPERM`/`EACCES` 对照由 `make test-proc` 断言 |
-| **CKM-2 可写持久化** | 原子写 + 掉电一致的状态区（FAT 写支持或小型日志式区，见开放问题 1）+ VFS 覆盖层的**机制**（`overlay_register/unregister` + 最长前缀/优先级/冲突） | CKM-1 | `make test-ckm`：写-重启-读回一致；覆盖注册/撤销改变 `open` 结果 |
+| **CKM-2 可写持久化** ✅ **已落地（2026-10-12）** | 系统盘尾部 1 MiB 的**双槽 A/B + CRC32 状态区**（`kernel/src/ckm/store.rs`，开放问题 1 取 (b)）+ VFS 覆盖层的**机制**（`kernel/src/ckm/overlay.rs`：注册/撤销/最长前缀/优先级/同优先级冲突拒绝，钩子在 `fs::mount::resolve`） | CKM-1 | `make test-ckm`（覆盖机制：注册/撤销改变 `open` 结果 + 冲突拒绝）+ `make test-ckm-store`（**跨重启**：写 → 重启 → 读回逐字节一致，且第二次启动只读不写）—— 落地清单见 **9.2** |
 | **CKM-3 事务引擎** | H-06 P0b（`cpm.py` → `ckmd` 的库）+ 签名/catalog + 回执 + `recover` + 失败注入 | CKM-2 | `make test-pkg` 扩到 H-06 12.1 的剩余条目（含离线回滚、原子失败、可恢复） |
 | **CKM-4 特权服务与 CLI** | `userland/ckmd`（持 `CAP_CKM_SERVICE`）+ `userland/ckm`（CLI）+ 内核状态树 `/ckm/**` 写路径 | CKM-3 | QEMU 场景 `ckm`：装/启/停/卸/回滚全链路 + 拒绝证据（判定点 1/3/4/5） |
 | **CKM-5 系统修改模块** | `kind=3` 覆盖层全量（优先级、冲突、开机顺序、基线保护） | CKM-4 | QEMU 场景 `ckm-overlay`：停用后 `open` 回基线（6.4 的三条） |
@@ -514,7 +537,52 @@ KernelSU 把「挂载/覆盖」做成可插拔的**元模块**（官方文档：
 | 内核自测（46 项） | 能力矩阵逐项对照（`policy::allowed` vs `check`）、非法状态转换、审计回绕、记录长度 |
 
 > 判定点 4（`ckm_policy_set` = 260）**仍未实现**：阶段 1 的授予面为零，号已定义并落在 ENOSYS 桩上（4.3），属于 CKM-4。
-> 同样仍未实现：状态树 `/ckm/**`（5.4）与状态表的持久化（CKM-2/3）。
+> 仍然没有的（截至 CKM-2）：状态树 `/ckm/**` 的**写路径**（5.4，CKM-4）与状态表的持久化
+> —— 注意区分：CKM-2 交付的是**持久化介质与覆盖层机制**（9.2），而「把状态表写回去」是 ckmd 的事（CKM-3/4）。
+
+### 9.2 CKM-2 落地清单（2026-10-12）
+
+两件事：**可写持久化的介质**（开放问题 1 的定夺）与**覆盖层的机制**。两者都不涉及「包」与事务。
+
+**介质：系统盘尾部 1 MiB 的双槽 A/B 状态区**
+
+| 项 | 内容 |
+| ---- | ---- |
+| 定夺 | 开放问题 1 取 **(b) 极小日志式区**；(a)（给 FAT 加写支持）留给 CSS-4 —— 理由见 `kernel/src/ckm/store.rs` 模块头与第 12 节 |
+| 落点 | 系统盘（块设备 0 = 启动盘）**尾部 1 MiB**，在 FAT **之外**：`tools/image-builder/build_image.py` 先在 63 MiB 上 `mformat`，再把保留区追加回去 —— 设备仍报 64 MiB、`table=none partitions=1`，但文件系统看不到尾部 1 MiB |
+| 布局 | 偏移 0 槽 A（4 KiB）/ 偏移 4096 槽 B（4 KiB）/ 其余保留；槽头 = `magic`("KMS1") + `version` + `seq` + `payload_len` + `crc32(payload)`，payload 是 KV 表（`u16` 计数 + 逐条 `(klen, vlen, key, value)`） |
+| 原子性 | **没有活动指针**（指针本身就是一次非原子写）：写者整槽写**非活动槽**，CRC 通过才切内存视图；读者取「有效（magic/version/长度/CRC 全对）且 `seq` 最大」的槽 —— 写到一半掉电时那个槽的 CRC 对不上，上一个槽完好 |
+| 代码 | `kernel/src/ckm/store.rs`（`init`/`enabled`/`get`/`put`/`key_count`/`selftest`）；`kernel_main` 在 `storage::init` 之后调用 —— 状态区要块设备，但**不需要**文件系统 |
+| 容量 | 16 个键；键 ≤ 32 B / 值 ≤ 255 B（「固定容量 + 明确拒绝」）；`put` 失败**不改**内存视图 |
+| 证据 | `ckm: store area dev=… lba=… slots=2 slot_bytes=4096 state=fresh`（首次）或 `state=loaded …`、`ckm: store put key=… len=N seq=N slot=A` / `slot=B`、`ckm: store verify key=… value=… ok=1`、`ckm: store selftest PASS (checks=N)` |
+| 命名空间 | CSS 的字母表/卷标偏好预留 `storage/letters`、`storage/labels`（[storage.md](./storage.md) 6.6）—— CSS 只定义键与语义，不定义持久化格式 |
+
+**覆盖层：注册表 + 路径改写钩子**
+
+| 项 | 内容 |
+| ---- | ---- |
+| 代码 | `kernel/src/ckm/overlay.rs`（`register`/`unregister`/`lookup`/`rewrite`/`reset`/`entry_at`）；钩子在 `kernel/src/fs/mount.rs` 的 `MountTable::resolve` 与 `route`：**规范化之后、查表之前**改写路径（空表是快路径，不分配） |
+| 模型 | 覆盖区 = `/ckm/overlay/<id>/**`，注册表项 = `(id, kind=3, priority, prefix)`；改写规则 = `OVERLAY_ROOT/<id>` + 前缀之后的剩余部分（前缀是目录 → 镜像目录内容；前缀是**文件** → 镜像文件本身） |
+| 查表 | **最长前缀 → 优先级最高**；同优先级冲突在**注册时**就被拒，因此表里不可能出现「同前缀同优先级」两条 |
+| 冲突 | 前缀重叠 + 优先级不同 → 允许，低者保留但不参与查表（证据行给出 `shadowed=<id>`）；重叠 + 优先级相同 → `op=overlay_conflict result=deny`；`kind ≠ 3` / 非法 id / 前缀覆盖 `/ckm`（自指）/ 重复 id → 拒绝 |
+| 撤销 | `unregister(id)` 移除该 id 的**全部**条目；因为钩子**每次**查表，「新 `open` 一定拿到基线」不需要刷新已打开的文件（6.4 第 2 条） |
+| 落点 | 内核自测 `fs::overlay_selftest()`（在 `fs/` 侧：建覆盖区、注册、读回比对、撤销、断言回基线）—— 用户进程启动时表为空 |
+
+**验收**（可复现的命令 → 断言）
+
+| 命令 | 断言 |
+| ---- | ---- |
+| `make test-ckm` | 40 条断言 + 3 条正则：CKM-1 的原有断言 + 覆盖层「注册改视图（`changed=1 bytes=26`）/ 冲突拒绝 / 优先级遮蔽 / 逐条撤销回基线（`bytes=23`）/ 负例」+ `ckm: store verify … ok=1` + `ckm: store selftest PASS (checks=6)` |
+| `make test-ckm-store` | **跨重启**：清零一份独占镜像副本 → 启动 #1（`state=fresh`，槽 A/B 各写一次）→ 启动 #2 同一份镜像（`state=loaded slot=A seq=3 keys=3`，读回逐字节相同，且 `state=loaded` 的下一行就是读回证据 = **没有重写**） |
+| `make test-orch`（场景 `ckm` / `ckm-store`） | 并行编排下的二次复核（`ckm-store` 用自己的镜像副本，因此可与其他场景并行） |
+| 内核自测 | `ckm: store selftest PASS (checks=6)`、`fs: overlay selftest PASS`（`make run` 与所有启动路径都会跑） |
+
+> **本清单不包含（避免把机制期当成全量期）**：`.mask` 显式隐藏、基线保护（写基线一律 `EROFS`）、
+> 开机加载顺序与「停用扩展 → `state=4` 转换」属于 **CKM-5**；回执/事务/回滚属于 **CKM-3**；
+> `ckmd`/`ckm` CLI 与状态树写路径属于 **CKM-4**。
+>
+> 另外，覆盖层目前仍由**内核内置**注册（6.2）：`overlay_*` 还没有 syscall，CKM-2 的自测就是
+> 第一版「注入者」（`fs::overlay_selftest`），`ckmd` 的注册路径在 CKM-4 接上。
 
 顺序上的三条硬约束（必须）：
 
@@ -550,6 +618,12 @@ KernelSU 把「挂载/覆盖」做成可插拔的**元模块**（官方文档：
 （`make test-ckm` / `make test-proc`，清单见 9.1）；第 2–8 条依赖 CKM-3/5/6 的交付物（事务、覆盖层、恢复环境），
 **在那些期实现之前不宣称通过** —— 文档里的验收条目不因部分实现而变形。
 
+**CKM-2 的覆盖情况（2026-10-12）**：第 4 条（系统文件被扩展覆盖 → 停用后恢复原始视图）的**机制面**已落地
+并被断言（注册改变 `open` 结果、`unregister` 把新 `open` 带回基线，清单见 9.2）。
+但第 4 条要求的另两样还差：`ckm: component id=<id> state=4`（组件状态机，CKM-5）与
+「覆盖表为空 + 基线保护（写基线 `EROFS`）」。因此**第 4 条仍不计入通过**；第 2/3/5/6/7/8 条依赖 CKM-3/5/6。
+另外「可写持久化」这条前置已就绪（9.2 的状态区），CKM-3 的回执与事务可以直接建在它上面。
+
 ## 11. 非目标（第一版明确不做）
 
 1. **不照搬 Android root 机制**：没有 `su` 二进制、没有 SELinux、不 patch 内核以隐藏 root、
@@ -564,10 +638,13 @@ KernelSU 把「挂载/覆盖」做成可插拔的**元模块**（官方文档：
 
 ## 12. 风险与开放问题（需要定夺，未定不进实现）
 
-1. **可写持久化介质**（CKM-2 的前置）：(a) 给 FAT 后端加写支持 + 原子替换（用户可 mount 走），
-   还是 (b) 新增一个极小的日志式区（双槽 A/B + CRC）专供 CKM 状态/回执/store。
-   倾向 (b)：事务需要原子性与掉电一致性，FAT 的写语义（FAT 表 + 目录项 + 簇链三处更新）
-   不天然提供；但 (a) 对用户价值更大。**定夺前不开工 CKM-2。**
+1. **可写持久化介质**（CKM-2 的前置）—— ✅ **已定夺（2026-10-12，随 CKM-2 落地）**：取 **(b) 极小的日志式区**
+   （双槽 A/B + CRC32，落在系统盘尾部 1 MiB，见 9.2）。四条理由：
+   1. **要的语义不同**：CKM 要「**原子状态区**」（一次写入要么整体可见、要么完全不可见，掉电后仍能读回
+      上一次成功的值），而 FAT 的写语义（FAT 表 + 目录项 + 簇链三处更新）不天然提供这一点；
+   2. (b) **不被别的期阻塞**：它不碰任何文件系统，因此可以在 CSS-4 的写入语义评审之前先落地；
+   3. CSS 的字母表/卷标偏好只需要**键值持久化**（`storage/letters`、`storage/labels`），不需要 FAT 写；
+   4. (a) 仍是 **CSS-4 的第一件事**（对用户价值更大），本定夺不取消它。
    注意与 CSS 的区别（不要混为一谈）：本条要的是「**原子状态区**」（双槽 + CRC + 掉电一致），
    CSS-4 要的是「**文件语义写入**」（簇分配、目录项、可写卷）—— 两者可能落在同一个 FAT 卷上，
    但验收标准不同：一个断回执可恢复，一个断写-重启-读回逐字节一致（[storage.md](./storage.md) 第 8 节）。
@@ -588,6 +665,8 @@ KernelSU 把「挂载/覆盖」做成可插拔的**元模块**（官方文档：
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-12 | **CSS-3 盘符接入（CKM 判定点 8 + CKM-2 状态区）落地**：`storage_assign_letter`(264)/`storage_mount`(262)/`storage_unmount`(263) 实现后，存储受控动作真的走 CKM —— 拒绝三件套（`-EPERM` + 审计 + 串口 `ckm: policy op=storage_mount … result=deny need=0x10`）与允许面都有实测（`make test-ckm` 的 uid 2000 拒绝；`make test-programs` 的 Shell uid 1000 `volumes demo` 成功）；**CKM-2 状态区的第一个存储侧消费者**出现：盘符表把自定义映射写进键 `storage/letters`（值是可读文本 `C=fs:1a2b3c4d;Z=raw:4`），跨重启读回由 `make test-ckm-store` 的两次启动给出 —— 即 3.4 硬约束第 3 条「可写区同时是字母表落点」已兑现；判定点 8 不再只是设计（见 [storage.md](./storage.md) 6.6/13） |
+| 2026-10-12 | **CKM-2 落地**：新增 `kernel/src/ckm/store.rs`（系统盘尾部 1 MiB 的**双槽 A/B + CRC32** 状态区：`init`/`get`/`put` + 跨重启自测；`kernel_main` 在 `storage::init` 之后调用）与 `kernel/src/ckm/overlay.rs`（覆盖层注册表 `register`/`unregister`/`lookup`/`rewrite` + 最长前缀/优先级/同优先级冲突拒绝；判定点 7/8 的落点）；`fs::mount::resolve`/`route` 在查表之前接入路径改写（空表快路径），`fs::overlay_selftest` 在 `fs/` 侧建立 `/ckm/overlay/**` 并断言「注册/撤销改变 `open` 结果」；`policy::reject` 新增**语义拒绝**（`need=0x0`，与能力不足可区分）；`tools/image-builder/build_image.py` 改为「先在 63 MiB 上 `mformat`、再追加 1 MiB 保留区」（设备仍是 64 MiB，FAT 看不到状态区）；新增 `make test-ckm-store` 与 `tests/test_ckm_store.py`（两阶段启动：写 → 重启 → 读回）、`test_boot.py --persist`、编排器场景 `ckm-store`（`ckm` 场景同步扩充）；`test-ckm` 扩到 40 断言 + 持久化两启动，`test-fat`/`test-programs`/`test-storage` 的 FAT 几何与根目录条目数断言随之更新（启动盘 FAT 63 MiB、`/ckm` 使根目录 5 → 6 项）；**开放问题 1 定夺为 (b)**；新增 9.2 落地清单，第 10 节补 CKM-2 覆盖情况 |
 | 2026-10-12 | **CKM-1 落地**：`kernel/src/ckm/`（`cred`/`policy`/`state`/`audit`/`api`）+ v1.0 `security/`（凭证 uid/gid + mode + `EACCES`）+ syscall `257`/`258`/`259` + 判定点 1/3/5/6 的强制落点与串口证据；`libc` 加三个包装与 48/64 字节记录解析器，`/init` 与 `/bin/hello` 分别提供允许/拒绝证据；新增 `make test-ckm`（22 断言）与编排器场景 `ckm`，`test-user`/`test-proc` 同步扩展；同批修掉一处**内核栈对齐 UB**（新增静态量把 `KSTACKS` 顶端挤到奇地址，syscall 参数帧 `&[u64; 5]` 因此不对齐 —— `process::kstack_top` 现在显式对齐到 16 字节）。头部状态改为「CKM-1 已落地」，第 9 节 CKM-1 行改 ✅ 并新增 **9.1 落地清单**，第 10 节补覆盖情况，4.5 的 `rev` 示例补 `0x` 前缀 |
 | 2026-10-11 | 追加**存储侧接口**（配合新建的 [storage.md](./storage.md)，CSS 提案）：能力位由 4 位扩到 **6 位**（`CAP_STORAGE_ADMIN 0x10` / `CAP_STORAGE_FORMAT 0x20`，uid 1000 持有，`/init` 与 `ckmd` 不持有）、判定点表追加 **8–10**（挂载/卸载/字母/重扫、格式化、写 `/storage/**`）、事件枚举追加 **12–16**（`storage_mount`/`storage_unmount`/`storage_letter`/`storage_format`/`storage_rescan`，串口短名同步）、号段说明注明 **CSS 占 261–266 故 `SYS_MAX` 最终值为 267**（CKM 自身号段仍为 257–260）、现状审计补「分区/卷/盘符」一行（归属 CSS）、CKM-2 硬约束补第 3 条（可写区同时是字母表落点）与开放问题 1 的边界澄清（原子状态区 vs 文件语义写入） |
 | 2026-10-11 | 创建本文档：定稿权限模型（单管理员 + 4 个能力位 + 7 个判定点，凭证只由 CKM 组件表在 `execve` 时改变）、内核接口（`kernel/src/ckm/` 五模块 + `CKM_ABI_VERSION=1` + 扩展号段 257–259 + 两份定长记录 + 串口证据格式）、扩展生命周期（四类扩展、状态机与合法转换表、确定性枚举/加载顺序）；覆盖层与 KernelSU 元模块的对应关系、事务与 H-06 P0b 的接口、安全模式与恢复环境、CKM-1…CKM-7 分期、8 条故障验收落成断言、非目标与 7 个开放问题；同步 docs/README.md 索引、DEVELOPMENT.md（H-07 行 + 5.12 + 修订记录）、roadmap（第十一阶段）、architecture 第 5 节、project-structure（规划目录）、README（文档入口） |

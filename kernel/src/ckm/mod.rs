@@ -13,7 +13,9 @@
 //! ```text
 //! syscall/* ──▶ ckm::api ──▶ {policy, cred, state, audit}
 //! fs/        ──▶ ckm::policy（只取前缀常量与判定）
-//! ckm/       ──▶ security/（凭证与 mode），**不**反向依赖 syscall/
+//! fs/        ──▶ ckm::overlay（路径改写钩子；覆盖层的**文件动作**在 fs 侧发起）
+//! ckm/       ──▶ security/（凭证与 mode）、driver/{serial, block}（状态区扇区 I/O）
+//! ckm/       ──▶ **不**反向依赖 syscall/ 与 fs/
 //! ```
 //!
 //! `ckm/` 是叶子被依赖者：它能被 `syscall/`、`fs/` 依赖，但自己不调用任何 syscall。
@@ -23,8 +25,10 @@
 pub mod api;
 pub mod audit;
 pub mod cred;
+pub mod overlay;
 pub mod policy;
 pub mod state;
+pub mod store;
 
 /// CKM ABI 版本（第一版 = 1）。
 ///

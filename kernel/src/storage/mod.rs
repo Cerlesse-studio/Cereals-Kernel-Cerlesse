@@ -11,13 +11,16 @@
 //! | [`gpt`] | GPT 只读解析（表头/表项 CRC32、备表头回退、类型 GUID） |
 //! | [`mbr`] | MBR/EBR 只读解析（4 主分区 + 扩展链，防环） |
 //! | [`volume`] | 卷对象、`vol_id`、文件系统探测、64 字节记录布局 |
-//! | [`registry`] | 卷表、确定性枚举、冲突检测、`storage_volumes` 快照 |
+//! | [`registry`] | 卷表、确定性枚举、冲突检测、盘符分配、`storage_volumes` 快照 |
+//! | [`letters`] | 盘符表（**CSS-3**）：缺省规则（系统卷 `C`、其余按枚举顺序）、
+//!   自定义分配、持久化到 CKM 状态区（`storage/letters`） |
 //!
 //! 启动顺序：`fs::mount_disks` **之前**调用 [`init`]（先看清有哪些卷，再谈挂载）。
 
 use crate::driver::serial;
 
 pub mod gpt;
+pub mod letters;
 pub mod mbr;
 pub mod partition;
 pub mod registry;
@@ -41,6 +44,12 @@ pub fn init() -> Result<(), &'static str> {
     serial::print(" max_devices=");
     serial::print_dec(crate::driver::block::MAX_BLOCK_DEVICES as u64);
     serial::println("");
+    // CSS-3：盘符表先清空、再从状态区装载，然后才枚举卷 —— 字母必须在
+    // `storage: vol …` 证据行打印出来**之前**就是已知的，否则「重启后字母不变」
+    // 只能靠消费者自己去对，而不是启动日志上的事实。
+    // 依赖顺序：`storage::init` 因此必须在 `ckm::store::init` 之后调用（`main.rs`）。
+    letters::reset();
+    letters::load_from_store();
     registry::scan_all(true)?;
     Ok(())
 }
@@ -88,6 +97,11 @@ pub fn selftest() -> Result<(), &'static str> {
         if rec[21] > 3 {
             return Err("storage: health out of range");
         }
+        // CSS-3：盘符字段只能是 0（未分配）或 'A'..='Z'。范围之外的值意味着
+        // 记录被写坏了 —— 而盘符是消费者（`volumes`/CLI）直接读的字段。
+        if rec[24] != 0 && !rec[24].is_ascii_uppercase() {
+            return Err("storage: drive letter out of range");
+        }
         let flags = u16::from_le_bytes([rec[22], rec[23]]);
         if flags & !0x000F != 0 {
             return Err("storage: unknown volume record flags set");
@@ -95,7 +109,7 @@ pub fn selftest() -> Result<(), &'static str> {
         if rec[60..64] != [0, 0, 0, 0] {
             return Err("storage: reserved bytes in volume record must be zero");
         }
-        checks += 6;
+        checks += 7;
     }
 
     serial::print("storage: selftest PASS (checks=");

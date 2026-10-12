@@ -112,12 +112,13 @@ root@cerlesse C:>
 | `make test-user` | 用户态全链路：ELF 装载 + 文件 syscall + 用户堆 + 隔离 + Shell |
 | `make test-shell` / `make test-proc` | 注入真实按键跑交互式 Shell / `fork` + `execve` + `wait4` |
 | `make test-programs` | 从 Shell 跑 `/bin/{ls,cat,echo,ps,volumes}`（`getdents` 列目录、`getprocs` 列进程、`storage_volumes` 列卷） |
+| `make test-ckm` / `make test-ckm-store` | CKM 权限/审计/组件状态 + 覆盖层（注册/撤销改变 `open` 结果）/ 可写状态区的**跨重启**持久化（写 → 重启 → 读回） |
 | `make test-fs` / `make test-fat` | VFS + RAMFS / FAT12/16/32 只读后端（双盘启动） |
 | `make test-driver` / `make test-network` | PCI 枚举 + virtio-blk / virtio-net + ARP + DHCP |
 | `make test-dyn` / `make dyn-hostcheck` | 内核侧最小动态链接 / 同一批夹具交给宿主机 glibc `ld.so` 复核 |
 | `make test-storage` / `make test-storage-mbr` | GPT / MBR 分区镜像的卷枚举（`storage_volumes`）+ VFS 收口（卷身份上挂载点、多挂载点、卸载）+ 主机侧夹具复核 |
 | `make check` / `make check-boundary` | 主机侧门禁（边界 + Go 单测）/ 内核不得依赖用户态 |
-| `make test-orch` / `make test-pkg` | 17 个场景并行编排 / CKC 包容器 `.ckc`（主机侧，不启 QEMU） |
+| `make test-orch` / `make test-pkg` | 19 个场景并行编排 / CKC 包容器 `.ckc`（主机侧，不启 QEMU） |
 
 其余目标（`image-kernel`、`userland-images`、`fat-image`、`go-test` 等）及其输出含义见 [DEVELOPMENT.md](DEVELOPMENT.md) 与 [docs/api.md](docs/api.md)。
 

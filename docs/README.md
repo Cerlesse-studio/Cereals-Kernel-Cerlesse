@@ -18,8 +18,8 @@
 | [architecture.md](./architecture.md) | 第一阶段：内核架构、语言分工、目标与非目标 | ✅ 已完成（会随开发反复修订） |
 | [lang-selection.md](./lang-selection.md) | 按功能领域汇总的性能最佳语言对照（辅助选型参考） | ✅ 新增（2026-10-07） |
 | [package-manager.md](./package-manager.md) | 面向内核/系统生态的高效、安全、轻量、灵活包管理器设计提案（H-06） | 🟡 提案 v1 + **P0a 已落地**：包容器后缀 **`.ckc`**（CKC = Cerlesse Kernel Container，64 字节头 + 确定性 ustar，身份 = payload 哈希），实现 `tools/pkgmgr/ckc.py`，验收 `make test-pkg` 37 项（含 `tar` 独立复核）；事务/catalog（P0b）与内核侧接入（P1）待做，见该文档 11.1 |
-| [ckm.md](./ckm.md) | **Cerlesse Kernel Manager（CKM）设计提案**：权限模型（单管理员 + 能力位 + 判定点）、内核接口（`kernel/src/ckm/` + 扩展号段 + 定长记录）、扩展生命周期与覆盖层、事务/恢复/安全模式、CKM-1…CKM-7 分期与故障验收 | 📋 提案 v1（规划，2026-10-11 新增；**尚未写代码**） |
-| [storage.md](./storage.md) | **Cerlesse Storage System（CSS）设计提案**：卷模型（设备→分区→卷→盘符/挂载点 + 稳定 `vol_id`）、Windows 式盘符与 Linux 式挂载双视图、VFS 收口（`FileSystem` 增量 + 挂载表带卷身份 + 错误语义改 errno）、与 CKM 的接口（2 个能力位 + 判定点 8–10 + 号段 261–266）、文件系统支持路线与第三方依赖政策、后端装载政策（第一版编译内置，6.8）、CSS-1…CSS-6 分期与 11 条验收 | 🟡 **CSS-1/CSS-2 已落地**（`kernel/src/storage/` + `storage_volumes`(261)/`storage_rescan`(265) + `mkfs` GPT/MBR 夹具 + 挂载表带卷身份/多挂载点/卸载 + 挂载错误改 errno + `make test-storage`），CSS-3…CSS-6 规划中 |
+| [ckm.md](./ckm.md) | **Cerlesse Kernel Manager（CKM）设计提案**：权限模型（单管理员 + 能力位 + 判定点）、内核接口（`kernel/src/ckm/` + 扩展号段 + 定长记录）、扩展生命周期与覆盖层、事务/恢复/安全模式、CKM-1…CKM-7 分期与故障验收 | 🟡 **CKM-1/CKM-2 已落地**（`kernel/src/ckm/` 七模块：凭证/判定点/状态表/审计环 + 覆盖层 + 双槽 A/B 状态区；syscall 257–259；`make test-ckm` 40 断言 + `make test-ckm-store` 跨重启）；CKM-3…CKM-7 规划中 |
+| [storage.md](./storage.md) | **Cerlesse Storage System（CSS）设计提案**：卷模型（设备→分区→卷→盘符/挂载点 + 稳定 `vol_id`）、Windows 式盘符与 Linux 式挂载双视图、VFS 收口（`FileSystem` 增量 + 挂载表带卷身份 + 错误语义改 errno）、与 CKM 的接口（2 个能力位 + 判定点 8–10 + 号段 261–266）、文件系统支持路线与第三方依赖政策、后端装载政策（第一版编译内置，6.8）、CSS-1…CSS-6 分期与 11 条验收 | 🟡 **CSS-1/CSS-2 已落地，CSS-3 大部分落地**（`kernel/src/storage/` + `storage_volumes`(261)/`storage_rescan`(265) + `mkfs` GPT/MBR 夹具 + 挂载表带卷身份/多挂载点/卸载 + 挂载错误改 errno + 盘符表 `storage/letters.rs` + `storage_mount`(262)/`unmount`(263)/`assign_letter`(264) + `libc` 的 `C:\` 重写 + `make test-storage`），CSS-4…CSS-6 规划中 |
 | [project-structure.md](./project-structure.md) | 目录结构与模块职责划分 | ✅ 已完成 |
 | [../DEVELOPMENT.md](../DEVELOPMENT.md) | 主开发文档：需求、依赖、任务清单、测试、QEMU、Issue 规划 | ✅ 已完成 |
 | [api.md](./api.md) | **API 参考**：系统调用 ABI / errno / `libc` API / 内核内部 trait / 主机工具 CLI / Make 目标 | 🟡 持续更新（2026-10-11 新建） |
@@ -67,12 +67,23 @@
   阶段一/三/六 未做（`abi/` 单一事实源、编排拆分、基线 tag）。实测：无 `userland/` 的 checkout 里
   `cargo build -p kernel` 退出码 0（改造前 101）、`make test-kernel-only` 7/7 PASS。
   规划与执行记录见 [pure-kernel.md](./pure-kernel.md)。
-- **第十一阶段（v1.0 之后）**📋：**CKM —— 内核级权限控制与扩展管理**（CKM Core 在内核 /
+- **第十一阶段（v1.0 之后）**🔨：**CKM —— 内核级权限控制与扩展管理**（CKM Core 在内核 /
   CKM Service 与 Manager 在用户态 / 可插拔覆盖层 / 独立恢复环境），分 CKM-1…CKM-7；
-  第一版不做动态内核模块装载与 GUI —— 规划见 [ckm.md](./ckm.md)，未开工。
-- **第十二阶段（v1.0 之后，与第十一阶段同期）**🔨：**CSS —— Cerlesse 存储管理系统**（磁盘/分区识别 → 卷与稳定标识 → 盘符与多挂载点 → 可写文件系统 → `ckm storage` 管理程序），分 CSS-1…CSS-6；第一版不写分区表、不做 RAID/LVM/加密卷/GUI。**CSS-1（底层识别）与 CSS-2（VFS 收口）已落地**（GPT/MBR 只读扫描 + 卷记录 + `storage_volumes`/`storage_rescan` + 挂载表带卷身份/多挂载点/卸载 + 挂载错误改 errno），CSS-3（盘符/状态树）及以后未开工 —— 见 [storage.md](./storage.md)。
+  第一版不做动态内核模块装载与 GUI —— 见 [ckm.md](./ckm.md)。
+  **CKM-1（内核接口）与 CKM-2（可写持久化 + 覆盖层机制）已落地**（2026-10-12）：能力位判定/审计环/组件状态查询、
+  系统盘尾部 1 MiB 的双槽 A/B + CRC32 状态区、覆盖层注册表与路径改写钩子（`fs::mount::resolve`）、
+  `make test-ckm`（40 断言）与 `make test-ckm-store`（写 → 重启 → 读回）。
+- **第十二阶段（v1.0 之后，与第十一阶段同期）**🔨：**CSS —— Cerlesse 存储管理系统**（磁盘/分区识别 → 卷与稳定标识 → 盘符与多挂载点 → 可写文件系统 → `ckm storage` 管理程序），分 CSS-1…CSS-6；第一版不写分区表、不做 RAID/LVM/加密卷/GUI。**CSS-1（底层识别）与 CSS-2（VFS 收口）已落地，CSS-3（盘符）大部分落地**（GPT/MBR 只读扫描 + 卷记录 + `storage_volumes`/`storage_rescan` + 挂载表带卷身份/多挂载点/卸载 + 挂载错误改 errno + 盘符表/`storage_mount`/`unmount`/`assign_letter` + `libc` 的 `C:\` 重写），CSS-3 剩余（`/storage/**` 状态树、卷标写/改名）与 CSS-4…CSS-6 未开工 —— 见 [storage.md](./storage.md)。
 - **后续**：每进入一个新阶段就编写/修订对应的主题文档；阶段内已落地部分也要及时补记当前状态（例如 v0.4 中断控制器）。
 - 本套文档**会在开发过程中被反复修改**——修改前请在对应文档顶部记录修订日期与变更点。
+- 本次（2026-10-12，第十九轮）修订重点：**CKM-2（可写持久化 + 覆盖层机制）落地** —— 新增
+  `kernel/src/ckm/store.rs`（系统盘尾部 1 MiB 的双槽 A/B + CRC32 状态区，开放问题 1 定夺为 (b)）与
+  `kernel/src/ckm/overlay.rs`（注册/撤销/最长前缀/优先级/冲突拒绝，钩子在 `fs::mount::resolve`），
+  `policy::reject`（语义拒绝）与 `fs::overlay_selftest`；`tools/image-builder/build_image.py` 改为
+  「先在 63 MiB 上 `mformat`、再追加 1 MiB 保留区」（设备仍 64 MiB，FAT 看不到状态区）；
+  新增 `make test-ckm-store` + `tests/test_ckm_store.py`（两阶段启动：写 → 重启 → 读回）与编排场景
+  `ckm-store`（共 19 个场景），`test-ckm` 扩到 40 断言，`test-fat`/`test-programs`/`test-storage` 的
+  FAT 几何与根目录条目数断言同步；ckm.md 新增 9.2 落地清单与开放问题 1 的定夺。
 -  本次（2026-10-11，第十七轮）修订重点：**新增 CSS（Cerlesse Storage System）存储管理提案（规划，不写代码）** —— 新建 `storage.md`：
   定稿**卷模型**（四层：设备→分区→卷→挂载点/盘符；`Volume` 记录；`vol_id` 三条确定性生成规则：
   文件系统 UUID/序列号 > `pt:<disk>-<part>-<lba>` > `raw:<disk>`；只读原因与健康状态各成枚举；卷表容量 16、每卷 ≤2 挂载点），

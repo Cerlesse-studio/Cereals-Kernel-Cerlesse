@@ -182,6 +182,9 @@ fd 编号（与 Linux 一致的形状，见 syscall.md 2.7）：
 - [x] 目录列举（`ls` 语义）：`fs: ls / entries=5` + 每项 `name/kind/size/perms`
       （v0.7 为 3；v0.9 第二步新增 `/bin` → 4，第六步新增 `/lib` → 5——这是个精确断言：
       根条目变化必须同步改 `fs::selftest` 与测试期望）
+      > **CKM-2（2026-10-12）之后有两条边界要分清**：`fs::selftest` 跑在 `/ckm` 建立**之前**，
+      > 所以这里仍是 5；用户进程看到的 `/` 是 **6**（多了内核的 `/ckm`，覆盖区 `/ckm/overlay` 的家，
+      > 见 `docs/ckm.md` 6.1/9.2）——`make test-programs` 断言的就是后者（`ls: / entries=6`）。
 - [x] 负例 errno：`fs: negative cases PASS (ENOENT/ENOTDIR/EISDIR/EEXIST/EINVAL)`
 - [x] 文件 syscall 全链路（随 `make test-user`，v0.7 时 32 项、v0.9 起 **61 项**断言）：`user: open path=/etc/motd flags=0x0 fd=3`
       → `user: read fd=3 want=64 got=23` → 内容经 `write` 打到串口 → `user: read fd=3 want=64 got=0`（EOF）
@@ -230,12 +233,17 @@ fd 编号（与 Linux 一致的形状，见 syscall.md 2.7）：
 `/mnt/fat` 恰好挂在 `/mnt`（自测用的第二个 RAMFS）**下面**，所以顺带验证了挂载表的**最长前缀路由**：
 
 ```text
-fs: mount point=/disk fs=fat16 sectors=131072 cluster_bytes=1024 clusters=65264
+fs: mount point=/disk fs=fat16 sectors=129024 cluster_bytes=1024 clusters=64244
 storage: mount point=/disk vol=fs:a2ff2e36 ro=ro-backend     ← CSS-2：卷身份 + 只读原因
 fs: mount point=/mnt/fat fs=fat32 sectors=131072 cluster_bytes=512 clusters=128992
 storage: mount point=/mnt/fat vol=fs:11102620 ro=ro-backend
 fs: route /mnt/note.txt fs=ramfs-scratch /mnt/fat/hello.txt fs=fat32
 ```
+
+> **启动盘的 `sectors=129024`（63 MiB）不是设备的容量**：设备仍然报 `sectors=131072`（64 MiB，
+> 见 `block: device=virtio-blk0 … bytes=67108864`），但 CKM-2 起镜像尾部 1 MiB 是**状态区**，
+> FAT 只覆盖前面 63 MiB（`tools/image-builder/build_image.py` 先在 63 MiB 上 `mformat`，
+> 再把保留区追加回去）。第二块盘（`/mnt/fat`，`mkfs.py` 生成）的 131072 是它**自己的**容量，两者无关。
 
 `ro=` 不是写死的字面量：它来自后端自己的能力位（`FatFs::caps().read_only` → `ro-backend`；
 RAMFS 是可写后端）。CSS-2 的挂载自测（`fs::storage_mount_selftest`，每次启动都跑）还会：
@@ -297,14 +305,17 @@ fs: disk selftest PASS
 ## 4. 非目标 / 后续
 
 - 页缓存/写回/一致性策略、`fsync`：非第一版目标；
-- 完整权限语义（UID/GID/ACL）与**盘符/卷标**：分别归 v1.0 的 `security/` 与 CSS-3；
-  CSS-2 已给出 `MountOptions { read_only }`（只读挂载的机制），但“谁能挂/谁能卸”的判定要等 CKM（判定点 8）；
+- 完整权限语义（UID/GID/ACL）与**卷标写/改名、`/storage/**` 状态树**：分别归 v1.0 的 `security/` 与 CSS-3 剩余；
+  CSS-2 已给出 `MountOptions { read_only }`（只读挂载的机制），CSS-3 已接上 CKM 判定点 8（“谁能挂/谁能卸”）
+  与盘符表 `storage/letters.rs`（`C:\` → POSIX 重写由 `libc/src/path.rs` 做，mount 由 `fs::mount_volume_by_id`/`unmount_point` 落）；
 - 超大文件、高并发 IO、高性能目录索引：非第一版目标。
 
 ## 5. 修订记录
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-12 | **CSS-3 影响**：`fs/mod.rs` 新增 `mount_volume_by_id`/`unmount_point`（`storage_mount`(262)/`storage_unmount`(263) 的底层落点，复用 CSS-2 的 `MountTable::mount_volume`/`alias_volume`/`umount`）；`fs/vfs.rs` 与已挂载后端的读写路径**无改动**（`C:\x` 是 `userland/libc/src/path.rs` 在发 syscall 前重写为 POSIX，内核仍只认绝对 POSIX 路径，见 storage.md 4.2） |
+| 2026-10-12 | **CKM-2 影响**：`fs::mount` 的 `resolve`/`route` 在查表之前接入覆盖层路径改写（`ckm::overlay`，空表为快路径），因此「路径 → 后端」的每一种入口都看到同一份视图；新增 `fs::overlay_selftest`（在 `fs/` 侧建立 `/ckm/overlay/**`、注册/撤销、断言 `open` 结果变化）→ 用户进程看到的 `/` 从 5 变 **6**（`ls: / entries=6`，而 `fs::selftest` 的 5 不变，它在 `/ckm` 建立之前）；启动盘 FAT 由 64 MiB 收为 **63 MiB**（尾部 1 MiB 是 CKM 状态区），`sectors=129024 clusters=64244`（`make test-fat` 与 `test-programs` 的 `bytes=66060288` 同步）；`fs/vfs.rs` 与 syscall 层无改动 |
 | 2026-10-11 | **CSS-2 落地（VFS 收口）**：`FileSystem` 增 `caps`/`volume_info`（保守缺省；RAMFS 可写、FAT 只读+大小写不敏感+卷标）；`fs/fat.rs` 增 FAT 探测唯一入口 `probe`/`probe_sector`/`bp_identity` 并把 `FatFs::open` 改返回 `OpenError { errno, reason }`；`fs/mount.rs` 拆「后端 / 挂载点」两张表（一个后端可被多挂载点引用），条目带 `vol_id`/`options`，新增 `alias_volume`/`umount`/`route`/`sync_counts`（挂载计数写回卷记录）；`fs::mount_disks` 按卷表挂载并保留 `/disk`、`/mnt/fat` 兼容点；`fs: stat` 行尾带 `vol=`；新增 `fs::storage_mount_selftest`（只读原因来自能力位、后端与记录一致、同一卷多挂载点同字节、卸载后 `ENOENT` 且卷仍在表、`ENOENT`/`EINVAL`/`EEXIST` 反例）；本文第 2.1/2.2/3.2/4 节同步标注现状 |
 | 2026-10-06 | 第一阶段创建占位 |
 | 2026-10-07 | 补记路线细化：明确 VFS 先行/RAMFS 后端/文件描述符表与 syscall 对接顺序、补充 ELF Loader 对接关系、补充 FAT32/mkfs 后续位置 |

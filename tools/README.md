@@ -4,7 +4,7 @@
 
 | 工具 | 用途 | 计划版本 | 状态 |
 | ---- | ---- | ---- | ---- |
-| `image-builder/` | 组装 boot + kernel + 文件系统磁盘镜像（64 MiB FAT，mtools） | v0.1 | ✅ |
+| `image-builder/` | 组装 boot + kernel + 文件系统磁盘镜像（64 MiB 设备；**FAT 只占前面 63 MiB**，尾部 1 MiB 是 CKM 状态区，见下，mtools） | v0.1 / CKM-2 | ✅ |
 | `check-boundary.py` | **内核/用户态边界门禁**（内核不得调用外部命令/内嵌用户态字节/依赖用户态包），含 `--selftest` 反向自检 | 纯内核化阶段二 | ✅ |
 | `check_user_elf.py` | 用户程序 ELF 段布局检查（基址/页对齐/`W^X`/映像窗口/无重定位）——**由 `userland/Makefile` 调用**（它检查的是用户态产物） | v0.7 | ✅ |
 | `mkfs/` | 文件系统镜像生成（FAT12/16/32 空盘或预置目录树，供磁盘 FS 测试）；**已追加 GPT/MBR 分区表镜像生成**（GPT 两分区 / MBR 双分区 / 主表头损坏 / 无分区表四类夹具，见 `docs/storage.md` 第 9 节 `make storage-images`） | v0.8 / CSS-1 | ✅ |
@@ -36,6 +36,20 @@ python3 tools/check-boundary.py --selftest # 注入 6 类违规样本，必须�
 
 ```bash
 python3 tools/mkfs/mkfs.py --out build/fat.img --from tests/fatroot/data   # `make fat-image`
+```
+
+`image-builder/build_image.py` 的镜像布局（CKM-2 起）：
+
+```text
+偏移 0          FAT（由 mformat 在 **63 MiB** 的文件上创建；固件从这里读 BOOTX64.EFI）
+偏移 63 MiB     CKM 状态区（1 MiB 原始扇区，双槽 A/B + CRC32，见 kernel/src/ckm/store.rs）
+```
+
+为什么是「先按 63 MiB 格式化、再追加」：mtools 的 FAT 几何按**文件大小**算，
+因此文件系统看不到尾部这 1 MiB —— 状态区在 FAT 之外，不与用户文件争簇；
+而设备容量仍是 64 MiB（内核看到 `sectors=131072`，分区识别仍是 `table=none partitions=1`）。
+
+```text
 mdir  -i build/fat.img ::                  # 独立实现（mtools）读同一张盘
 mtype -i build/fat.img ::hello.txt
 ```

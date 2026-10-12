@@ -27,7 +27,7 @@ KERNEL_ELF := target/x86_64-unknown-none/debug/kernel
 USERLAND        := userland
 USERLAND_IMAGES := $(BUILD)/userland/images
 
-.PHONY: help build boot kernel kernel-nouserland image image-kernel image-exception image-pagefault fat-image storage-images run test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn dyn-hostcheck test-scheduler test-ipc test-fs test-user test-ckm test-driver test-fat test-storage-fixtures test-storage test-storage-mbr test-network test-all user userland-images test-pkg go-test test-orch check-boundary check clean
+.PHONY: help build boot kernel kernel-nouserland image image-kernel image-exception image-pagefault fat-image storage-images run test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn dyn-hostcheck test-scheduler test-ipc test-fs test-user test-ckm test-ckm-store test-driver test-fat test-storage-fixtures test-storage test-storage-mbr test-network test-all user userland-images test-pkg go-test test-orch check-boundary check clean
 
 help:
 	@echo "targets:"
@@ -47,7 +47,8 @@ help:
 	@echo "  test-ipc - v0.5: assert pipe create/write/read summary logs + selftest"
 	@echo "  test-fs - v0.7: assert VFS mount routing + RAMFS read/write/ls + negative errno cases"
 	@echo "  test-user - v0.7/v0.9/v1.0: assert ELF loaded from RAMFS + ring3 file syscalls + user heap + mprotect + isolation + shell"
-	@echo "  test-ckm - v1.0: CKM-1 — capability policy (EPERM vs EACCES) + audit ring + component state enumeration"
+	@echo "  test-ckm - v1.0: CKM-1 + CKM-2 — capability policy (EPERM vs EACCES) + audit ring + component state + overlay + persistent state area"
+	@echo "  test-ckm-store - CKM-2: write -> restart -> read back (dual-slot A/B state area on a private disk copy)"
 	@echo "  test-driver - v0.8: assert PCI enumeration + driver probe + virtio-blk sector read/write"
 	@echo "  fat-image - v0.8: build the FAT test volume (tools/mkfs/mkfs.py from tests/fatroot/data)"
 	@echo "  test-fat - v0.8: assert FAT16/32 on disk mounted in VFS: read/ls/LFN/multi-cluster/EROFS"
@@ -66,7 +67,7 @@ help:
 	@echo "  test-all - run every integration test"
 
 	@echo "  go-test  - v0.4 H-04/H-05: Go unit tests for tools-go (host side)"
-	@echo "  test-orch - v0.4 H-04: run all 17 scenarios in parallel via Go orchestrator"
+	@echo "  test-orch - v0.4 H-04: run all 19 scenarios in parallel via Go orchestrator"
 	@echo "  clean  - remove build artifacts"
 
 build: image
@@ -374,7 +375,20 @@ test-user: image
 # 那条路径要 `/bin/hello` 真的被 Shell `execve` 起来（键盘注入），不在本目标的观察窗里。
 # `--expect-re` 用来绑定「同一个值在多条证据行里一致」（自测项数不算常数）：
 # `checks=\d+` 与「两次查询的组件序列逐字节相同」都是 CKM-1 的验收项。
-test-ckm: image
+#
+# CKM-2 追加的两段机制（`docs/ckm.md` 9 节 CKM-2 行）：
+#
+#   1. **覆盖层**（同一次启动内可断言）：注册 `demo`（priority=10，前缀 `/etc`）后
+#      **新 `open`** 读到覆盖内容（`changed=1 bytes=25` ≠ 基线的 23 字节）；同优先级 +
+#      前缀重叠 → `op=overlay_conflict result=deny`；更高优先级 `high` 真的遮蔽 `demo`；
+#      逐条撤销 → 先回 `demo` 的视图、再**回到基线**（`docs/ckm.md` 6.4 第 2 条）；
+#      收尾时覆盖表必须为空（用户进程看到的是基线）。
+#   2. **可写持久化**（**跨重启**，所以交给 `tests/test_ckm_store.py`：清零一份独占镜像
+#      → 启动写入（`state=fresh`，槽 A/B 交替）→ 同一份镜像再启动 → `state=loaded`
+#      读回逐字节相同且**不重写**）。本目标的第一次启动只断言与「FAT 之外」无关的
+#      确定性证据（`verify … ok=1`），因为 `build/disk.img` 里可能已经留有上次 `make run`
+#      写入的状态区（`--persist` 才关掉 `snapshot=on`，其它场景都是临时覆盖层）。
+test-ckm: image fat-image
 	$(PYTHON) tests/test_boot.py \
 		--serial-log $(BUILD)/serial-ckm.log \
 		--expect "Kernel started!" \
@@ -400,7 +414,38 @@ test-ckm: image
 		--expect "hello: ckm component[2] id=init kind=system-component state=active" \
 		--expect "hello: ckm open /etc/init.flag fd=3" \
 		--expect "hello: ckm wrote 30 bytes to /etc/init.flag" \
-		--expect "hello: ckm selftest ok=1"
+		--expect "hello: ckm selftest ok=1" \
+		--expect "fs: overlay selftest begin" \
+		--expect "fs: overlay area /ckm/overlay ready id=demo,high" \
+		--expect "ckm: policy op=overlay_register pid=0 uid=0 result=allow need=0x0 detail=0x0" \
+		--expect "fs: overlay table[0] id=demo kind=3 priority=10 prefix=/etc" \
+		--expect "ckm: overlay path=/etc/motd -> /ckm/overlay/demo/motd id=demo priority=10" \
+		--expect "fs: overlay open /etc/motd changed=1 bytes=26" \
+		--expect "ckm: policy op=overlay_conflict pid=0 uid=0 result=deny need=0x0 detail=0x0" \
+		--expect "fs: overlay conflict rejected (dupe vs demo, same priority)" \
+		--expect "ckm: overlay register id=high kind=3 priority=20 prefix=/etc/motd slot=1 shadowed=demo" \
+		--expect "ckm: overlay path=/etc/motd -> /ckm/overlay/high id=high priority=20" \
+		--expect "fs: overlay priority wins (high=20 > demo=10) bytes=28" \
+		--expect "ckm: overlay unregister id=high removed=1 remaining=1 result=allow" \
+		--expect "ckm: overlay unregister id=demo removed=1 remaining=0 result=allow" \
+		--expect "fs: overlay unregister restored baseline bytes=23" \
+		--expect "fs: overlay negative cases PASS (kind/prefix/duplicate)" \
+		--expect "fs: overlay selftest PASS" \
+		--expect "ckm: store verify key=selftest value=cerlesse-ckm-store-v1 ok=1" \
+		--expect "ckm: store verify key=msg value=persist-ok ok=1" \
+		--expect-re "ckm: store selftest PASS \\(checks=[0-9]+\\)" \
+		--expect "storage: letters load n=0 source=none" \
+		--expect "storage: letters table n=1 present=1 first=C" \
+		--expect "storage: letters persistence probe skipped (system volume only)" \
+		--expect "storage: letters selftest PASS (checks=4)"
+	$(PYTHON) tests/test_ckm_store.py --disk2 $(BUILD)/fat.img --serial-log-prefix $(BUILD)/serial-ckm-store
+
+# CKM-2 持久化验收（单跑：只跑「写 → 重启 → 读回」这一段，迭代与编排器场景用）。
+# 它**必须**独占一份 `build/disk.img` 的副本（`test_boot.py --persist` 会真的落盘）。
+test-ckm-store: image fat-image
+	$(PYTHON) tests/test_ckm_store.py \
+		--disk2 $(BUILD)/fat.img \
+		--serial-log-prefix $(BUILD)/serial-ckm-store
 
 # v0.8 验收：PCI 枚举 → 驱动注册框架 → virtio-blk 挂接 → 块设备读写。
 #
@@ -478,8 +523,10 @@ fat-image:
 # v0.8 验收：磁盘上的文件系统（FAT 后端挂进 VFS 后，syscall 层一行未改就能 open/read）。
 #
 # 断言的都是「磁盘上的事实」而不是日志措辞：
-#   - `fs: mount point=/disk fs=fat16 sectors=131072 cluster_bytes=1024 clusters=65264`：
+#   - `fs: mount point=/disk fs=fat16 sectors=129024 cluster_bytes=1024 clusters=64244`：
 #     启动盘（mtools 写的 ESP）被 **FAT16 解析器** 认出来（类型由簇数判定，不靠扩展名）；
+#     这里的 `sectors=129024`（= 63 MiB）而不是设备的 131072（= 64 MiB）：CKM-2 起镜像尾部
+#     1 MiB 是**状态区**，FAT 只覆盖前面 63 MiB（`tools/image-builder/build_image.py`）；
 #   - `fs: read /disk/KERNEL.ELF magic=0x7f454c46`：从磁盘读回**内核自己的映像**，
 #     前 4 字节是 ELF 魔数 —— VFS → FAT → 块设备 → virtio 的完整往返；
 #   - `BOOTX64.EFI magic=0x4d5a`（`MZ`）：固件要用的 PE 引导文件在同一张盘上读到；
@@ -496,7 +543,7 @@ test-fat: image fat-image
 		--disk2 $(BUILD)/fat.img \
 		--serial-log $(BUILD)/serial-fat.log \
 		--expect "Kernel started!" \
-		--expect "fs: mount point=/disk fs=fat16 sectors=131072 cluster_bytes=1024 clusters=65264" \
+		--expect "fs: mount point=/disk fs=fat16 sectors=129024 cluster_bytes=1024 clusters=64244" \
 		--expect "fs: disk selftest begin" \
 		--expect "fs: ls /disk entries=2" \
 		--expect "fs: ls /disk name=EFI kind=dir size=0 perms=drwxr-xr-x" \
@@ -576,7 +623,10 @@ test-storage-fixtures: storage-images
 #   - `pt:1-4-43008`：没有 UUID 的分区用「磁盘-分区-起始 LBA」当身份；
 #   - `vol conflict id=fs:34122620 at=1:6,1:7 (all marked degraded)`：克隆卷必须**报出来**，
 #     且冲突之后才打卷证据行（否则会先打一行自相矛盾的 health=ok）；
-#   - `storage: parse selftest PASS` + `storage: selftest PASS`：解析分支与记录布局/确定性。
+#   - **CSS-3**：`letter=` 字段（盘符）—— 系统卷（启动盘）拿 `C`，其余按 6.5 的枚举顺序
+#     拿 `D`/`E`/…；**克隆卷的第二个卷不带字母**（同一 `vol_id` 不能有两个入口）；
+#     `storage: letter vol=raw:4 letter=Z custom=1` + `ckm: store put key=storage/letters`：
+#     自定义字母进了 CKM 状态区（跨重启不变，见 `make test-ckm-store`）。
 test-storage: image storage-images
 	$(PYTHON) tests/test_boot.py \
 		--disk $(BUILD)/disk.img \
@@ -598,25 +648,35 @@ test-storage: image storage-images
 		--expect "storage: disk index=3 dev=virtio-blk3 sectors=14336 table=GPT partitions=2" \
 		--expect "storage: disk index=4 dev=virtio-blk4 sectors=14336 table=invalid partitions=1 health=degraded" \
 		--expect "storage: vol conflict id=fs:34122620 at=1:6,1:7 (all marked degraded)" \
-		--expect "storage: vol id=fs:66602620 disk=1 part=1 fs=fat16 label=EFI-ESP letter=- mounts=0 ro=ro-backend health=ok" \
-		--expect "storage: vol id=fs:111111112222 disk=1 part=2 fs=ext4 label=cerlesse-ex letter=- mounts=0 ro=ro-backend health=unsupported" \
-		--expect "storage: vol id=fs:bc022620 disk=1 part=3 fs=exfat label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
-		--expect "storage: vol id=pt:1-4-43008 disk=1 part=4 fs=iso9660 label=PROBE-ISO letter=- mounts=0 ro=ro-backend health=unsupported" \
-		--expect "storage: vol id=pt:1-5-45056 disk=1 part=5 fs=unsupported label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
-		--expect "storage: vol id=fs:34122620 disk=1 part=6 fs=fat12 label=CLONE-A letter=- mounts=0 ro=ro-backend health=degraded" \
+		--expect "storage: letters table n=12 present=12 first=C" \
+		--expect "storage: vol id=fs:66602620 disk=1 part=1 fs=fat16 label=EFI-ESP letter=D mounts=0 ro=ro-backend health=ok" \
+		--expect "storage: vol id=fs:111111112222 disk=1 part=2 fs=ext4 label=cerlesse-ex letter=E mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=fs:bc022620 disk=1 part=3 fs=exfat label=- letter=F mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=pt:1-4-43008 disk=1 part=4 fs=iso9660 label=PROBE-ISO letter=G mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=pt:1-5-45056 disk=1 part=5 fs=unsupported label=- letter=H mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=fs:34122620 disk=1 part=6 fs=fat12 label=CLONE-A letter=I mounts=0 ro=ro-backend health=degraded" \
 		--expect "storage: vol id=fs:34122620 disk=1 part=7 fs=fat12 label=CLONE-B letter=- mounts=0 ro=ro-backend health=degraded" \
-		--expect "storage: vol id=fs:93622620 disk=2 part=1 fs=fat16 label=DG-ESP letter=- mounts=0 ro=ro-backend health=degraded" \
-		--expect "storage: vol id=fs:b43d2620 disk=2 part=2 fs=exfat label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
-		--expect "storage: vol id=fs:8f6c2620 disk=3 part=1 fs=fat16 label=BK-ESP letter=- mounts=0 ro=ro-backend health=ok" \
-		--expect "storage: vol id=raw:4 disk=4 part=0 fs=unsupported label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=fs:93622620 disk=2 part=1 fs=fat16 label=DG-ESP letter=J mounts=0 ro=ro-backend health=degraded" \
+		--expect "storage: vol id=fs:b43d2620 disk=2 part=2 fs=exfat label=- letter=K mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=fs:8f6c2620 disk=3 part=1 fs=fat16 label=BK-ESP letter=L mounts=0 ro=ro-backend health=ok" \
+		--expect "storage: vol id=fs:475e2620 disk=3 part=2 fs=exfat label=- letter=M mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=raw:4 disk=4 part=0 fs=unsupported label=- letter=N mounts=0 ro=ro-backend health=unsupported" \
 		--expect "storage: parse selftest PASS (cases=11 checks=45)" \
-		--expect "storage: selftest PASS (checks=124)" \
+		--expect "storage: selftest PASS (checks=137)" \
+		--expect "storage: letters load n=0 source=none" \
+		--expect "ckm: store put key=storage/letters len=7 seq=4 slot=B" \
+		--expect "storage: letters saved custom=1" \
+		--expect "storage: letter vol=raw:4 letter=Z custom=1" \
+		--expect "storage: letters persisted probe=Z vol=raw:4" \
+		--expect "storage: letters conflict rejected letter=D" \
+		--expect-re "storage: letters cleared probe=Y vol=(fs:[0-9a-f]+) fallback=C" \
+		--expect "storage: letters selftest PASS (checks=36)" \
 		--expect "fs: storage mount selftest begin" \
 		--expect "fs: alias point=/volumes/NO_NAME offset=4096 bytes=64 (same bytes as /disk/KERNEL.ELF)" \
 		--expect "fs: after unmount path=/volumes/NO_NAME/KERNEL.ELF errno=2" \
 		--expect "fs: mount negative cases PASS (ENOENT/EINVAL/EEXIST)" \
 		--expect "fs: storage mount selftest PASS" \
-		--expect-re "storage: mount point=/disk vol=(fs:[0-9a-f]+) ro=ro-backend.*?storage: volcheck id=\1 backend=fat16 caps=ro-backend case=insensitive label=NO_NAME bytes=67108864 record=ok.*?storage: mount point=/volumes/NO_NAME vol=\1 ro=ro-backend.*?fs: route path=/volumes/NO_NAME/KERNEL.ELF point=/volumes/NO_NAME vol=\1 fs=fat16 ro=ro-backend.*?fs: stat path=/volumes/NO_NAME/KERNEL.ELF kind=file size=[0-9]+ vol=\1.*?storage: unmount point=/volumes/NO_NAME vol=\1 mounts=1.*?fs: after unmount" \
+		--expect-re "storage: mount point=/disk vol=(fs:[0-9a-f]+) ro=ro-backend.*?storage: volcheck id=\1 backend=fat16 caps=ro-backend case=insensitive label=NO_NAME bytes=66060288 record=ok.*?storage: mount point=/volumes/NO_NAME vol=\1 ro=ro-backend.*?fs: route path=/volumes/NO_NAME/KERNEL.ELF point=/volumes/NO_NAME vol=\1 fs=fat16 ro=ro-backend.*?fs: stat path=/volumes/NO_NAME/KERNEL.ELF kind=file size=[0-9]+ vol=\1.*?storage: unmount point=/volumes/NO_NAME vol=\1 mounts=1.*?fs: after unmount" \
 		--expect-re "fs: route path=/volumes/NO_NAME/KERNEL.ELF point=/volumes/NO_NAME vol=(fs:[0-9a-f]+) fs=fat16 ro=ro-backend.*?fs: stat path=/volumes/NO_NAME/KERNEL.ELF kind=file size=[0-9]+ vol=\1"
 
 # CSS-1 验收（MBR 系）：4 个主表项 + 扩展链（EBR）里的逻辑分区 5/6，以及断链的处理。
@@ -638,16 +698,22 @@ test-storage-mbr: image storage-images
 		--expect "storage: part disk=1 index=6 table=MBR start_lba=14338 sectors=2048 type=linux-fs" \
 		--expect "storage: disk index=2 dev=virtio-blk2 sectors=10240 table=MBR partitions=2 health=degraded" \
 		--expect "storage: part disk=2 index=5 table=MBR start_lba=2049 sectors=2048 type=ntfs/exfat" \
-		--expect "storage: vol id=fs:66602620 disk=1 part=1 fs=fat12 label=EFI-ESP letter=- mounts=0 ro=ro-backend health=ok" \
-		--expect "storage: vol id=fs:21302620 disk=1 part=5 fs=ntfs label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
-		--expect "storage: vol id=pt:1-6-14338 disk=1 part=6 fs=unsupported label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
-		--expect "storage: vol id=fs:23482620 disk=2 part=5 fs=ntfs label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
-		--expect "storage: vol id=fs:99192620 disk=2 part=6 fs=exfat label=- letter=- mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=fs:66602620 disk=1 part=1 fs=fat12 label=EFI-ESP letter=D mounts=0 ro=ro-backend health=ok" \
+		--expect "storage: vol id=fs:21302620 disk=1 part=5 fs=ntfs label=- letter=E mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=pt:1-6-14338 disk=1 part=6 fs=unsupported label=- letter=F mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=fs:23482620 disk=2 part=5 fs=ntfs label=- letter=G mounts=0 ro=ro-backend health=unsupported" \
+		--expect "storage: vol id=fs:99192620 disk=2 part=6 fs=exfat label=- letter=H mounts=0 ro=ro-backend health=unsupported" \
 		--expect "storage: parse selftest PASS (cases=11 checks=45)" \
-		--expect "storage: selftest PASS (checks=82)" \
+		--expect "storage: selftest PASS (checks=88)" \
+		--expect "storage: letters selftest PASS (checks=22)" \
 		--expect "fs: storage mount selftest PASS" \
 		--expect-re "storage: mount point=/disk vol=(fs:[0-9a-f]+) ro=ro-backend.*?storage: unmount point=/volumes/NO_NAME vol=\1 mounts=1"
 
+# CSS-3 拒绝面：uid 2000 的 `/bin/hello`（零能力）请求存储受控动作 → 三条都是
+# `-1` + `need=0x10`（判定点 8 的“三件套”：返回值 + 审计 + 串口证据）。
+# 与它成对的是 `/bin/volumes demo`（Shell，uid 1000）三次**成功**（`make test-programs`）——
+# 同一组 syscall、同一个卷，唯一差别是主体。
+#
 # v0.5 验收：IPC（pipe 骨架）创建/写入/读取串口摘要日志 + 自测，随 Round Robin 巡回后执行
 test-ipc: image
 	$(PYTHON) tests/test_boot.py \
@@ -748,6 +814,9 @@ test-proc: image
 		--expect "hello-bin: ckm open /etc/motd ro -> 3" \
 		--expect "hello-bin: ckm read /etc/motd n=23" \
 		--expect "hello-bin: ckm audit_read -> -1" \
+		--expect "hello-bin: css storage_mount vol=fs:" \
+		--expect "hello-bin: css storage_unmount -> -1 (EPERM expected)" \
+		--expect "hello-bin: css storage_assign_letter Q -> -1 (EPERM expected)" \
 		--expect "hello-bin: ckm errno EPERM=-1 EACCES=-13" \
 		--expect "sh: foo: exit code=127" \
 		--expect "sh: bye" \
@@ -762,8 +831,11 @@ test-proc: image
 # （`/bin/ls`、`/bin/ps`、`/bin/cat`、`/bin/echo`、`/bin/volumes`）——
 # 全部从 Shell 交互触发，走 `fork` + `execve` + `wait4`，断言的是程序**自己产出的内容**
 # 与「它们各自用到的内核能力真的通了」：
-#   - `user: getdents path=/ entries=5 returned=5` + `ls: / entries=5`：
+#   - `user: getdents path=/ entries=6 returned=6` + `ls: / entries=6`：
 #     `ls` 读的是 **VFS 的目录项**（v0.7 起只有内核自测用过 `list()`）；
+#     根目录是 6 项而不是 5：CKM-2 起内核多建了一个 `/ckm`（覆盖区 `/ckm/overlay`
+#     的家，`docs/ckm.md` 6.1）；`fs: ls / entries=5` 那条是 `fs::selftest`
+#     的窗口（在 `/ckm` 建立**之前**），两者不矛盾，分别在断自己的时点；
 #   - `ls: /bin entries=8`：`/bin` 里恰好是这次构建写进去的 8 个程序
 #     （sh / hello / ls / cat / echo / ps / volumes / dynhello）—— 同时证明 `fs::init` 的清单是完整的；
 #   - `user: storage_volumes count=1 total=1` + `volumes: fs:… disk=0 part=0 fs=fat16 …`：
@@ -774,6 +846,12 @@ test-proc: image
 #     `ps` 读的是**内核进程表**（本轮新增的 `getprocs`）：表里恰好是 Shell 与 ps 自己，
 #     且 `ppid` 指回 Shell —— 这正是 `fork` 建出来的父子关系；
 #   - `user: exec pid=N path=/bin/{ls,ps,echo,cat}`：四个程序都是真的被 `execve` 起来的；
+#   - **CSS-3**：`volumes` 多了一列 `letter=`（记录偏移 24，系统卷 = `C`）；
+#     `volumes demo` 把 `C:` 那个卷挂到 `/volumes/<卷标>`（`storage_mount`，受控动作，
+#     Shell 是 uid 1000 → 允许），然后用**两个入口**读同一段字节
+#     （`C:\KERNEL.ELF` 由 libc 重写成 POSIX 路径，`docs/storage.md` 4.2），
+#     再卸载并断言路径真的消失 —— 「Windows 式路径不是内核语法」这条因此有实测证据；
+#     与之成对的是 `hello-bin: css storage_mount … -> -1`（uid 2000，零能力，见 test-ckm）；
 #   - `cat: /etc/motd bytes=23`：`/bin/cat` 走 open/read/write/close 读到内核提供的文件；
 #   - `echo program works` + `sh: /bin/echo: exit code=0`：`argv` 经内核写入新进程用户栈，
 #     程序原样打印（`/bin/echo` 是程序，裸 `echo` 是内建命令 —— 见 user/shell 的帮助）。
@@ -789,6 +867,8 @@ test-programs: image
 		--key l --key s --key spc --key slash --key b --key i --key n --key ret \
 		--key p --key s --key ret \
 		--key v --key o --key l --key u --key m --key e --key s --key ret \
+		--key v --key o --key l --key u --key m --key e --key s --key spc \
+		--key d --key e --key m --key o --key ret \
 		--key slash --key b --key i --key n --key slash --key e --key c --key h --key o \
 		--key spc --key e --key c --key h --key o --key spc --key p --key r --key o \
 		--key g --key r --key a --key m --key spc --key w --key o --key r --key k --key s \
@@ -797,10 +877,11 @@ test-programs: image
 		--key spc --key slash --key e --key t --key c --key slash --key m --key o \
 		--key t --key d --key ret \
 		--expect "user: program=/bin/sh source=elf" \
-		--expect "user: getdents path=/ entries=5 returned=5" \
-		--expect "ls: / entries=5" \
+		--expect "user: getdents path=/ entries=6 returned=6" \
+		--expect "ls: / entries=6" \
 		--expect "ls: entry name=init kind=file size=" \
 		--expect "ls: entry name=bin kind=dir size=0" \
+		--expect "ls: entry name=ckm kind=dir size=0" \
 		--expect "ls: /bin entries=8" \
 		--expect "ls: entry name=ls kind=file size=" \
 		--expect "ls: entry name=volumes kind=file size=" \
@@ -809,9 +890,18 @@ test-programs: image
 		--expect "ps: pid=3 ppid=0 state=RUNNING comm=sh" \
 		--expect "ps: 2 process(es)" \
 		--expect "user: storage_volumes count=1 total=1" \
-		--expect "volumes: id disk part fs label label_trunc ro health bytes free_known free mounts" \
-		--expect "disk=0 part=0 fs=fat16 label=NO_NAME label_trunc=0 ro=ro-backend health=ok bytes=67108864 free_known=0 free=0 mounts=1" \
+		--expect "volumes: id disk part fs label label_trunc letter ro health bytes free_known free mounts" \
+		--expect "disk=0 part=0 fs=fat16 label=NO_NAME label_trunc=0 letter=C ro=ro-backend health=ok bytes=66060288 free_known=0 free=0 mounts=1" \
 		--expect "volumes: 1 volume(s) (total=1)" \
+		--expect "user: storage_mount vol=fs:" \
+		--expect "volumes: demo storage_mount -> 0" \
+		--expect "volumes: demo win=C:\\KERNEL.ELF linux=/volumes/NO_NAME/KERNEL.ELF" \
+		--expect "volumes: demo read win_bytes=16 linux_bytes=16 equal=1 first=0x7f454c46" \
+		--expect "volumes: demo storage_unmount -> 0" \
+		--expect "volumes: demo after unmount open -> -2" \
+		--expect-re "ckm: policy op=storage_mount pid=([0-9]+) uid=1000 result=allow need=0x0 detail=0x0" \
+		--expect "ckm: policy op=storage_unmount pid=" \
+		--expect "storage: unmount point=/volumes/NO_NAME vol=fs:" \
 		--expect "cat: /etc/motd bytes=23" \
 		--expect "echo program works" \
 		--expect "sh: ls: exit code=0" \
@@ -897,7 +987,7 @@ check: check-boundary go-test
 go-test:
 	cd tools-go && $(GO) vet ./... && $(GO) test ./...
 
-# v0.4 H-04 验收：Go 编排器并行跑全部 17 个集成测试场景 + 串口日志二次复核。
+# v0.4 H-04 验收：Go 编排器并行跑全部 19 个集成测试场景 + 串口日志二次复核。
 # 磁盘镜像先构建（默认/异常注入/页错误 + FAT 测试盘），随后场景并行执行；
 # 每个场景独占 OVMF_VARS 副本、串口日志与 monitor socket（见 tests/orchestrate.json）。
 test-orch: image image-exception image-pagefault fat-image storage-images

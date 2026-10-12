@@ -13,8 +13,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-BLOCK_SIZE = 1024 * 1024  # 64 MiB 镜像
-IMAGE_BLOCKS = 64
+BLOCK_SIZE = 1024 * 1024  # 1 MiB（镜像容量的单位）
+IMAGE_BLOCKS = 64  # 设备总容量 64 MiB（内核看到的是 131072 个 512 字节扇区）
+# CKM-2：镜像尾部保留 1 MiB 作 **CKM 状态区**（`docs/ckm.md` 第 12 节开放问题 1 的定夺
+# ＝「极小的日志式区：双槽 A/B + CRC」，内核侧实现在 `kernel/src/ckm/store.rs`）。
+#
+# 为什么用「先按 63 MiB 格式化、再追加」这个形状：mtools 的 FAT 几何是按**文件大小**
+# 算出来的，先在 63 MiB 的文件上 `mformat`，再把保留区追加回去，文件系统就**看不到**
+# 尾部这 1 MiB —— 状态区在 FAT 之外，不需要内核去理解 FAT 的分配表，也不会与用户文件
+# 争簇。设备容量（64 MiB）与分区识别（`table=none partitions=1`）都因此保持不变。
+RESERVED_BLOCKS = 1
 
 
 def run(cmd: list[str]) -> None:
@@ -46,8 +54,9 @@ def main() -> None:
         raise SystemExit(f"kernel not found: {kernel} (run `make kernel` first)")
 
     out.parent.mkdir(parents=True, exist_ok=True)
+    fat_bytes = BLOCK_SIZE * (IMAGE_BLOCKS - RESERVED_BLOCKS)
     with out.open("wb") as f:
-        f.write(b"\x00" * (BLOCK_SIZE * IMAGE_BLOCKS))
+        f.write(b"\x00" * fat_bytes)
 
     img = str(out)
     run(["mformat", "-i", img, "::"])
@@ -56,7 +65,14 @@ def main() -> None:
     run(["mcopy", "-i", img, str(boot), "::/EFI/BOOT/BOOTX64.EFI"])
     run(["mcopy", "-i", img, str(kernel), "::/KERNEL.ELF"])
 
-    print(f"image ready: {out} ({out.stat().st_size} bytes)")
+    # 保留区：追加 1 MiB 零扇区，把镜像补回 64 MiB。FAT 与固件都看不到它。
+    with out.open("ab") as f:
+        f.write(b"\x00" * (BLOCK_SIZE * RESERVED_BLOCKS))
+
+    print(
+        f"image ready: {out} ({out.stat().st_size} bytes; "
+        f"fat={fat_bytes} bytes, ckm state area={BLOCK_SIZE * RESERVED_BLOCKS} bytes)"
+    )
 
 
 if __name__ == "__main__":

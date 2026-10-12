@@ -27,6 +27,11 @@
 //! | 读 `/etc/motd`（`0644`） | —— | 成功（读不受能力约束） |
 //!
 //! 这三行合起来说明一件事：判定是真的在**按主体**做，而不是「一律拒绝」。
+//!
+//! **CSS-3 起还多三行（判定点 8）**：挂载 / 卸载 / 分配盘符都需要
+//! `CAP_STORAGE_ADMIN`，而这个进程零能力 —— 于是三条都拿到 `-1`。
+//! 与之成对的是 `/bin/volumes demo`（Shell 里 uid 1000，持有该能力）**成功**：
+//! 同一组 syscall、同一个卷，唯一差别是主体。
 
 #![no_std]
 #![no_main]
@@ -119,6 +124,32 @@ fn ckm_denials() {
     let mut audit = [0u8; AUDIT_RECORD_SIZE];
     let n = ckm_audit_read(&mut audit, 0, None);
     println!("hello-bin: ckm audit_read -> {}", n);
+
+    // 8) CSS-3：存储受控动作（判定点 8）—— 挂载/卸载/盘符都要 `CAP_STORAGE_ADMIN`（0x10）。
+    //    三条都需要“三件套”拒绝（返回值 + 审计 + 串口证据），且都是**能力**拒绝（-1）
+    //    而不是别的原因：卷标识取自卷表（真实存在），挂载点是个合法路径。
+    let mut table = [0u8; 1024];
+    let count = libc::storage_volumes(&mut table, None);
+    let vol_id = if count > 0 {
+        libc::volume_id(&table, 0)
+    } else {
+        "raw:0"
+    };
+    let mounted = libc::storage_mount(vol_id, "/volumes/hello-bin", 0);
+    println!(
+        "hello-bin: css storage_mount vol={} -> {} (EPERM expected)",
+        vol_id, mounted
+    );
+    let unmounted = libc::storage_unmount("/volumes/hello-bin");
+    println!(
+        "hello-bin: css storage_unmount -> {} (EPERM expected)",
+        unmounted
+    );
+    let letter = libc::storage_assign_letter(vol_id, b'Q');
+    println!(
+        "hello-bin: css storage_assign_letter Q -> {} (EPERM expected)",
+        letter
+    );
 
     // 把两个 errno 常量也打出来：若内核改了数值，这一行会立刻不同
     println!("hello-bin: ckm errno EPERM={} EACCES={}", EPERM, EACCES);
