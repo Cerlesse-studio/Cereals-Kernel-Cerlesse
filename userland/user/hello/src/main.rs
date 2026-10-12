@@ -30,8 +30,12 @@ use alloc::vec::Vec;
 
 use libc::syscall::{raw, SYS_WRITE};
 use libc::{
-    brk, close, getpid, mmap, mprotect, munmap, nanosleep, open, println, read, write, MAP_ANONYMOUS,
-    MAP_PRIVATE, O_CREAT, O_RDONLY, O_WRONLY, PROT_EXEC, PROT_NONE, PROT_READ, PROT_WRITE,
+    brk, ckm_audit_read, ckm_component_state, ckm_policy_query, ckm_record_is_deny,
+    ckm_record_need, close, component_id, component_kind, component_kind_name, component_state,
+    component_state_name, getpid, mmap, mprotect, munmap, nanosleep, open, println, read,
+    storage_rescan, write, AUDIT_RECORD_SIZE, CAP_CKM_SERVICE, CKM_OP_FS_WRITE, CKM_OP_POLICY_QUERY,
+    CKM_OP_STATE_WRITE, CKM_PREFIX_ETC, COMPONENT_RECORD_SIZE, EPERM, MAP_ANONYMOUS, MAP_PRIVATE,
+    O_CREAT, O_RDONLY, O_WRONLY, PROT_EXEC, PROT_NONE, PROT_READ, PROT_WRITE, STORAGE_RESCAN_ALL,
 };
 
 /// 可写的静态变量：v0.7 的 ELF Loader 把 `RW` 段映射成 ring3 可写，
@@ -42,6 +46,12 @@ static mut COUNTER: u32 = 0;
 const MOTD_PATH: &str = "/etc/motd";
 /// 用户程序写文件的落点（内核随后读回并打印内容）。
 const OUT_PATH: &str = "/tmp/hello.txt";
+/// CKM-1：`/init` 以 `CAP_FS_SYSTEM_WRITE` 在**受保护前缀**里建的文件。
+///
+/// 它与 `/bin/hello`（uid 2000）对同一个前缀的写入构成一对对照：
+/// 同一个路径、同一个 flags，一个成功、一个 `EPERM` ——
+/// 差别只在凭证，不在路径（`docs/ckm.md` 3.4 判定点 1）。
+const INIT_FLAG_PATH: &str = "/etc/init.flag";
 
 /// `brk` 一次增长两页（8 KiB）。
 const HEAP_STEP: u64 = 2 * 4096;
@@ -121,7 +131,103 @@ pub extern "C" fn main() -> i32 {
         println!("hello: mprotect FAIL");
         return 44;
     }
+
+    // ---- 8. CKM-1：凭证与能力判定（`/init` = uid 0 + CAP_FS_SYSTEM_WRITE） ----
+    if !ckm_selftest() {
+        println!("hello: ckm FAIL");
+        return 45;
+    }
     42
+}
+
+/// CKM-1 自测：把「能力判定」在 ring3 上的结果留成可断言的证据。
+///
+/// `/init` 的固定身份是 **uid 0 + [`CAP_FS_SYSTEM_WRITE`]**（`docs/ckm.md` 3.1），
+/// 所以每个期望值都是确定的，而不是「跑起来看看」：
+///
+/// | 操作 | 需要 | /init 的结果 |
+/// | ---- | ---- | ---- |
+/// | `fs_write`（受保护前缀） | `CAP_FS_SYSTEM_WRITE` | 允许（且有端到端写入） |
+/// | `state_write` | `CAP_CKM_SERVICE` | `-EPERM`（需要 `0x2`） |
+/// | `audit_read` | `CAP_AUDIT_READ` | `-EPERM` |
+/// | `storage_rescan` | `CAP_STORAGE_ADMIN` | `-EPERM` |
+/// | `policy_query` / `component_state` | 无 | 允许（只读） |
+///
+/// 最后一条是刻意加的**最小权限对照**：`/init` 能建立系统视图（写 `/etc`），
+/// 但不能读审计、不能改策略、不能动存储 —— 这正是「不给 CKM 管理能力」的含义。
+fn ckm_selftest() -> bool {
+    let mut ok = true;
+    let mut rec = [0u8; AUDIT_RECORD_SIZE];
+    println!("hello: ckm selftest begin");
+
+    // 1) 查询接口本身无能力要求（它只能问自己，不能枚举别人）
+    let q = ckm_policy_query(CKM_OP_POLICY_QUERY, 0, &mut rec);
+    println!(
+        "hello: ckm policy_query(policy_query) -> {} need=0x{:x}",
+        q,
+        ckm_record_need(&rec, 0)
+    );
+    ok &= q == 0 && !ckm_record_is_deny(&rec, 0);
+
+    // 2) 写受保护前缀：/init 持有 CAP_FS_SYSTEM_WRITE → 允许
+    let q = ckm_policy_query(CKM_OP_FS_WRITE, CKM_PREFIX_ETC, &mut rec);
+    println!(
+        "hello: ckm policy_query(fs_write,etc) -> {} need=0x{:x}",
+        q,
+        ckm_record_need(&rec, 0)
+    );
+    ok &= q == 0;
+
+    // 3) 写扩展状态树：需要 CAP_CKM_SERVICE，/init 没有 → 拒绝
+    let q = ckm_policy_query(CKM_OP_STATE_WRITE, 0, &mut rec);
+    println!(
+        "hello: ckm policy_query(state_write) -> {} need=0x{:x}",
+        q,
+        ckm_record_need(&rec, 0)
+    );
+    ok &= q == EPERM && ckm_record_need(&rec, 0) == CAP_CKM_SERVICE;
+
+    // 4) 审计读取需要 CAP_AUDIT_READ：/init 没有 → -1（审计环因此不是谁都能读的）
+    let mut audit = [0u8; AUDIT_RECORD_SIZE * 4];
+    let mut audit_total = 0u64;
+    let n = ckm_audit_read(&mut audit, 0, Some(&mut audit_total));
+    println!("hello: ckm audit_read -> {}", n);
+    ok &= n == EPERM;
+
+    // 5) 组件状态表：只读、无能力要求 → 允许（枚举顺序由内核保证确定性）
+    let mut comps = [0u8; COMPONENT_RECORD_SIZE * 4];
+    let mut comp_count = 0u64;
+    let n = ckm_component_state(&mut comps, Some(&mut comp_count));
+    println!("hello: ckm component_state -> {} count={}", n, comp_count);
+    ok &= n == 3 && comp_count == 3;
+    for i in 0..n as usize {
+        println!(
+            "hello: ckm component[{}] id={} kind={} state={}",
+            i,
+            component_id(&comps, i),
+            component_kind_name(component_kind(&comps, i)),
+            component_state_name(component_state(&comps, i))
+        );
+    }
+
+    // 6) 存储管理（重扫设备）需要 CAP_STORAGE_ADMIN：/init 也不持有 → -1
+    let rescan = storage_rescan(STORAGE_RESCAN_ALL);
+    println!("hello: ckm storage_rescan -> {}", rescan);
+    ok &= rescan == EPERM;
+
+    // 7) 端到端允许：能力位不是「只在查询里返回 0」—— /init 真的写进了 /etc
+    let fd = open(INIT_FLAG_PATH, O_CREAT | O_WRONLY);
+    println!("hello: ckm open {} fd={}", INIT_FLAG_PATH, fd);
+    ok &= fd >= 3;
+    if fd >= 3 {
+        let msg = b"init: system view established\n";
+        let written = write(fd as i32, msg);
+        println!("hello: ckm wrote {} bytes to {}", written, INIT_FLAG_PATH);
+        let _ = close(fd as i32);
+    }
+
+    println!("hello: ckm selftest ok={}", ok as u8);
+    ok
 }
 
 /// 用户堆自测：`brk` 增长、`mmap` 匿名映射、`munmap` 归还、越界/非法参数的负例，

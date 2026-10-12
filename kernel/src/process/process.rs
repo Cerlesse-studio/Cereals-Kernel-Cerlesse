@@ -124,6 +124,12 @@ pub struct Process {
     pub space: Option<UserSpace>,
     /// 该进程被运行前填写的「回到谁那里去」
     pub return_to: RunCtx,
+    /// 进程凭证（v1.0 + CKM-1）：uid/gid/能力位。
+    ///
+    /// 它**只由内核写**：`create` 给初始值，`fork` 沿袭父进程，`execve` 在命中
+    /// CKM 组件表时换掉（`docs/ckm.md` 3.1）。用户态没有任何系统调用能读改它 ——
+    /// 「我是谁」由内核决定，这正是第一版权限模型没有提权路径的原因。
+    pub cred: crate::security::Cred,
 }
 
 impl Process {
@@ -184,8 +190,21 @@ fn kstacks_base() -> *mut u8 {
 }
 
 /// 槽位 `slot` 的系统调用栈顶。
+///
+/// 栈顶**向下对齐到 16 字节**，这一点是必需的而不只是好看：
+///
+/// - `syscall` 入口把 5 个参数按 `[u64; 5]` 放在 `栈顶 - 128` 处，内核侧再把它
+///   当成 `&[u64; 5]` 使用（见 `syscall::trampoline`）；
+/// - `TSS.RSP0` 也指向这里，ring3 中断/异常由 CPU 在此压入 trap frame；
+///
+/// `KSTACKS` 是 `[[u8; N]; M]`（**对齐 1**），它在 `.bss` 里的实际地址由链接器
+/// 决定 —— 只要前面新增了一个奇数长度的静态量，栈顶就会变成奇地址，那个
+/// `&[u64; 5]` 随即成为 UB（debug 构建的 UB 检查会直接 panic：
+/// "unsafe precondition(s) violated: slice::from_raw_parts requires ... alignment"）。
+/// 因此在对齐上**不能指望运气**，这里显式对齐。
 fn kstack_top(slot: usize) -> u64 {
-    unsafe { kstacks_base().add(slot * KSTACK_SIZE).add(KSTACK_SIZE) as u64 }
+    let top = unsafe { kstacks_base().add(slot * KSTACK_SIZE).add(KSTACK_SIZE) as u64 };
+    top & !0xF
 }
 
 /// 清空进程表（内核启动时调用一次）并给每条内核栈打上栈底哨兵。
@@ -309,6 +328,10 @@ pub fn create(
             frame: UserFrame::new_user(0, 0, 0, 0),
             space: None,
             return_to: RunCtx::default(),
+            // 初始凭证是内核凭证：调用方（顶层程序运行 / `fork` / `execve`）
+            // 负责随后把它改成正确的值。不复用「上一次跑过的进程」的凭证，
+            // 否则释放-复用槽位会变成一条提权路径。
+            cred: crate::security::Cred::kernel(),
         }));
         entry.as_mut().and_then(|s| s.as_mut())
     }

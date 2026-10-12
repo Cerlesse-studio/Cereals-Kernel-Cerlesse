@@ -27,7 +27,7 @@ KERNEL_ELF := target/x86_64-unknown-none/debug/kernel
 USERLAND        := userland
 USERLAND_IMAGES := $(BUILD)/userland/images
 
-.PHONY: help build boot kernel kernel-nouserland image image-kernel image-exception image-pagefault fat-image storage-images run test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn dyn-hostcheck test-scheduler test-ipc test-fs test-user test-driver test-fat test-storage-fixtures test-storage test-storage-mbr test-network test-all user userland-images test-pkg go-test test-orch check-boundary check clean
+.PHONY: help build boot kernel kernel-nouserland image image-kernel image-exception image-pagefault fat-image storage-images run test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn dyn-hostcheck test-scheduler test-ipc test-fs test-user test-ckm test-driver test-fat test-storage-fixtures test-storage test-storage-mbr test-network test-all user userland-images test-pkg go-test test-orch check-boundary check clean
 
 help:
 	@echo "targets:"
@@ -47,6 +47,7 @@ help:
 	@echo "  test-ipc - v0.5: assert pipe create/write/read summary logs + selftest"
 	@echo "  test-fs - v0.7: assert VFS mount routing + RAMFS read/write/ls + negative errno cases"
 	@echo "  test-user - v0.7/v0.9/v1.0: assert ELF loaded from RAMFS + ring3 file syscalls + user heap + mprotect + isolation + shell"
+	@echo "  test-ckm - v1.0: CKM-1 — capability policy (EPERM vs EACCES) + audit ring + component state enumeration"
 	@echo "  test-driver - v0.8: assert PCI enumeration + driver probe + virtio-blk sector read/write"
 	@echo "  fat-image - v0.8: build the FAT test volume (tools/mkfs/mkfs.py from tests/fatroot/data)"
 	@echo "  test-fat - v0.8: assert FAT16/32 on disk mounted in VFS: read/ls/LFN/multi-cluster/EROFS"
@@ -167,7 +168,7 @@ test-pagefault: image-pagefault
 
 # 全量回归：先跑主机侧边界门禁（内核不得依赖用户态），再跑全部 QEMU 场景 ——
 # 包含 test-kernel-only（没有用户态镜像时内核照样启动 + 进入可诊断状态）。
-test-all: check-boundary test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn test-scheduler test-ipc test-fs test-user test-driver test-fat test-storage-fixtures test-storage test-storage-mbr test-network
+test-all: check-boundary test test-kernel-only test-exception test-memory test-pagefault test-keyboard test-shell test-proc test-programs test-dyn test-scheduler test-ipc test-fs test-user test-ckm test-driver test-fat test-storage-fixtures test-storage test-storage-mbr test-network
 
 # v0.5 验收：≥3 个内核任务在 PIT 时间片驱动下轮转（Round Robin）
 test-scheduler: image
@@ -340,6 +341,11 @@ test-user: image
 		--expect "user: sleep done ticks=2" \
 		--expect "user: exit code=42" \
 		--expect "user: init PASS" \
+		--expect "hello: ckm selftest begin" \
+		--expect "hello: ckm policy_query(state_write) -> -1 need=0x2" \
+		--expect "hello: ckm component_state -> 3 count=3" \
+		--expect "hello: ckm open /etc/init.flag fd=3" \
+		--expect "hello: ckm selftest ok=1" \
 		--expect "fs: readback /tmp/hello.txt len=24" \
 		--expect "fs: user data: written by user program" \
 		--expect "user: enter name=probe pid=2" \
@@ -349,6 +355,52 @@ test-user: image
 		--expect "user: probe PASS" \
 		--expect "user: heap frame reclamation PASS" \
 		--expect "user: selftest PASS"
+
+# v1.0 验收（CKM-1）：**内核级权限控制**——与「日志里有 CKM 字样」无关，
+# 断言的是四件机制真的成立（`docs/ckm.md` 第 9 节 CKM-1 的验收出口）：
+#
+#   1. **能力判定在内核**：内核自测（`ckm: selftest PASS (checks=N)`，46 项）逐项对照
+#      能力矩阵，判定行 `ckm: policy op=… result=allow|deny need=…` 在每次判定后必打；
+#   2. **缺能力 → `-EPERM`、不属于你 → `-EACCES`**：`/init`（uid 0、只有 `CAP_FS_SYSTEM_WRITE`）
+#      能写受保护前缀 `/etc/**`（`fs_write` → 0），但**不能**改扩展状态树（`state_write` → `-1`，
+#      `need=0x2`）、**不能**读审计环（`audit_read` → `-1`，`need=0x8`）、不能重扫设备
+#      （`storage_rescan` → `-1`，`need=0x10`）—— 「不给 CKM 管理能力」因此是可断言的；
+#   3. **记录布局是 ABI**：`/init` 用 **libc 的解析器**读了 48 字节审计记录与 64 字节组件记录
+#      （`component_state -> 3 count=3` + 按确定性顺序列出三个组件），偏移读错立刻对不上；
+#   4. **审计环可核查**：拒绝必产生审计事件（`ckm: audit seq=N op=… result=deny`），
+#      容量 ≥64 且回绕后仍可读（`ckm: audit ring wrapped capacity=64`）。
+#
+# uid 2000 的「默认拒绝」证据（`-1` EPERM vs `-13` EACCES）由 `test-proc` 断言：
+# 那条路径要 `/bin/hello` 真的被 Shell `execve` 起来（键盘注入），不在本目标的观察窗里。
+# `--expect-re` 用来绑定「同一个值在多条证据行里一致」（自测项数不算常数）：
+# `checks=\d+` 与「两次查询的组件序列逐字节相同」都是 CKM-1 的验收项。
+test-ckm: image
+	$(PYTHON) tests/test_boot.py \
+		--serial-log $(BUILD)/serial-ckm.log \
+		--expect "Kernel started!" \
+		--expect "ckm: init ABI_VERSION=1 admin_uid=1000 protected=4 audit_cap=64" \
+		--expect-re "ckm: selftest PASS \\(checks=[0-9]+\\)" \
+		--expect "ckm: component id=init transition=deny from=3 to=2" \
+		--expect "ckm: audit ring wrapped capacity=64" \
+		--expect "ckm: verify id=kmod result=deny reason=kind" \
+		--expect "ckm: verify id=bad id result=deny reason=id" \
+		--expect "ckm: verify id=dupe result=deny reason=target" \
+		--expect "ckm: policy op=state_write pid=1 uid=0 result=deny need=0x2" \
+		--expect "ckm: policy op=audit_read pid=1 uid=0 result=deny need=0x8" \
+		--expect "ckm: policy op=storage_rescan pid=1 uid=0 result=deny need=0x10" \
+		--expect-re "ckm: audit seq=[0-9]+ op=fs_write result=allow pid=1 uid=0" \
+		--expect "hello: ckm selftest begin" \
+		--expect "hello: ckm policy_query(policy_query) -> 0 need=0x0" \
+		--expect "hello: ckm policy_query(fs_write,etc) -> 0 need=0x0" \
+		--expect "hello: ckm policy_query(state_write) -> -1 need=0x2" \
+		--expect "hello: ckm audit_read -> -1" \
+		--expect "hello: ckm component_state -> 3 count=3" \
+		--expect "hello: ckm component[0] id=hello kind=userland state=active" \
+		--expect "hello: ckm component[1] id=shell kind=userland state=active" \
+		--expect "hello: ckm component[2] id=init kind=system-component state=active" \
+		--expect "hello: ckm open /etc/init.flag fd=3" \
+		--expect "hello: ckm wrote 30 bytes to /etc/init.flag" \
+		--expect "hello: ckm selftest ok=1"
 
 # v0.8 验收：PCI 枚举 → 驱动注册框架 → virtio-blk 挂接 → 块设备读写。
 #
@@ -664,7 +716,8 @@ test-shell: image
 # 断言的是「内核真的把另一个程序跑起来了」，而不是日志措辞：
 #   - `user: fork parent=3 -> child pid=N image_pages=7`：地址空间被复制（7 个映像页 = Shell 的映像）；
 #   - `user: run child pid=N name=fork-child`：子进程在父进程 wait4 时被恢复（单 CPU 的延迟调度）；
-#   - `user: exec pid=N path=/bin/hello ... segments=4 image_pages=5`：映像被换掉，**PID 不变**；
+#   - `user: exec pid=N path=/bin/hello ... segments=4 image_pages=6`：映像被换掉，**PID 不变**；
+#     （页数 6 而不是 5：CKM-1 给 `/bin/hello` 加了「默认拒绝」的自证代码，映像因此长了一页）
 #   - `hello-bin: argc=2` / `argv[0]=hello` / `argv[1]=world`：内核把 argv 写进了新进程的用户栈；
 #   - `user: exec /bin/foo -> ENOENT` + `sh: foo: exit code=127`：
 #     **找不到的程序**也是完整路径（fork 成功 → exec 失败 → 子进程 exit(127) → 父进程拿到退出码）；
@@ -687,11 +740,20 @@ test-proc: image
 		--expect "hello-bin: Hello from an external program!" \
 		--expect "sh: exec /bin/foo failed errno=-2" \
 		--expect "sh: hello: exit code=1" \
+		--expect "hello-bin: ckm policy_query(fs_write,etc) -> -1 need=0x4" \
+		--expect "hello-bin: ckm policy_query(audit_read) -> -1 need=0x8" \
+		--expect "hello-bin: ckm policy_query(policy_query) -> 0" \
+		--expect "hello-bin: ckm open /etc/hello-bin.flag -> -1 (EPERM expected)" \
+		--expect "hello-bin: ckm open /tmp/hello-bin.flag -> -13 (EACCES expected)" \
+		--expect "hello-bin: ckm open /etc/motd ro -> 3" \
+		--expect "hello-bin: ckm read /etc/motd n=23" \
+		--expect "hello-bin: ckm audit_read -> -1" \
+		--expect "hello-bin: ckm errno EPERM=-1 EACCES=-13" \
 		--expect "sh: foo: exit code=127" \
 		--expect "sh: bye" \
 		--expect "user: heap frame reclamation PASS" \
 		--expect "user: selftest PASS" \
-		--expect-re "user: fork parent=3 -> child pid=([0-9]+) image_pages=7.*?user: run child pid=\1 name=fork-child.*?sh: child pid=\1 exec /bin/hello \(argc=2\).*?user: exec pid=\1 path=/bin/hello segments=4 image_pages=5 entry=0x8000000000.*?hello-bin: pid=\1.*?user: reaped pid=\1 exit=1" \
+		--expect-re "user: fork parent=3 -> child pid=([0-9]+) image_pages=7.*?user: run child pid=\1 name=fork-child.*?sh: child pid=\1 exec /bin/hello \(argc=2\).*?user: exec pid=\1 path=/bin/hello segments=4 image_pages=6 entry=0x8000000000.*?hello-bin: pid=\1.*?user: reaped pid=\1 exit=1" \
 		--expect-re "hello-bin: argc=2.*?hello-bin: argv\[0\]=hello.*?hello-bin: argv\[1\]=world" \
 		--expect-re "user: run child pid=([0-9]+) name=fork-child.*?user: exec /bin/foo -> ENOENT \(no such program\).*?user: reaped pid=\1 exit=127" \
 		--expect-re "user: frames free before=([0-9]+) after=\1"

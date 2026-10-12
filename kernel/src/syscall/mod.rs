@@ -7,6 +7,8 @@
 //! - [`syscall_table`]：编号 → handler 的分发表；
 //! - [`process`] / [`file`] / [`memory`] / [`dir`]：已实现的 syscall
 //!   （exit/getpid/sleep/getprocs、read/write/open/close、mmap/munmap/brk、getdents）；
+//! - [`ckm`]：CKM 管理接口（CKM-1）—— `ckm_policy_query`(257) / `ckm_audit_read`(258)
+//!   / `ckm_component_state`(259)，判定点落点见 `docs/ckm.md` 3.4；
 //! - [`user`]：用户程序与 ring3 运行驱动 —— `/init`（`user/hello` 的 ELF，从 RAMFS 装载）
 //!   与隔离探针（内嵌机器码）。
 //!
@@ -18,6 +20,7 @@
 //! - 错误返回：负数表示 `-errno`（如 `-ENOSYS = -38`），非负数为正常返回值。
 
 pub mod address_space;
+pub mod ckm;
 pub mod dir;
 pub mod dynamic;
 pub mod elf;
@@ -40,7 +43,9 @@ pub const ENOSYS: i64 = -38;
 ///
 /// # Safety
 ///
-/// - `args` 必须指向 5 个 `u64`（`rdi, rsi, rdx, r10, r8`）；
+/// - `args` 必须指向 5 个 `u64`（`rdi, rsi, rdx, r10, r8`），且 **8 字节对齐**；
+///   参数帧由入口放在对齐过的内核栈顶下方（见 `process::kstack_top` 的对齐说明），
+///   不对齐时下面的 `&*(args as *const [u64; 5])` 会触发 debug 构建的 UB 检查；
 /// - `space` 必须是当前正在运行的用户地址空间（或空指针，表示内核自身发起）。
 #[no_mangle]
 pub unsafe extern "C" fn syscall_dispatch(
@@ -56,13 +61,15 @@ pub unsafe extern "C" fn syscall_dispatch(
     // CSS-1 起 `UNIMPLEMENTED` 里重新有号（262/263/264/266 的存储类调用）：
     // 命中时串口会打出 `syscall: ENOSYS nr=262 name=storage_mount`，
     // 与「号越界」区分开。
-    if let Some(name) = syscall_table::unimplemented_name(nid) {
+    let names = syscall_table::unimplemented_name(nid);
+    if let Some(name) = names {
         serial::print("syscall: ENOSYS nr=");
         serial::print_dec(nid);
         serial::print(" name=");
         serial::println(name);
     }
-    match syscall_table::parse(nid) {
+    let parsed = syscall_table::parse(nid);
+    match parsed {
         Some(handler) => {
             let ret = unsafe { handler(args_ref, space) };
             ret as u64 // 负数按二进制补码返回，用户态自行解释

@@ -30,9 +30,9 @@
 ### 1.2 调用号总表
 
 编号沿用 **Linux x86_64** 语义，便于将来直接运行现成用户态程序。
-`0..=255` 沿用 Linux 语义，`256..` 是 Cerlesse 扩展号段（256 = `getprocs`，257–260 由 CKM 预留，
-261–266 由 CSS 使用）；号段上限 `SYS_MAX = 267`；**号越界**与**号合法但未实现**是两种可区分的失败
-（前者 `parse` 返回 `None`，后者落在公共 ENOSYS 桩，均返回 `-ENOSYS`）。
+`0..=255` 沿用 Linux 语义，`256..` 是 Cerlesse 扩展号段（256 = `getprocs`，257–260 是 CKM 号段
+—— 257/258/259 已在 CKM-1 实现，260 预留给 CKM-4；261–266 由 CSS 使用）；号段上限 `SYS_MAX = 267`；
+**号越界**与**号合法但未实现**是两种可区分的失败（前者 `parse` 返回 `None`，后者落在公共 ENOSYS 桩，均返回 `-ENOSYS`）。
 
 | 号 | 名称 | 状态 | 说明 |
 | ---- | ---- | ---- | ---- |
@@ -52,6 +52,10 @@
 | 61 | `wait4` | ✅ | 运行/回收直接子进程，返回退出码 |
 | 78 | `getdents` | ✅ | 目录枚举，定长 88 字节记录（v0.9 第五步） |
 | 256 | `getprocs` | ✅ | 进程表快照，定长 40 字节记录（v0.9 第五步，扩展号段） |
+| 257 | `ckm_policy_query` | ✅ | 当前凭证对某 op 的判定（`0`/`-EPERM`）+ 定长 48 字节记录（CKM-1） |
+| 258 | `ckm_audit_read` | ✅ | 读审计环（`seq > since_seq`），定长 48 字节记录；需 `CAP_AUDIT_READ`（CKM-1） |
+| 259 | `ckm_component_state` | ✅ | 组件表快照，定长 64 字节记录，按确定性顺序（CKM-1） |
+| 260 | `ckm_policy_set` | ENOSYS | 改 CKM 策略（CKM-4；阶段 1 的授予面为零） |
 | 261 | `storage_volumes` | ✅ | 卷表快照，定长 64 字节记录（CSS-1，只读、无需能力位） |
 | 262–264 | `storage_mount`/`unmount`/`assign_letter` | ENOSYS | CSS-3 待实现（扩展号段；CSS-2 已先提供**内核内**的 `fs::mount::MountTable::{mount_volume,alias_volume,umount}` 作为它的落点） |
 | 265 | `storage_rescan` | ✅ | 重扫设备的分区与文件系统（CSS-1；设备不存在 `-ENODEV`） |
@@ -210,6 +214,61 @@ isize wait4(i64 pid)   // libc: wait4(pid: i64) -> isize
 - 运行并**回收**直接子进程（地址空间整棵归还），返回它的退出码（可为负）。
 - 非直接子进程 / 已回收：`-ECHILD`(-10)。
 
+### 2.15 `ckm_policy_query`（nr=257，CKM-1）
+
+```
+isize ckm_policy_query(u32 op, u64 arg, u8 *out, usize out_len, 0)   // libc: ckm_policy_query(op, arg, out: &mut [u8]) -> isize
+```
+
+- `op` 是「操作」枚举（`docs/ckm.md` 4.6）：`1 fs_write` / `2 state_write` / `3 policy_set` / `4 audit_read` /
+  `5 policy_query` / `6 exec_component` / `12..16 storage_*`；`arg` 由 op 解释（如 `fs_write` 的受保护前缀编号）。
+- 返回 `0` = 允许，`-EPERM`(-1) = 能力不足；**返回值与记录里的 `result` 一致**（两者不一致即实现错）。
+- `out`（≥ 48 字节）收 48 字节记录（下表）；只允许查**当前进程**自己的凭证，没有「查别人」的参数。
+- 每次调用都会产生一条审计事件与一行 `ckm: policy …` 串口证据。
+
+| 偏移 | 大小 | 字段 | 说明 |
+| ---- | ---- | ---- | ---- |
+| 0 | 8 | `seq` | 审计序号（与 `ckm_audit_read` 同一序列） |
+| 8 | 8 | `pid` | 发起进程 |
+| 16 | 4 | `uid` / 20:4 `gid` | 凭证 |
+| 24 | 2 | `op` | 被查操作 |
+| 26 | 1 | `result` | `0` allow / `1` deny |
+| 28 | 4 | `need` | deny 时缺少的能力位，否则 0 |
+| 32 | 8 | `detail` | op 相关（`fs_write` = 前缀编号，`storage_rescan` = 设备号） |
+
+### 2.16 `ckm_audit_read`（nr=258，CKM-1）
+
+```
+isize ckm_audit_read(u8 *buf, usize buf_len, u64 since_seq, u64 *out_count, 0)
+```
+
+- 需 `CAP_AUDIT_READ`（uid 1000/1001）：否则 `-EPERM` **且这次拒绝本身也进审计**。
+- 拷贝 `seq > since_seq` 的记录（每条 48 字节，**与 2.15 的表相同**），返回**条数**（不是字节数）；
+  `out_count`（可选）收审计环的总序号（环容量 64，回绕后旧记录被覆盖）。
+- `buf_len` 不足一条记录 → `-EINVAL`；用户缓冲不可写 → `-EFAULT`。
+
+### 2.17 `ckm_component_state`（nr=259，CKM-1）
+
+```
+isize ckm_component_state(u8 *buf, usize buf_len, u64 *out_count, 0, 0)
+```
+
+- 无能力要求（只读）：导出组件/扩展表快照，每条 64 字节，**顺序确定性**：`kind` 升序 →
+  `priority` 降序 → `id` 字节序升序（相同输入两次调用逐字节相同）。
+
+| 偏移 | 大小 | 字段 |
+| ---- | ---- | ---- |
+| 0 | 16 | `id`（ASCII，NUL 填充） |
+| 16 | 2 | `kind`（1 userland / 2 system-component / 3 system-override / 4 kernel-module） |
+| 18 | 1 | `state`（0 absent / 1 staged / 2 installed / 3 active / 4 disabled / 5 failed / 6 removed-pending） |
+| 20 | 4 | `version_code` |
+| 24 | 4 | `abi_kernel` |
+| 28 | 4 | `priority` |
+| 32 | 24 | `rev`（内容修订 = payload SHA-256 前 24 字节） |
+
+记录的权威定义在内核（`kernel/src/ckm/{audit,state}.rs`），用户态只镜像一次解析器
+（`libc::ckm_record_*` / `component_*`），**不自己算偏移**。
+
 ## 3. errno 常量
 
 | 数值 | 名称 | 含义 | 用户态 `libc` 导出 |
@@ -258,6 +317,12 @@ isize wait4(i64 pid)   // libc: wait4(pid: i64) -> isize
 | `getprocs` | `fn getprocs(buf: &mut [u8]) -> isize` | 定长 40 字节记录（`procinfo_*` 解析器） |
 | `storage_volumes` | `fn storage_volumes(buf: &mut [u8], out_count: Option<&mut u64>) -> isize` | 定长 64 字节记录（CSS-1，`volume_*` 解析器） |
 | `storage_rescan` | `fn storage_rescan(disk_index: u32) -> isize` | `u32::MAX` = 全部（CSS-1） |
+| `ckm_policy_query` | `fn ckm_policy_query(op: u16, arg: u64, out: &mut [u8]) -> isize` | `0`/`-EPERM`；48 字节记录（CKM-1） |
+| `ckm_audit_read` | `fn ckm_audit_read(buf: &mut [u8], since_seq: u64, out_count: Option<&mut u64>) -> isize` | 返回**条数**；需 `CAP_AUDIT_READ`（CKM-1） |
+| `ckm_component_state` | `fn ckm_component_state(buf: &mut [u8], out_count: Option<&mut u64>) -> isize` | 64 字节记录 × 32 槽，确定性顺序（CKM-1） |
+| `ckm_record_seq/_pid/_uid/_gid/_op/_is_deny/_need/_detail` | `(&[u8], usize) -> …` | 48 字节记录（审计/判定）的解析器 |
+| `component_id` / `component_kind` / `component_state` / `component_version_code` / `component_abi_kernel` / `component_priority` | `(&[u8], usize) -> …` | 64 字节组件记录的解析器（`rev` 是 24 字节的内容修订，未单独开解析器） |
+| `ckm_op_name` / `ckm_op_required_caps` / `component_kind_name` / `component_state_name` | `(u16/u8) -> &'static str` | 串口/日志用短名与「需要哪些能力」镜像 |
 | `exit` | `fn exit(code: i32) -> !` | |
 
 ### 4.2 常量
@@ -266,7 +331,12 @@ isize wait4(i64 pid)   // libc: wait4(pid: i64) -> isize
 - `open` 标志：`O_RDONLY = 0`、`O_WRONLY = 1`、`O_RDWR = 2`、`O_CREAT = 0o100`。
 - `mmap`/`mprotect` 保护位：`PROT_NONE = 0x0`、`PROT_READ = 0x1`、`PROT_WRITE = 0x2`、`PROT_EXEC = 0x4`。
 - `mmap` 标志：`MAP_PRIVATE = 0x2`、`MAP_ANONYMOUS = 0x20`。
-- errno：`ENOENT/EBADF/ECHILD/EAGAIN/ENOMEM/EFAULT/EISDIR/EINVAL/ENOSPC/ENOSYS`（数值见第 3 节）。
+- errno：`ENOENT/EBADF/ECHILD/EAGAIN/ENOMEM/EFAULT/EISDIR/EINVAL/ENOSPC/ENOSYS/EPERM/EACCES`（数值见第 3 节）。
+- CKM（CKM-1）：能力位 `CAP_CKM_ADMIN = 0x1`、`CAP_CKM_SERVICE = 0x2`、`CAP_FS_SYSTEM_WRITE = 0x4`、
+  `CAP_AUDIT_READ = 0x8`、`CAP_STORAGE_ADMIN = 0x10`、`CAP_STORAGE_FORMAT = 0x20`；
+  op 枚举 `CKM_OP_FS_WRITE = 1` … `CKM_OP_STORAGE_RESCAN = 16`；
+  记录尺寸 `AUDIT_RECORD_SIZE = 48`、`COMPONENT_RECORD_SIZE = 64`；前缀编号 `CKM_PREFIX_ETC/BIN/LIB/INIT`。
+- 权限可区分：能力不足 `EPERM(-1)` vs mode 不许可 `EACCES(-13)`（受保护前缀额外要能力，见 `docs/ckm.md` 3.3）。
 - 进程：`ARG_MAX = 8`。
 
 ### 4.3 宏与运行时支撑
@@ -424,7 +494,7 @@ serialmon 退出码：`0` 通过、`1` 异常/缺失、`2` 用法或 IO 错误�
 make build / make run            # 构建镜像 / QEMU + OVMF 启动
 make test ... test-network       # 各集成测试（断言串口日志）
 make test-all                    # test + exception + memory + pagefault + keyboard + shell + proc
-                                 #   + programs + dyn + scheduler + ipc + fs + user + driver + fat + network
+                                 #   + programs + dyn + scheduler + ipc + fs + user + ckm + driver + fat + network
 make dyn-hostcheck               # 转发到 `make -C userland dyn-hostcheck`：动态链接夹具的宿主 glibc 独立复核（缺工具则跳过）
 make userland-images / make user # 在 userland/ 里构建 + 校验全部用户程序（不启 QEMU、不需要内核源码）
 make image-kernel / test-kernel-only # 纯内核：不内嵌用户态的镜像 / 断言内核单独启动到诊断空闲
@@ -445,7 +515,8 @@ make clean
 | `test-scheduler` | Round Robin 轮转 | — |
 | `test-ipc` | pipe 创建/写/读 | — |
 | `test-fs` | VFS 路由 + RAMFS 读/写/ls + 负例 | 21 |
-| `test-user` | ELF 装载 + 文件 syscall + 用户堆 + `mprotect`（`PROT_NONE`/`RX` 转换）+ 隔离 + Shell + 动态链接 | 91 |
+| `test-user` | ELF 装载 + 文件 syscall + 用户堆 + `mprotect`（`PROT_NONE`/`RX` 转换）+ 隔离 + Shell + 动态链接 + `/init` 的 CKM-1 证据 | 91 |
+| `test-ckm` | CKM-1：内核能力判定自测（46 项）+ `/init` 的允许/拒绝 + 组件枚举确定性 + 审计环回绕 | 22 + 2 正则 |
 | `test-shell` | 交互式 Shell（注入按键） | 11 |
 | `test-proc` | fork/execve/wait4 全链路 + PID 一致性 | 8 + 4 正则 |
 | `test-programs` | getdents/getprocs + 基础用户程序（含 `/bin/volumes`）真的被 exec | 23 + 6 正则 |
@@ -463,6 +534,7 @@ make clean
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-12 | **CKM-1（内核级权限控制）**：号表新增 `ckm_policy_query`(257)/`ckm_audit_read`(258)/`ckm_component_state`(259) 与 `ckm_policy_set`(260) 的 ENOSYS 行；新增 2.15/2.16/2.17（op 枚举、48/64 字节记录布局、errno）；4.1/4.2 新增 `libc` 封装、解析器与 `CAP_*`/`CKM_OP_*`/`EPERM`/`EACCES`/记录尺寸常量；号段说明改为「257–259 已实现」；第 7 节新增 `test-ckm`（22 + 2 正则）并标注 `test-user` 包含 CKM 证据 |
 | 2026-10-11 | **CSS-2（VFS 收口）**：5.1 节的 `FileSystem` 补 `caps`/`volume_info`（保守缺省）、`FatFs::open` 的错误类型改为 `OpenError { errno, reason }`、VFS 入口提 `route`/`backend_caps`/`backend_volume_info`、挂载表改为 `backends`+`mounts` 并补 `mount_volume`/`alias_volume`/`umount`；5.3 号表行标注 262–264 的内核落点已先备好 |
 | 2026-10-11 | 创建本文档：汇总系统调用 ABI（寄存器约定/号表/逐条语义）、errno 表、`libc` API、
 内核内部 trait（`FileSystem`/`Driver`/`BlockDevice`）、主机侧工具 CLI 与 Makefile 目标 |

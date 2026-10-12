@@ -596,6 +596,311 @@ pub fn volume_mounts(buf: &[u8], index: usize) -> u32 {
     }
 }
 
+// ---------------------------------------------------------------- CKM（CKM-1）
+
+/// `ckm_policy_query` 的系统调用号（CKM-1，`docs/ckm.md` 4.3）。
+pub const SYS_CKM_POLICY_QUERY: u64 = 257;
+/// `ckm_audit_read` 的系统调用号（CKM-1）。
+pub const SYS_CKM_AUDIT_READ: u64 = 258;
+/// `ckm_component_state` 的系统调用号（CKM-1）。
+pub const SYS_CKM_COMPONENT_STATE: u64 = 259;
+
+/// CKM ABI 版本（必须与内核 `ckm::CKM_ABI_VERSION` 相等）。
+pub const CKM_ABI_VERSION: u32 = 1;
+
+/// 审计记录长度（必须与内核 `ckm::audit::AUDIT_RECORD_SIZE` 一致）。
+pub const AUDIT_RECORD_SIZE: usize = 48;
+/// 组件状态记录长度（必须与内核 `ckm::state::COMPONENT_RECORD_SIZE` 一致）。
+pub const COMPONENT_RECORD_SIZE: usize = 64;
+/// 组件 `id` 字段里可读字符的上限（记录占 16 字节：15 字符 + NUL）。
+pub const COMPONENT_ID_MAX: usize = 15;
+/// 组件状态表容量（内核 `ckm::STATE_SLOTS`）。
+pub const MAX_COMPONENTS: usize = 32;
+
+/// `-EPERM`：**能力不足**（受保护前缀），与下面的 `EACCES` 刻意区分。
+pub const EPERM: isize = -1;
+/// `-EACCES`：**mode 不允许**（POSIX；文件不属于你）。
+pub const EACCES: isize = -13;
+
+/// `CAP_CKM_ADMIN`：改 CKM 策略（uid 1000）。
+pub const CAP_CKM_ADMIN: u32 = 0x1;
+/// `CAP_CKM_SERVICE`：执行扩展事务（`ckmd`，uid 1001）。
+pub const CAP_CKM_SERVICE: u32 = 0x2;
+/// `CAP_FS_SYSTEM_WRITE`：写受保护前缀（`/etc`、`/bin`、`/lib`、`/init`）。
+pub const CAP_FS_SYSTEM_WRITE: u32 = 0x4;
+/// `CAP_AUDIT_READ`：读审计环形缓冲。
+pub const CAP_AUDIT_READ: u32 = 0x8;
+/// `CAP_STORAGE_ADMIN`：存储管理的可逆动作（挂载/卸载/盘符/重扫）。
+pub const CAP_STORAGE_ADMIN: u32 = 0x10;
+/// `CAP_STORAGE_FORMAT`：创建/格式化文件系统（破坏性）。
+pub const CAP_STORAGE_FORMAT: u32 = 0x20;
+
+// op / 事件编号（`docs/ckm.md` 4.6；与内核 `ckm::policy::Op` 一致）
+pub const CKM_OP_FS_WRITE: u16 = 1;
+pub const CKM_OP_STATE_WRITE: u16 = 2;
+pub const CKM_OP_POLICY_SET: u16 = 3;
+pub const CKM_OP_AUDIT_READ: u16 = 4;
+pub const CKM_OP_POLICY_QUERY: u16 = 5;
+pub const CKM_OP_EXEC_COMPONENT: u16 = 6;
+pub const CKM_OP_OVERLAY_REGISTER: u16 = 7;
+pub const CKM_OP_OVERLAY_CONFLICT: u16 = 8;
+pub const CKM_OP_SAFE_MODE_ENTER: u16 = 9;
+pub const CKM_OP_TXN_COMMIT: u16 = 10;
+pub const CKM_OP_TXN_ROLLBACK: u16 = 11;
+pub const CKM_OP_STORAGE_MOUNT: u16 = 12;
+pub const CKM_OP_STORAGE_UNMOUNT: u16 = 13;
+pub const CKM_OP_STORAGE_LETTER: u16 = 14;
+pub const CKM_OP_STORAGE_FORMAT: u16 = 15;
+pub const CKM_OP_STORAGE_RESCAN: u16 = 16;
+
+/// 受保护前缀下标（`fs_write` 的 `arg` 语义：它就是内核 `detail` 里的那个下标）。
+pub const CKM_PREFIX_ETC: u64 = 0;
+/// `/bin`
+pub const CKM_PREFIX_BIN: u64 = 1;
+/// `/lib`
+pub const CKM_PREFIX_LIB: u64 = 2;
+/// `/init`
+pub const CKM_PREFIX_INIT: u64 = 3;
+
+/// op 短名（与内核串口证据同一批字串；日志与 CLI 显示用）。
+pub fn ckm_op_name(op: u16) -> &'static str {
+    match op {
+        CKM_OP_FS_WRITE => "fs_write",
+        CKM_OP_STATE_WRITE => "state_write",
+        CKM_OP_POLICY_SET => "policy_set",
+        CKM_OP_AUDIT_READ => "audit_read",
+        CKM_OP_POLICY_QUERY => "policy_query",
+        CKM_OP_EXEC_COMPONENT => "exec_component",
+        CKM_OP_OVERLAY_REGISTER => "overlay_register",
+        CKM_OP_OVERLAY_CONFLICT => "overlay_conflict",
+        CKM_OP_SAFE_MODE_ENTER => "safe_mode_enter",
+        CKM_OP_TXN_COMMIT => "txn_commit",
+        CKM_OP_TXN_ROLLBACK => "txn_rollback",
+        CKM_OP_STORAGE_MOUNT => "storage_mount",
+        CKM_OP_STORAGE_UNMOUNT => "storage_unmount",
+        CKM_OP_STORAGE_LETTER => "storage_letter",
+        CKM_OP_STORAGE_FORMAT => "storage_format",
+        CKM_OP_STORAGE_RESCAN => "storage_rescan",
+        _ => "unknown",
+    }
+}
+
+/// 一个 op 需要的 capability 位（用户态镜像；显示与自检用，**不是**权威来源）。
+pub fn ckm_op_required_caps(op: u16) -> u32 {
+    match op {
+        CKM_OP_FS_WRITE => CAP_FS_SYSTEM_WRITE,
+        CKM_OP_STATE_WRITE | CKM_OP_OVERLAY_REGISTER | CKM_OP_OVERLAY_CONFLICT
+        | CKM_OP_TXN_COMMIT | CKM_OP_TXN_ROLLBACK => CAP_CKM_SERVICE,
+        CKM_OP_POLICY_SET | CKM_OP_SAFE_MODE_ENTER => CAP_CKM_ADMIN,
+        CKM_OP_AUDIT_READ => CAP_AUDIT_READ,
+        CKM_OP_STORAGE_MOUNT | CKM_OP_STORAGE_UNMOUNT | CKM_OP_STORAGE_LETTER
+        | CKM_OP_STORAGE_RESCAN => CAP_STORAGE_ADMIN,
+        CKM_OP_STORAGE_FORMAT => CAP_STORAGE_FORMAT,
+        _ => 0,
+    }
+}
+
+/// `ckm_policy_query(op, arg, out)`：查当前进程对 `op` 的判定，返回 `0` 或 `-EPERM`。
+///
+/// 同时把一条 [`AUDIT_RECORD_SIZE`] 字节记录写进 `out`（**复用审计记录布局**，
+/// `seq = 0` 表示它不是事件；解析器与 [`ckm_audit_read`] 共用）。
+/// 没有参数能指定「查别的进程」—— 这个调用只能问自己。
+///
+/// `out` 至少要有 [`AUDIT_RECORD_SIZE`] 字节，否则内核返回 `-EINVAL`。
+pub fn ckm_policy_query(op: u16, arg: u64, out: &mut [u8]) -> isize {
+    unsafe {
+        raw(
+            SYS_CKM_POLICY_QUERY,
+            op as u64,
+            arg,
+            out.as_ptr() as u64,
+            out.len() as u64,
+            0,
+        )
+    }
+}
+
+/// `ckm_audit_read(buf, since_seq, out_count)`：读审计环里 `seq > since_seq` 的记录。
+///
+/// 需要 `CAP_AUDIT_READ`（否则返回 `-EPERM` 且**不写缓冲**）；返回实际写入条数，
+/// `out_count` 回填环内当前条数。缓冲至少 [`AUDIT_RECORD_SIZE`] 字节。
+pub fn ckm_audit_read(buf: &mut [u8], since_seq: u64, out_count: Option<&mut u64>) -> isize {
+    let count_ptr = match out_count {
+        Some(slot) => slot as *mut u64 as u64,
+        None => 0,
+    };
+    unsafe {
+        raw(
+            SYS_CKM_AUDIT_READ,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            since_seq,
+            count_ptr,
+            0,
+        )
+    }
+}
+
+/// `ckm_component_state(buf, out_count)`：按确定性顺序导出组件状态记录，返回条数。
+///
+/// 只读、无能力要求；缓冲装不下整张表返回 `-ENOSPC`（**要么写完整记录，要么明确失败**）。
+/// `out_count` 回填条数。
+pub fn ckm_component_state(buf: &mut [u8], out_count: Option<&mut u64>) -> isize {
+    let count_ptr = match out_count {
+        Some(slot) => slot as *mut u64 as u64,
+        None => 0,
+    };
+    unsafe {
+        raw(
+            SYS_CKM_COMPONENT_STATE,
+            buf.as_ptr() as u64,
+            buf.len() as u64,
+            count_ptr,
+            0,
+            0,
+        )
+    }
+}
+
+// ---- 记录解析器（内核是权威定义，这里不自己算偏移）----
+
+/// 第 `index` 条审计记录的 `seq`。
+pub fn ckm_record_seq(buf: &[u8], index: usize) -> u64 {
+    match record(buf, index, AUDIT_RECORD_SIZE) {
+        Some(rec) => u64::from_le_bytes(rec[0..8].try_into().unwrap_or([0; 8])),
+        None => 0,
+    }
+}
+
+/// 第 `index` 条审计记录的 `pid`。
+pub fn ckm_record_pid(buf: &[u8], index: usize) -> u64 {
+    match record(buf, index, AUDIT_RECORD_SIZE) {
+        Some(rec) => u64::from_le_bytes(rec[8..16].try_into().unwrap_or([0; 8])),
+        None => 0,
+    }
+}
+
+/// 第 `index` 条审计记录的 `uid`。
+pub fn ckm_record_uid(buf: &[u8], index: usize) -> u32 {
+    match record(buf, index, AUDIT_RECORD_SIZE) {
+        Some(rec) => u32::from_le_bytes(rec[16..20].try_into().unwrap_or([0; 4])),
+        None => 0,
+    }
+}
+
+/// 第 `index` 条审计记录的 `gid`。
+pub fn ckm_record_gid(buf: &[u8], index: usize) -> u32 {
+    match record(buf, index, AUDIT_RECORD_SIZE) {
+        Some(rec) => u32::from_le_bytes(rec[20..24].try_into().unwrap_or([0; 4])),
+        None => 0,
+    }
+}
+
+/// 第 `index` 条审计记录的 `op` 编号（短名见 [`ckm_op_name`]）。
+pub fn ckm_record_op(buf: &[u8], index: usize) -> u16 {
+    match record(buf, index, AUDIT_RECORD_SIZE) {
+        Some(rec) => u16::from_le_bytes([rec[24], rec[25]]),
+        None => 0,
+    }
+}
+
+/// 第 `index` 条记录是否是**拒绝**（`result == 1`）。
+pub fn ckm_record_is_deny(buf: &[u8], index: usize) -> bool {
+    record(buf, index, AUDIT_RECORD_SIZE).map_or(false, |rec| rec[26] == 1)
+}
+
+/// 第 `index` 条审计记录 `deny` 时需要的 capability 位（`allow` 时为 0）。
+pub fn ckm_record_need(buf: &[u8], index: usize) -> u32 {
+    match record(buf, index, AUDIT_RECORD_SIZE) {
+        Some(rec) => u32::from_le_bytes(rec[28..32].try_into().unwrap_or([0; 4])),
+        None => 0,
+    }
+}
+
+/// 第 `index` 条记录的 `detail`（op 相关：前缀下标 / 组件槽位 / errno）。
+pub fn ckm_record_detail(buf: &[u8], index: usize) -> u64 {
+    match record(buf, index, AUDIT_RECORD_SIZE) {
+        Some(rec) => u64::from_le_bytes(rec[32..40].try_into().unwrap_or([0; 8])),
+        None => 0,
+    }
+}
+
+/// 第 `index` 条组件状态记录的 `id`（NUL 之前的字节）。
+pub fn component_id(buf: &[u8], index: usize) -> &str {
+    let Some(rec) = record(buf, index, COMPONENT_RECORD_SIZE) else {
+        return "";
+    };
+    match rec.get(..COMPONENT_ID_MAX + 1) {
+        Some(bytes) => {
+            let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            core::str::from_utf8(&bytes[..len]).unwrap_or("?")
+        }
+        None => "",
+    }
+}
+
+/// 第 `index` 条组件记录的 `kind`（`1` 用户态 / `2` 系统组件 / `3` 覆盖层 / `4` 内核模块）。
+pub fn component_kind(buf: &[u8], index: usize) -> u16 {
+    match record(buf, index, COMPONENT_RECORD_SIZE) {
+        Some(rec) => u16::from_le_bytes([rec[16], rec[17]]),
+        None => 0,
+    }
+}
+
+/// `kind` 的短名（与内核 `ckm::state::Kind` 同一套语义）。
+pub fn component_kind_name(kind: u16) -> &'static str {
+    match kind {
+        1 => "userland",
+        2 => "system-component",
+        3 => "system-override",
+        4 => "kernel-module",
+        _ => "?",
+    }
+}
+
+/// 第 `index` 条组件记录的 `state` 编号。
+pub fn component_state(buf: &[u8], index: usize) -> u8 {
+    record(buf, index, COMPONENT_RECORD_SIZE).map_or(0, |rec| rec[18])
+}
+
+/// `state` 的短名（`docs/ckm.md` 5.3 的状态机）。
+pub fn component_state_name(state: u8) -> &'static str {
+    match state {
+        0 => "absent",
+        1 => "staged",
+        2 => "installed",
+        3 => "active",
+        4 => "disabled",
+        5 => "failed",
+        6 => "removed-pending",
+        _ => "?",
+    }
+}
+
+/// 第 `index` 条组件记录的整数版本号。
+pub fn component_version_code(buf: &[u8], index: usize) -> u32 {
+    match record(buf, index, COMPONENT_RECORD_SIZE) {
+        Some(rec) => u32::from_le_bytes(rec[20..24].try_into().unwrap_or([0; 4])),
+        None => 0,
+    }
+}
+
+/// 第 `index` 条组件记录声明的 CKM ABI 版本。
+pub fn component_abi_kernel(buf: &[u8], index: usize) -> u32 {
+    match record(buf, index, COMPONENT_RECORD_SIZE) {
+        Some(rec) => u32::from_le_bytes(rec[24..28].try_into().unwrap_or([0; 4])),
+        None => 0,
+    }
+}
+
+/// 第 `index` 条组件记录的覆盖层优先级（非覆盖层恒 0）。
+pub fn component_priority(buf: &[u8], index: usize) -> u32 {
+    match record(buf, index, COMPONENT_RECORD_SIZE) {
+        Some(rec) => u32::from_le_bytes(rec[28..32].try_into().unwrap_or([0; 4])),
+        None => 0,
+    }
+}
+
 /// `exit(code)`：结束当前进程并把退出码交回内核。
 ///
 /// 顶层程序（`/init`、`/bin/sh`）结束后控制权回到内核运行驱动；

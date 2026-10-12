@@ -16,6 +16,7 @@
 extern crate alloc;
 
 mod arch;
+mod ckm;
 mod driver;
 mod fs;
 mod interrupt;
@@ -24,6 +25,7 @@ mod memory;
 mod network;
 mod process;
 mod scheduler;
+mod security;
 mod storage;
 mod time;
 
@@ -168,6 +170,19 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
     }
     if let Err(err) = fs::selftest() {
         driver::serial::print("fs: FAIL: ");
+        driver::serial::println(err);
+        halt();
+    }
+
+    // CKM-1：凭证 / 能力位 / 判定点 / 审计环就位（`docs/ckm.md`）。
+    //
+    // 位置在 `fs::init` 之后、任何用户进程之前：
+    // - 之后才能保证「启动早期的 open/execve 也经过判定」（否则存在一段无判定窗口）；
+    // - `fs::init` 之前不行：`ckm::init` 会打印证据行，而串口与 RAMFS 都已就绪更便于定位。
+    // 自测里的「非法转换」「审计回绕」必须真跑过一遍（它们是机制而非展示）。
+    ckm::api::init();
+    if let Err(err) = ckm::api::selftest() {
+        driver::serial::print("ckm: FAIL: ");
         driver::serial::println(err);
         halt();
     }
@@ -400,5 +415,38 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         driver::serial::print_hex(loc.line() as u64);
         driver::serial::println("");
     }
+    // 消息必须打出来：只报位置的话，「索引越界」与「unwrap 到 None」
+    // 在串口上长得一模一样，定位要多花一整轮重启。
+    struct SerialText {
+        budget: usize,
+    }
+    impl core::fmt::Write for SerialText {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for b in s.bytes() {
+                if self.budget == 0 {
+                    return Err(core::fmt::Error);
+                }
+                self.budget -= 1;
+                if (0x20..0x7f).contains(&b) {
+                    driver::serial::putc(b);
+                } else {
+                    // 不可打印字节用 `\xNN` 转义：长度异常的 `&str` 就落在这里，
+                    // 直接 `print` 会把终端搞乱。
+                    driver::serial::print("\\x");
+                    driver::serial::print_hex_pad(b as u64, 2);
+                }
+            }
+            Ok(())
+        }
+    }
+    driver::serial::print("panic: ");
+    // 消息要打出来，但**限长**：一个长度异常的 `&str` 会把串口灌爆
+    // （实测教训：几 MB 的消息比没有消息更难定位）。
+    let mut sink = SerialText { budget: 160 };
+    let complete = core::fmt::Write::write_fmt(&mut sink, format_args!("{}", info.message())).is_ok();
+    if !complete {
+        driver::serial::print("...");
+    }
+    driver::serial::println("");
     halt()
 }

@@ -255,7 +255,8 @@ pub fn selftest() -> Result<(), &'static str> {
     serial::print(" size=");
     serial::print_dec(meta.size);
     serial::print(" perms=");
-    serial::print(meta.perms());
+    let mut perms = [0u8; 10];
+    serial::print(meta.perms_str(&mut perms));
     serial::print(" vol=");
     serial::println(&vol);
 
@@ -309,7 +310,8 @@ pub fn selftest() -> Result<(), &'static str> {
         serial::print(" size=");
         serial::print_dec(entry.meta.size);
         serial::print(" perms=");
-        serial::println(entry.meta.perms());
+        let mut perms = [0u8; 10];
+        serial::println(entry.meta.perms_str(&mut perms));
     }
     // 根目录条目数：内核自己建立的是 `bin` / `lib` / `etc` / `tmp` 四个目录（[`init`]），
     // 再加上**用户态提供的** `/init`（有用户态镜像时才有）。
@@ -395,7 +397,8 @@ pub fn disk_selftest() -> Result<(), &'static str> {
         serial::print(" size=");
         serial::print_dec(entry.meta.size);
         serial::print(" perms=");
-        serial::println(entry.meta.perms());
+        let mut perms = [0u8; 10];
+        serial::println(entry.meta.perms_str(&mut perms));
     }
     let kernel_entry = entries
         .iter()

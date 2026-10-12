@@ -6,10 +6,14 @@
 //! - [`sys_storage_volumes`] 是**只读**查询，不需要任何能力位（CKM 的只读面
 //!   同样如此，见 `docs/storage.md` 6.2）；写入的条数受 `buf_len` 限制，装不下
 //!   就截断（每条记录仍然完整）——`out_count_ptr` 用来问「总共有多少条」；
-//! - [`sys_storage_rescan`] 是受控动作，CKM 落地后需要 `CAP_STORAGE_ADMIN`
-//!   （判定点 8）；CSS-1 还没有 CKM，因此这里只提供机制本身，权限在 CSS-3
-//!   接上 CKM 时补齐（这个顺序与 `docs/ckm.md` 的分期一致）。
+//! - [`sys_storage_rescan`] 是**受控动作**：CKM-1 起要求
+//!   `CAP_STORAGE_ADMIN`（`docs/ckm.md` 3.4 判定点 8），拒绝时返回 `-EPERM`
+//!   并留下审计 + 串口证据。挂载/卸载/盘符（262/263/264）的行为归 CSS-3，
+//!   它们现在仍落在 ENOSYS 桩上，因此那三个动作的判定点 8 也在 CSS-3 才接上
+//!   （本文件的 [`sys_storage_rescan`] 是这条判定点已经生效的那一半）。
 
+use crate::ckm::api as ckm;
+use crate::ckm::policy::Op;
 use crate::driver::serial;
 use crate::storage::registry;
 use crate::storage::volume::VOLUME_RECORD_SIZE;
@@ -83,6 +87,16 @@ pub unsafe fn sys_storage_rescan(args: &[u64; 5], _space: *const UserSpace) -> i
         return EINVAL;
     }
     let index = index as u32;
+
+    // 判定点 8（`docs/ckm.md` 3.4）：重扫设备是受控动作，需要 `CAP_STORAGE_ADMIN`。
+    // 参数校验之后、动任何设备状态之前判定 —— 拒绝必须发生在副作用之前。
+    let errno = ckm::enforce(Op::StorageRescan, index as u64);
+    if errno != 0 {
+        serial::print("user: storage_rescan disk=");
+        serial::print_dec(index as u64);
+        serial::println(" -> EPERM (need CAP_STORAGE_ADMIN)");
+        return errno;
+    }
 
     if index == u32::MAX {
         return match registry::scan_all(true) {

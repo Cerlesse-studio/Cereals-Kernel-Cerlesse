@@ -179,6 +179,39 @@
       "timeoutSec": 60
     },
     {
+      "name": "ckm",
+      "cmd": [
+        "python3", "tests/test_boot.py",
+        "--serial-log", "build/orch/ckm/serial.log",
+        "--ovmf-vars", "build/orch/ckm/OVMF_VARS.fd",
+        "--timeout", "30",
+        "--expect", "Kernel started!",
+        "--expect", "ckm: init ABI_VERSION=1 admin_uid=1000 protected=4 audit_cap=64",
+        "--expect", "ckm: selftest PASS",
+        "--expect", "ckm: policy op=state_write pid=1 uid=0 result=deny need=0x2",
+        "--expect", "ckm: policy op=audit_read pid=1 uid=0 result=deny need=0x8",
+        "--expect", "ckm: audit ring wrapped capacity=64",
+        "--expect", "ckm: verify id=kmod result=deny reason=kind",
+        "--expect", "hello: ckm policy_query(fs_write,etc) -> 0 need=0x0",
+        "--expect", "hello: ckm policy_query(state_write) -> -1 need=0x2",
+        "--expect", "hello: ckm audit_read -> -1",
+        "--expect", "hello: ckm component_state -> 3 count=3",
+        "--expect", "hello: ckm open /etc/init.flag fd=3",
+        "--expect", "hello: ckm selftest ok=1"
+      ],
+      "serialLog": "build/orch/ckm/serial.log",
+      "expect": [
+        "Kernel started!",
+        "ckm: init ABI_VERSION=1 admin_uid=1000 protected=4 audit_cap=64",
+        "ckm: selftest PASS",
+        "ckm: policy op=state_write pid=1 uid=0 result=deny need=0x2",
+        "ckm: audit ring wrapped capacity=64",
+        "hello: ckm component_state -> 3 count=3",
+        "hello: ckm selftest ok=1"
+      ],
+      "timeoutSec": 60
+    },
+    {
       "name": "fs",
       "cmd": [
         "python3", "tests/test_boot.py",

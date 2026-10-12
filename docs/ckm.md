@@ -1,10 +1,12 @@
 # Cerlesse Kernel Manager（CKM）设计提案
 
 - 阶段：跨阶段 / 内核级权限与扩展管理（CKM；执行上排在 v1.0 之后，桌面路线之前）
-- 最后更新：2026-10-11
-- 状态：📋 **提案 v1（规划）** —— 三项规格已定稿：**权限模型（第 3 节）**、
-  **内核接口（第 4 节）**、**扩展生命周期（第 5–6 节）**；实现按第 9 节的
-  CKM-1 … CKM-7 分期推进，当前**尚未写任何 CKM 代码**（`kernel/src/ckm/` 不存在）
+- 最后更新：2026-10-12
+- 状态：🚧 **CKM-1（内核接口）已落地** —— `kernel/src/ckm/`（`cred`/`policy`/`state`/`audit`/`api`）
+  + v1.0 的 `kernel/src/security/`（凭证 uid/gid + 文件 mode + `EACCES`）+ 判定点 1/3/5/6
+  + syscall `257`/`258`/`259` 已在 `x86_64` 上运行并通过验收（落地清单见 **9.1**，验收见第 10 节）；
+  **仍未实现**：CKM-2 可写持久化（含覆盖层机制）、CKM-3 事务/回执/回滚、CKM-4 `ckmd`/`ckm` CLI、
+  CKM-5 覆盖层全量、CKM-6 恢复环境与安全模式、CKM-7 可加载内核模块 —— 它们仍按第 9 节分期推进
 - 关联：[../DEVELOPMENT.md](../DEVELOPMENT.md)（H-07 需求行）· [docs/README.md](./README.md)（索引）·
   [docs/package-manager.md](./package-manager.md)（`.ckc` 包格式与事务，CKM 的包格式层）·
   [docs/architecture.md](./architecture.md)（第 5 节非目标）· [docs/pure-kernel.md](./pure-kernel.md)（内核/用户态边界）·
@@ -68,15 +70,15 @@ Cerlesse Kernel                  进程、内存、syscall、VFS、驱动、调�
 
 | 项 | 现状 | 证据 | CKM 需要它吗 |
 | ---- | ---- | ---- | ---- |
-| 凭证 / 权限 / 能力 | **全是 2 行占位**：`kernel/src/security/{credential,permission,capability}.rs` 只有 `//!` 与 `// TODO(v1.0)` | 文件本身；`docs/project-structure.md` 标 `security/` = v1.0 | ✅ 阶段 1 的下层（v1.0 先做 uid/gid + 文件 mode） |
-| 文件权限 | VFS 已有 `perms` 展示（`fs: stat … perms=-rw-r--r--`），但**没有 UID/GID 判定**、没有 `EACCES`/`EPERM` 路径 | `docs/filesystem.md`；`make test-fs` 断言里只有展示 | ✅ 判定点 1 |
+| 凭证 / 权限 / 能力 | ✅ **已落地（v1.0 / CKM-1）**：`security/{credential,capability,permission}.rs`（`Cred { uid, gid, caps }`、6 位能力、mode 判定）+ `ckm/{cred,policy,state,audit,api}.rs` | `make test-ckm`（22 断言）、内核自测 `ckm: selftest PASS (checks=46)` | ✅ 判定点 1/3/5/6 的落点 |
+| 文件权限 | ✅ **已落地**：mode 位由 `security/permission.rs` 真正判定（→`-13`），受保护前缀额外要 `CAP_FS_SYSTEM_WRITE`（→`-1`），两者在证据与审计里**可区分** | `fs: stat /etc/motd … perms=-rw-r--r--`、`hello-bin: ckm open /etc/hello-bin.flag -> -1 (EPERM expected)` vs `-> -13 (EACCES expected)` | ✅ 判定点 1 |
 | 可写持久化 | RAMFS 在内存里、**FAT12/16/32 后端只读**（写 = `EROFS`） | `docs/filesystem.md` 3.x、`fs/fat.rs` 模块文档 | ✅ 阶段 2 的前置（扩展状态/回执/store 都要落盘；**同时也是 CSS 字母表/卷标偏好的落点**，见 storage.md 6.6） |
 | 分区 / 卷 / 盘符 | **完全没有**：块设备按**整盘绝对 LBA** 寻址、挂载点写死在 `fs::mount_disks()`（`dev0→/disk`、`dev1→/mnt/fat`，且只挂 FAT）、Shell 提示符里的 `C:` 是常量字符串 | `driver/block.rs`、`fs/mod.rs`、`docs/storage.md` 第 2 节 | ✅ 归 **CSS**（存储管理）；CKM 只提供它的权限判定与状态持久化，不重复实现卷表 |
 | 扩展包格式 | `.ckc` 容器 + 确定性打包 + payload 哈希 + 打包期规则**已落地**（P0a，`make test-pkg` 37 项） | `docs/package-manager.md` 3.2 / 11.1 | ✅ 直接复用，**不重做**（见 2.2） |
 | `.ckc` 的事务/回执/目录 | **未做**（P0b：`cpm.py`、catalog 签名、事务日志、`rollback`/`recover`） | `docs/package-manager.md` 11.1 | ✅ = CKM 阶段 3 的交付物 |
 | syscall 扩展号段 | `0..=255` = Linux 语义，`>= 256` = Cerlesse 扩展；已用 `getprocs = 256` 与 CSS-1 的 `storage_volumes = 261`/`storage_rescan = 265`，**当前 `SYS_MAX = 267`**（CSS-1 后） | `docs/syscall.md` 3.8/3.11、`syscall_table.rs` | ✅ CKM 从 257 起编号（4.3） |
 | 内核/用户态边界 | 已有 `tools/check-boundary.py`（内核不得嵌套 cargo/内嵌用户态字节/依赖用户态包）与独立 workspace `userland/` | `docs/pure-kernel.md` 第 8 节、`make check-boundary` | ✅ CKM Core 留在内核，`ckmd`/`ckm` 必须进 `userland/` |
-| 审计 / 事件 | 无（只有串口日志） | `kernel/src/` 无 audit 模块 | ✅ 阶段 1 新增 |
+| 审计 / 事件 | ✅ **已落地（CKM-1）**：`ckm/audit.rs` 固定容量环形缓冲（64 条，回绕后仍可读）+ 每次判定的串口证据；用户态经 `ckm_audit_read`(258) 读 48 字节记录 | `ckm: audit seq=… result=deny …`、`ckm: audit ring wrapped capacity=64`、`hello: ckm audit_read -> -1`（无 `CAP_AUDIT_READ`） | ✅ 阶段 1 |
 | 引导菜单 / 恢复镜像 | boot crate 只做「装载内核并移交」；无菜单、无恢复条目、无启动失败计数 | `docs/boot.md`、`boot/` | ✅ 阶段 6（依赖阶段 2 的持久化） |
 
 ### 2.1 三件已经具备的前提
@@ -194,6 +196,9 @@ struct Cred {
 `fs/` 只依赖 `ckm::policy` 与前缀常量；**`ckm/` 不反向依赖 `syscall/`**（与 `security/` 一样是叶子被依赖者）。
 现有 `security/` 继续承担凭证的 UID/GID 与文件 mode 判定（v1.0），两者分工写在 4.1 与 3.3。
 
+> **现状（2026-10-12）**：上表五个文件已全部落地（`kernel/src/ckm/`，含 9.1 的落地清单），
+> 依赖方向（`syscall/* → ckm::api`、`ckm/` 不反向依赖 `syscall/`）由 `make check-boundary` 与模块内 `use` 共同保证。
+
 ### 4.2 CKM ABI 版本
 
 - 内核导出常量 `CKM_ABI_VERSION: u32 = 1`（第一版）；
@@ -257,7 +262,7 @@ struct Cred {
 ckm: init ABI_VERSION=1 admin_uid=1000 protected=4 audit_cap=64
 ckm: policy op=fs_write pid=3 uid=2000 result=deny need=0x4 detail=0x2
 ckm: policy op=policy_query pid=1 uid=1000 result=allow need=0x0 detail=0x0
-ckm: component id=hello kind=1 state=3 rev=1f3c... priority=0
+ckm: component id=hello kind=1 state=3 rev=0x1f3c… priority=0
 ckm: audit seq=1 op=fs_write result=deny pid=3 uid=2000
 ckm: selftest PASS (checks=N)
 ```
@@ -266,7 +271,8 @@ ckm: selftest PASS (checks=N)
 - `op` 用**短名**而不是数字（数字在 4.6，改动时不会让日志变成天书）：`fs_write`、`state_write`、
   `policy_set`、`audit_read`、`policy_query`、`exec_component`、`overlay_register`、`overlay_conflict`、
   `storage_mount`、`storage_unmount`、`storage_letter`、`storage_format`、`storage_rescan`；
-- 组件状态行只在**状态转换**时打印（不是每次查询），因此 `make test-ckm` 可以断言「谁在什么时候动了什么」。
+- 组件状态行只在**状态转换**时打印（不是每次查询），因此 `make test-ckm` 可以断言「谁在什么时候动了什么」；
+- `need` / `detail` / `rev` 都用 `print_hex` 打印，它**自带 `0x` 前缀**（因此是 `need=0x4`，不是 `0x0x4`）。
 
 ### 4.6 事件/操作枚举（内核常量，用户态镜像）
 
@@ -460,13 +466,55 @@ KernelSU 把「挂载/覆盖」做成可插拔的**元模块**（官方文档：
 
 | 期 | 交付物 | 依赖 | 验收出口 |
 | ---- | ---- | ---- | ---- |
-| **CKM-1 内核接口** | `kernel/src/ckm/`（`cred`/`policy`/`state`/`audit`/`api`）+ 3.4 判定点 1/3/5/6 + `ckm_policy_query`/`ckm_audit_read`/`ckm_component_state` + 串口证据 | **v1.0 的 `security/`（uid/gid + mode）先落地** | `make test-ckm`（新增）：未授权写受保护前缀被拒 + 审计可读 + 组件状态枚举确定性 |
+| **CKM-1 内核接口** ✅ **已落地（2026-10-12）** | `kernel/src/ckm/`（`cred`/`policy`/`state`/`audit`/`api`）+ 3.4 判定点 1/3/5/6 + `ckm_policy_query`/`ckm_audit_read`/`ckm_component_state` + 串口证据 | **v1.0 的 `security/`（uid/gid + mode）已先落地** | `make test-ckm`（22 断言）：缺能力写受保护前缀被拒（`-EPERM`）+ 审计可读（含回绕）+ 组件状态枚举确定性；uid 2000 的 `EPERM`/`EACCES` 对照由 `make test-proc` 断言 |
 | **CKM-2 可写持久化** | 原子写 + 掉电一致的状态区（FAT 写支持或小型日志式区，见开放问题 1）+ VFS 覆盖层的**机制**（`overlay_register/unregister` + 最长前缀/优先级/冲突） | CKM-1 | `make test-ckm`：写-重启-读回一致；覆盖注册/撤销改变 `open` 结果 |
 | **CKM-3 事务引擎** | H-06 P0b（`cpm.py` → `ckmd` 的库）+ 签名/catalog + 回执 + `recover` + 失败注入 | CKM-2 | `make test-pkg` 扩到 H-06 12.1 的剩余条目（含离线回滚、原子失败、可恢复） |
 | **CKM-4 特权服务与 CLI** | `userland/ckmd`（持 `CAP_CKM_SERVICE`）+ `userland/ckm`（CLI）+ 内核状态树 `/ckm/**` 写路径 | CKM-3 | QEMU 场景 `ckm`：装/启/停/卸/回滚全链路 + 拒绝证据（判定点 1/3/4/5） |
 | **CKM-5 系统修改模块** | `kind=3` 覆盖层全量（优先级、冲突、开机顺序、基线保护） | CKM-4 | QEMU 场景 `ckm-overlay`：停用后 `open` 回基线（6.4 的三条） |
 | **CKM-6 恢复环境** | 恢复镜像 + 引导菜单/命令行 + 启动失败计数 + 安全模式四件事 | CKM-5 | `make test-recovery`：连续 3 次失败进安全模式；从恢复环境重装 `ckmd` |
 | **CKM-7 可加载内核模块** | 签名 + ABI + 依赖 + 卸载安全检查（**本文档不展开**） | CKM-6 | 需要单独提案（`docs/ckm-kmod.md`），先于实现评审 |
+
+### 9.1 CKM-1 落地清单（2026-10-12）
+
+规格在上文（第 3–4 节），这里只写**代码落在哪、怎么验收**。
+
+**内核**（`kernel/src/`）
+
+| 位置 | 内容 |
+| ---- | ---- |
+| `security/credential.rs` | `Cred { uid, gid, caps }`；固定主体常量（`ADMIN_UID = 1000`、管理服务 `1001`、普通用户 `2000`）；`CAP_*`（6 位） |
+| `security/capability.rs` | 能力位图判定（`need & !caps == 0`）与串口短名 |
+| `security/permission.rs` | 文件 mode 判定（`mode::FILE_DEFAULT = 0o644` / `DIR_DEFAULT = 0o755`，属主/组/其他三段）→ `EACCES` |
+| `ckm/mod.rs` | `CKM_ABI_VERSION = 1`、`AUDIT_CAPACITY = 64`、`STATE_SLOTS = 32`、幂等 `init()`（空表 + 引导组件表） |
+| `ckm/cred.rs` | `current()`（内核上下文 = uid 0 + 全能力）、`cap_ok(need)`、按组件表换 uid/gid/能力（3.1 的唯一改变路径） |
+| `ckm/policy.rs` | 判定点 1/3/5/6/7/8/10 的实现：`check(op, arg)` → `allow` / `-EPERM`；每次判定都打 `ckm: policy …` 并写审计 |
+| `ckm/state.rs` | 32 槽组件表 + 合法转换表校验（非法转换 = `ckm: component … transition=deny`）+ **确定性枚举**（`kind` ↑、`priority` ↓、`id` 字节序 ↑） |
+| `ckm/audit.rs` | 64 条环形缓冲（`seq` 单调、回绕置 `wrapped`）+ 48 字节定长记录 |
+| `ckm/api.rs` | `syscall/` 的唯一入口（`policy_query` / `audit_read` / `component_state`） |
+| `syscall/ckm.rs` | 257 `ckm_policy_query` / 258 `ckm_audit_read` / 259 `ckm_component_state`（记录的权威布局在 `ckm/{audit,state}.rs`，用户态只镜像不定义） |
+| `syscall/{file,process,storage}.rs`、`fs/` | 判定点的**落点**（受保护前缀的 `open`/`write`、`execve` 换凭证、存储管理动作） |
+| `process/process.rs` | 内核栈顶 16 字节对齐（`kstack_top`）—— 与 CKM 同批修掉的 UB：新增静态量会把 `KSTACKS` 顶端挤到奇地址，而 syscall 参数帧是 `&[u64; 5]` |
+
+**用户态**（`userland/`）
+
+| 位置 | 内容 |
+| ---- | ---- |
+| `libc/src/syscall.rs` | 三个 syscall 包装 + 48/64 字节记录解析器（`ckm_record_*` / `component_*` / `audit_*`）+ `CAP_*` / `CKM_OP_*` / `EPERM` / `EACCES` 常量 |
+| `user/hello`（`/init`） | `ckm_selftest()`：uid 0 + `CAP_FS_SYSTEM_WRITE` 的**允许/拒绝两面**（能写 `/etc/**`；`state_write` / `audit_read` / `storage_rescan` 均 `-1`），并按确定性顺序列出组件表 |
+| `user/hello-bin`（`/bin/hello`） | `ckm_denials()`：uid 2000 + **零能力**的默认拒绝证据 —— 受保护前缀 `-1`（`EPERM`）与 mode 不许可 `-13`（`EACCES`）**可区分** |
+
+**验收**（可复现的命令 → 断言）
+
+| 命令 | 断言 |
+| ---- | ---- |
+| `make test-ckm` | 22 条断言 + 2 条正则：`ckm: selftest PASS (checks=46)`、`/init` 的允许/拒绝、组件枚举、`ckm: audit ring wrapped capacity=64`、`verify … reason=kind/id/target` |
+| `make test-proc` | uid 2000 的 `-1` / `-13` 对照 + 拒绝一定伴随审计事件（`ckm: audit seq=… uid=2000 result=deny`） |
+| `make test-user` | `/init` 的 CKM 证据行（`test-ckm` 断言的子集，防回归） |
+| `make test-orch`（场景 `ckm`） | 并行编排下的二次复核（同一批子串断言） |
+| 内核自测（46 项） | 能力矩阵逐项对照（`policy::allowed` vs `check`）、非法状态转换、审计回绕、记录长度 |
+
+> 判定点 4（`ckm_policy_set` = 260）**仍未实现**：阶段 1 的授予面为零，号已定义并落在 ENOSYS 桩上（4.3），属于 CKM-4。
+> 同样仍未实现：状态树 `/ckm/**`（5.4）与状态表的持久化（CKM-2/3）。
 
 顺序上的三条硬约束（必须）：
 
@@ -497,6 +545,10 @@ KernelSU 把「挂载/覆盖」做成可插拔的**元模块**（官方文档：
 - 审计环回绕后仍可读（`wrapped` 标志 + 至少保留 64 条中的最新部分）；
 - 组件状态枚举顺序在两次查询间**稳定**（相同输入 → 逐字节相同的输出）；
 - 不允许任何扩展通过 `kind=3` 之外的路径写基线（`EROFS` 证据）。
+
+**CKM-1 的覆盖情况（2026-10-12）**：第 1 条（未授权进程请求管理权限被拒）与上面「补充」四条已落地并被断言
+（`make test-ckm` / `make test-proc`，清单见 9.1）；第 2–8 条依赖 CKM-3/5/6 的交付物（事务、覆盖层、恢复环境），
+**在那些期实现之前不宣称通过** —— 文档里的验收条目不因部分实现而变形。
 
 ## 11. 非目标（第一版明确不做）
 
@@ -536,5 +588,6 @@ KernelSU 把「挂载/覆盖」做成可插拔的**元模块**（官方文档：
 
 | 日期 | 变更 |
 | ---- | ---- |
+| 2026-10-12 | **CKM-1 落地**：`kernel/src/ckm/`（`cred`/`policy`/`state`/`audit`/`api`）+ v1.0 `security/`（凭证 uid/gid + mode + `EACCES`）+ syscall `257`/`258`/`259` + 判定点 1/3/5/6 的强制落点与串口证据；`libc` 加三个包装与 48/64 字节记录解析器，`/init` 与 `/bin/hello` 分别提供允许/拒绝证据；新增 `make test-ckm`（22 断言）与编排器场景 `ckm`，`test-user`/`test-proc` 同步扩展；同批修掉一处**内核栈对齐 UB**（新增静态量把 `KSTACKS` 顶端挤到奇地址，syscall 参数帧 `&[u64; 5]` 因此不对齐 —— `process::kstack_top` 现在显式对齐到 16 字节）。头部状态改为「CKM-1 已落地」，第 9 节 CKM-1 行改 ✅ 并新增 **9.1 落地清单**，第 10 节补覆盖情况，4.5 的 `rev` 示例补 `0x` 前缀 |
 | 2026-10-11 | 追加**存储侧接口**（配合新建的 [storage.md](./storage.md)，CSS 提案）：能力位由 4 位扩到 **6 位**（`CAP_STORAGE_ADMIN 0x10` / `CAP_STORAGE_FORMAT 0x20`，uid 1000 持有，`/init` 与 `ckmd` 不持有）、判定点表追加 **8–10**（挂载/卸载/字母/重扫、格式化、写 `/storage/**`）、事件枚举追加 **12–16**（`storage_mount`/`storage_unmount`/`storage_letter`/`storage_format`/`storage_rescan`，串口短名同步）、号段说明注明 **CSS 占 261–266 故 `SYS_MAX` 最终值为 267**（CKM 自身号段仍为 257–260）、现状审计补「分区/卷/盘符」一行（归属 CSS）、CKM-2 硬约束补第 3 条（可写区同时是字母表落点）与开放问题 1 的边界澄清（原子状态区 vs 文件语义写入） |
 | 2026-10-11 | 创建本文档：定稿权限模型（单管理员 + 4 个能力位 + 7 个判定点，凭证只由 CKM 组件表在 `execve` 时改变）、内核接口（`kernel/src/ckm/` 五模块 + `CKM_ABI_VERSION=1` + 扩展号段 257–259 + 两份定长记录 + 串口证据格式）、扩展生命周期（四类扩展、状态机与合法转换表、确定性枚举/加载顺序）；覆盖层与 KernelSU 元模块的对应关系、事务与 H-06 P0b 的接口、安全模式与恢复环境、CKM-1…CKM-7 分期、8 条故障验收落成断言、非目标与 7 个开放问题；同步 docs/README.md 索引、DEVELOPMENT.md（H-07 行 + 5.12 + 修订记录）、roadmap（第十一阶段）、architecture 第 5 节、project-structure（规划目录）、README（文档入口） |
